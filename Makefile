@@ -51,12 +51,14 @@ release-linux-arm64: | build
 	strip build/bridge-linux-arm64 2>/dev/null || true
 
 # macOS: link to system libc (no static option on darwin); Xcode's clang picks the SDK.
+# _DARWIN_C_SOURCE re-enables BSD extensions (memmem, strcasestr, SIGWINCH)
+# that _POSIX_C_SOURCE otherwise hides.
 release-darwin-x64: | build
-	clang -target x86_64-apple-macos11 $(CFLAGS) -o build/bridge-darwin-x64 $(SRCS)
+	clang -target x86_64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/bridge-darwin-x64 $(SRCS)
 	strip build/bridge-darwin-x64 2>/dev/null || true
 
 release-darwin-arm64: | build
-	clang -target arm64-apple-macos11 $(CFLAGS) -o build/bridge-darwin-arm64 $(SRCS)
+	clang -target arm64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/bridge-darwin-arm64 $(SRCS)
 	strip build/bridge-darwin-arm64 2>/dev/null || true
 
 clean:

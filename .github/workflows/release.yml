@@ -75,8 +75,13 @@ jobs:
 
       - name: Smoke test binary
         working-directory: bridge/build
-        # Darwin-x64 cross-builds won't run on arm64 runners, so skip there.
-        if: matrix.target != 'darwin-x64' || runner.arch == 'X64'
+        # Only run when target arch matches runner arch — otherwise the binary
+        # can't execute on the CI host.
+        if: >
+          (matrix.target == 'linux-x64'    && runner.arch == 'X64')   ||
+          (matrix.target == 'linux-arm64'  && runner.arch == 'ARM64') ||
+          (matrix.target == 'darwin-x64'   && runner.arch == 'X64')   ||
+          (matrix.target == 'darwin-arm64' && runner.arch == 'ARM64')
         run: ./bridge-${{ matrix.target }} --version
 
       - name: Upload artifact
