@@ -470,10 +470,12 @@ static int redeem_enroll_token(const char *token) {
     noise_random(id_bytes, 4);
     login_hex_encode(id_hex, id_bytes, 4);
 
+    // Bridge is always a PC-class device; other clients (sandbox, browser)
+    // declare their own type at redeem time.
     char req[1024];
     int n = snprintf(req, sizeof(req),
         "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
-        "\"payload\":{\"token\":\"%s\"}}",
+        "\"payload\":{\"token\":\"%s\",\"deviceType\":\"PC\"}}",
         id_hex, token);
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: token too long\n"); return -1; }
 
