@@ -1,31 +1,31 @@
 #!/bin/sh
 # TODOforAI Bridge installer.
 #
-#   curl -fsSL https://dl.todofor.ai/install.sh | sh
-#   curl -fsSL https://dl.todofor.ai/install.sh | sh -s -- --token ENROLL_TOKEN
-#   curl -fsSL https://dl.todofor.ai/install.sh | sh -s -- --token TOK --name host-02
+#   curl -fsSL https://todofor.ai/bridge | sh
+#   curl -fsSL https://todofor.ai/bridge | sh -s -- --token ENROLL_TOKEN
+#   curl -fsSL https://todofor.ai/bridge | sh -s -- --token TOK --name host-02
 #
 # Options:
 #   --token TOKEN     redeem an enrollment token (non-interactive login)
 #   --name NAME       device name to register under
 #   --prefix DIR      install dir (default: $HOME/.todoforai/bin)
-#   --channel NAME    release channel (default: stable)
+#   --tag TAG         specific release tag (default: latest)
 #   --no-service      skip systemd/launchd supervisor setup
 #   --no-start        install but don't start the bridge
 #
-# Environment overrides: TODOFORAI_DL_BASE, TODOFORAI_PREFIX, TODOFORAI_CHANNEL.
+# Environment overrides: TODOFORAI_PREFIX, TODOFORAI_TAG.
 
 set -eu
 
-DL_BASE="${TODOFORAI_DL_BASE:-https://dl.todofor.ai}"
+REPO="todoforai/bridge"
 PREFIX="${TODOFORAI_PREFIX:-$HOME/.todoforai/bin}"
-CHANNEL="${TODOFORAI_CHANNEL:-stable}"
+TAG="${TODOFORAI_TAG:-}"
 TOKEN=""
 DEVICE_NAME=""
 DO_SERVICE=1
 DO_START=1
 
-die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m::\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
 
@@ -35,11 +35,11 @@ while [ $# -gt 0 ]; do
         --token)      TOKEN="${2:-}"; shift 2 ;;
         --name)       DEVICE_NAME="${2:-}"; shift 2 ;;
         --prefix)     PREFIX="${2:-}"; shift 2 ;;
-        --channel)    CHANNEL="${2:-}"; shift 2 ;;
+        --tag)        TAG="${2:-}"; shift 2 ;;
         --no-service) DO_SERVICE=0; shift ;;
         --no-start)   DO_START=0; shift ;;
         -h|--help)
-            sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
@@ -50,7 +50,7 @@ uname_m=$(uname -m)
 case "$uname_s" in
     Linux)  os=linux ;;
     Darwin) os=darwin ;;
-    *)      die "unsupported OS: $uname_s" ;;
+    *)      die "unsupported OS: $uname_s (Windows coming soon)" ;;
 esac
 case "$uname_m" in
     x86_64|amd64) arch=x64 ;;
@@ -58,8 +58,6 @@ case "$uname_m" in
     *) die "unsupported arch: $uname_m" ;;
 esac
 asset="bridge-${os}-${arch}"
-url="${DL_BASE}/${CHANNEL}/${asset}"
-sha_url="${url}.sha256"
 
 # ── fetch tool ──────────────────────────────────────────────────────────────
 if command -v curl >/dev/null 2>&1; then
@@ -70,12 +68,22 @@ else
     die "need curl or wget"
 fi
 
+# ── resolve release tag (default: latest) ──────────────────────────────────
+if [ -z "$TAG" ]; then
+    info "finding latest release"
+    TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    [ -z "$TAG" ] && die "could not determine latest release (see https://github.com/$REPO/releases)"
+fi
+url="https://github.com/$REPO/releases/download/$TAG/$asset"
+sha_url="${url}.sha256"
+
 # ── download + verify ───────────────────────────────────────────────────────
 mkdir -p "$PREFIX"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-info "Downloading $asset ($CHANNEL) from $DL_BASE"
+info "downloading $asset ($TAG)"
 fetch "$url"     "$tmp/bridge"     || die "download failed: $url"
 fetch "$sha_url" "$tmp/bridge.sha" || die "checksum fetch failed: $sha_url"
 
@@ -175,8 +183,6 @@ EOF
 }
 
 install_loop_fallback() {
-    # Inline restart loop — for systems without systemd or launchd.
-    # Treats clean exit + SIGTERM (143, used by self-update) as normal restarts.
     loop="$PREFIX/bridge-loop"
     cat >"$loop" <<EOF
 #!/bin/sh
