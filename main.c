@@ -587,20 +587,11 @@ static int cmd_enroll(int argc, char **argv) {
     noise_random(id_bytes, 4);
     login_hex_encode(id_hex, id_bytes, 4);
 
-    char name_field[320] = "";
-    if (device_name && *device_name) {
-        char name_esc[256];
-        if (json_escape_buf(name_esc, sizeof(name_esc), device_name) != 0) {
-            fprintf(stderr, "error: device name too long\n"); return 1;
-        }
-        snprintf(name_field, sizeof(name_field), ",\"deviceName\":\"%s\"", name_esc);
-    }
-
     char req[1024];
     int n = snprintf(req, sizeof(req),
         "{\"id\":\"%s\",\"type\":\"cli.enroll.mint\","
-        "\"payload\":{\"deviceId\":\"%s\",\"secret\":\"%s\",\"ttlSec\":%ld%s}}",
-        id_hex, creds.device_id, creds.device_secret, ttl_sec, name_field);
+        "\"payload\":{\"deviceId\":\"%s\",\"secret\":\"%s\",\"ttlSec\":%ld}}",
+        id_hex, creds.device_id, creds.device_secret, ttl_sec);
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: request too long\n"); return 1; }
 
     char resp[LOGIN_CONFIG_MAX];
