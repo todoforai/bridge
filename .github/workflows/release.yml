@@ -46,13 +46,12 @@ jobs:
         with:
           path: bridge
 
-      # Sibling c-core, as expected by Makefile (-I../todoforai-c-core/...)
+      # Sibling c-core (public), as expected by Makefile (-I../todoforai-c-core/...)
       - name: Checkout c-core
         uses: actions/checkout@v4
         with:
           repository: todoforai/todoforai-c-core
           path: todoforai-c-core
-          ref: main
 
       - name: Install zig (linux targets)
         if: startsWith(matrix.target, 'linux-')
