@@ -462,7 +462,7 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
 }
 
 // Redeem an enrollment token for fresh device credentials and save them.
-static int redeem_enroll_token(const char *token, const char *device_name) {
+static int redeem_enroll_token(const char *token) {
     const char *addr, *pub;
     enroll_backend(&addr, &pub);
 
@@ -471,22 +471,10 @@ static int redeem_enroll_token(const char *token, const char *device_name) {
     login_hex_encode(id_hex, id_bytes, 4);
 
     char req[1024];
-    int n;
-    if (device_name && *device_name) {
-        char name_esc[256];
-        if (json_escape_buf(name_esc, sizeof(name_esc), device_name) != 0) {
-            fprintf(stderr, "error: device name too long\n"); return -1;
-        }
-        n = snprintf(req, sizeof(req),
-            "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
-            "\"payload\":{\"token\":\"%s\",\"deviceName\":\"%s\"}}",
-            id_hex, token, name_esc);
-    } else {
-        n = snprintf(req, sizeof(req),
-            "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
-            "\"payload\":{\"token\":\"%s\"}}",
-            id_hex, token);
-    }
+    int n = snprintf(req, sizeof(req),
+        "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
+        "\"payload\":{\"token\":\"%s\"}}",
+        id_hex, token);
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: token too long\n"); return -1; }
 
     char resp[LOGIN_CONFIG_MAX];
@@ -540,8 +528,9 @@ static int cmd_login(int argc, char **argv) {
 
     // Non-interactive path: redeem an enrollment token minted by another bridge
     // (or by the backend via `cli.enroll.mint` / REST). No browser, no polling.
+    // Token is the only capability needed; server picks sensible device defaults.
     if (token && *token) {
-        return redeem_enroll_token(token, device_name) == 0 ? 0 : 1;
+        return redeem_enroll_token(token) == 0 ? 0 : 1;
     }
 
     const char *addr, *pub;
@@ -631,8 +620,11 @@ static void print_help(void) {
     printf("bridge " BRIDGE_VERSION " — TODOforAI edge agent\n\n"
            "Usage:\n"
            "  bridge %s\n"
+           "      Run the edge agent (default).\n"
            "  bridge %s\n"
+           "      Interactive device login; use --token to skip the browser prompt.\n"
            "  bridge %s\n"
+           "      Print a one-time enrollment token for provisioning another device.\n"
            "  bridge --version | -v\n"
            "  bridge --help    | -h\n\n"
            "Env: EDGE_HOST, EDGE_PORT, EDGE_SERVER_PUBKEY, EDGE_DEVICE_NAME\n",
