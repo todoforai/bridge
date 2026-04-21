@@ -641,10 +641,11 @@ static void print_help(void) {
            "Usage:\n"
            "  bridge %s\n"
            "  bridge %s\n"
+           "  bridge %s\n"
            "  bridge --version | -v\n"
            "  bridge --help    | -h\n\n"
            "Env: EDGE_HOST, EDGE_PORT, EDGE_SERVER_PUBKEY, EDGE_DEVICE_NAME\n",
-           USAGE_MAIN, USAGE_LOGIN);
+           USAGE_MAIN, USAGE_LOGIN, USAGE_ENROLL);
 }
 
 int main(int argc, char **argv) {
@@ -656,6 +657,9 @@ int main(int argc, char **argv) {
     // shows the login-specific usage).
     if (argc >= 2 && strcmp(argv[1], "login") == 0) {
         return cmd_login(argc - 1, argv + 1);
+    }
+    if (argc >= 2 && strcmp(argv[1], "enroll") == 0) {
+        return cmd_enroll(argc - 1, argv + 1);
     }
 
     const char *host = NULL, *port_s = NULL, *pubkey_hex = NULL;
