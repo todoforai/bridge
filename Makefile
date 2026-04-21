@@ -36,5 +36,28 @@ static: | build
 	zig cc -target x86_64-linux-musl -static $(CFLAGS) -o build/bridge-static \
 	    $(SRCS) -lutil
 
+# ── Release targets ─────────────────────────────────────────────────────────
+# Produce a single stripped artifact named build/bridge-<os>-<arch>.
+# Used by CI; locally requires `zig` (Linux) or Xcode clang (macOS).
+
+.PHONY: release-linux-x64 release-linux-arm64 release-darwin-x64 release-darwin-arm64
+
+release-linux-x64: | build
+	zig cc -target x86_64-linux-musl -static $(CFLAGS) -o build/bridge-linux-x64 $(SRCS) -lutil
+	strip build/bridge-linux-x64 2>/dev/null || true
+
+release-linux-arm64: | build
+	zig cc -target aarch64-linux-musl -static $(CFLAGS) -o build/bridge-linux-arm64 $(SRCS) -lutil
+	strip build/bridge-linux-arm64 2>/dev/null || true
+
+# macOS: link to system libc (no static option on darwin); Xcode's clang picks the SDK.
+release-darwin-x64: | build
+	clang -target x86_64-apple-macos11 $(CFLAGS) -o build/bridge-darwin-x64 $(SRCS)
+	strip build/bridge-darwin-x64 2>/dev/null || true
+
+release-darwin-arm64: | build
+	clang -target arm64-apple-macos11 $(CFLAGS) -o build/bridge-darwin-arm64 $(SRCS)
+	strip build/bridge-darwin-arm64 2>/dev/null || true
+
 clean:
 	rm -rf build

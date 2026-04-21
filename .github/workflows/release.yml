@@ -1,0 +1,130 @@
+# Release workflow — triggered by pushing a tag like v0.1.0.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Builds bridge-{linux,darwin}-{x64,arm64} + .sha256 sidecars, then creates a
+# GitHub Release with those assets. The installer at
+# https://todofor.ai/bridge reads `releases/latest` via the public GitHub API.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build + release (e.g. v0.1.0). Required for manual runs.'
+        required: true
+
+permissions:
+  contents: write   # for gh release create / upload
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+            make: release-linux-x64
+          - target: linux-arm64
+            os: ubuntu-latest
+            make: release-linux-arm64
+          - target: darwin-x64
+            os: macos-latest
+            make: release-darwin-x64
+          - target: darwin-arm64
+            os: macos-latest
+            make: release-darwin-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+        with:
+          path: bridge
+
+      # Sibling c-core, as expected by Makefile (-I../todoforai-c-core/...)
+      - name: Checkout c-core
+        uses: actions/checkout@v4
+        with:
+          repository: todoforai/todoforai-c-core
+          path: todoforai-c-core
+          ref: main
+
+      - name: Install zig (linux targets)
+        if: startsWith(matrix.target, 'linux-')
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build ${{ matrix.target }}
+        working-directory: bridge
+        run: make ${{ matrix.make }}
+
+      - name: Compute sha256
+        working-directory: bridge/build
+        run: |
+          if command -v sha256sum >/dev/null; then
+            sha256sum bridge-${{ matrix.target }} > bridge-${{ matrix.target }}.sha256
+          else
+            shasum -a 256 bridge-${{ matrix.target }} > bridge-${{ matrix.target }}.sha256
+          fi
+          cat bridge-${{ matrix.target }}.sha256
+
+      - name: Smoke test binary
+        working-directory: bridge/build
+        # Darwin-x64 cross-builds won't run on arm64 runners, so skip there.
+        if: matrix.target != 'darwin-x64' || runner.arch == 'X64'
+        run: ./bridge-${{ matrix.target }} --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-${{ matrix.target }}
+          path: |
+            bridge/build/bridge-${{ matrix.target }}
+            bridge/build/bridge-${{ matrix.target }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for gh CLI context)
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lah dist/
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          # Create the release if it doesn't exist; otherwise upload into it.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "bridge $tag" \
+              --generate-notes
+          fi
