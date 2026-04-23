@@ -12,9 +12,9 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 CORE = ../todoforai-c-core
-SRCS = main.c conn.c pty.c identity.c update.c util.c \
+SRCS = main.c conn.c pty.c identity.c tools.c update.c util.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c $(CORE)/noise/vendor/blake2s.c
-HDRS = conn.h pty.h identity.h update.h util.h json.h \
+HDRS = conn.h pty.h identity.h tools.h update.h util.h json.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/noise/vendor/blake2.h $(CORE)/noise/vendor/blake2-impl.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h

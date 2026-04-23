@@ -31,6 +31,7 @@
 #include "identity.h"  // BRIDGE_VERSION
 #include "json.h"
 #include "pty.h"
+#include "tools.h"
 #include "update.h"
 #include "util.h"
 
@@ -43,7 +44,6 @@
 // Plain HTTP port — bridge has no TLS client; Noise provides end-to-end crypto.
 #define DEFAULT_PORT         80
 #define DEFAULT_PATH         "/ws/v2/bridge"
-#define DEFAULT_PATH_SANDBOX "/ws/v2/bridge?deviceType=SANDBOX"
 #define DEFAULT_SHELL        "/bin/sh"
 #define BUF_SIZE             4096
 #define MAX_SESSIONS         16
@@ -285,6 +285,46 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 break;
             }
         }
+
+    } else if (IS("tool_catalog")) {
+        // Server pushed the shell-command catalog; scan and reply.
+        const char *entries = NULL; size_t entries_len = 0;
+        if (!json_str(msg, msg_len, "entries", &entries, &entries_len)) return 0;
+
+        // Unescape JSON \t, \n, \\, \" in place (we own a decoded copy).
+        char *buf = malloc(entries_len + 1);
+        if (!buf) return 0;
+        size_t w = 0;
+        for (size_t i = 0; i < entries_len; i++) {
+            char c = entries[i];
+            if (c == '\\' && i + 1 < entries_len) {
+                char n = entries[++i];
+                switch (n) {
+                    case 't':  buf[w++] = '\t'; break;
+                    case 'n':  buf[w++] = '\n'; break;
+                    case 'r':  buf[w++] = '\r'; break;
+                    case '\\': buf[w++] = '\\'; break;
+                    case '"':  buf[w++] = '"';  break;
+                    case '/':  buf[w++] = '/';  break;
+                    default:   buf[w++] = n;    break;
+                }
+            } else {
+                buf[w++] = c;
+            }
+        }
+        buf[w] = '\0';
+
+        char *out = malloc(MAX_MSG);
+        if (!out) { free(buf); return 0; }
+        int n = bridge_scan_tools(buf, w, out, MAX_MSG);
+        free(buf);
+        if (n > 0) {
+            send_json(e, out, (size_t)n);
+            fprintf(stderr, "Scanned tools, %d bytes reported\n", n);
+        } else {
+            fprintf(stderr, "Tool scan failed (overflow or empty)\n");
+        }
+        free(out);
     }
 
     #undef IS
@@ -363,30 +403,8 @@ static int run(edge_t *e, const char *device_id, const char *device_secret) {
 // ── Args / env ──────────────────────────────────────────────────────────────
 
 static const char *USAGE_MAIN   = "[--host HOST] [--port PORT] [--server-pubkey HEX]";
-static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN]";
+static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--device-type TYPE]";
 static const char *USAGE_ENROLL = "enroll [--ttl SECONDS] [--device-name NAME] [--quiet]";
-
-static int read_cmdline_token(char *out, size_t cap) {
-    int fd = open("/proc/cmdline", O_RDONLY);
-    if (fd < 0) return -1;
-    char buf[4096];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return -1;
-    buf[n] = '\0';
-
-    const char *needle = "edge.token=";
-    const char *p = strstr(buf, needle);
-    if (!p) return -1;
-    p += strlen(needle);
-    size_t i = 0;
-    while (p[i] && p[i] != ' ' && p[i] != '\n' && i < cap - 1) {
-        out[i] = p[i]; i++;
-    }
-    if (i == 0) return -1;
-    out[i] = '\0';
-    return 0;
-}
 
 static int parse_pubkey_hex(const char *hex, uint8_t out[32]) {
     if (!hex || strlen(hex) != 64) return -1;
@@ -462,7 +480,8 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
 }
 
 // Redeem an enrollment token for fresh device credentials and save them.
-static int redeem_enroll_token(const char *token) {
+// deviceType defaults to "PC"; sandbox `/init` passes "SANDBOX".
+static int redeem_enroll_token(const char *token, const char *device_type) {
     const char *addr, *pub;
     enroll_backend(&addr, &pub);
 
@@ -470,13 +489,22 @@ static int redeem_enroll_token(const char *token) {
     noise_random(id_bytes, 4);
     login_hex_encode(id_hex, id_bytes, 4);
 
-    // Bridge is always a PC-class device; other clients (sandbox, browser)
-    // declare their own type at redeem time.
+    if (!device_type || !*device_type) device_type = "PC";
+
+    // deviceType is a restricted identifier — reject anything outside [A-Z0-9_]
+    // to avoid JSON injection and keep names tidy server-side.
+    for (const char *p = device_type; *p; p++) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) {
+            fprintf(stderr, "error: invalid --device-type (allowed: A-Z 0-9 _)\n");
+            return -1;
+        }
+    }
+
     char req[1024];
     int n = snprintf(req, sizeof(req),
         "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
-        "\"payload\":{\"token\":\"%s\",\"deviceType\":\"PC\"}}",
-        id_hex, token);
+        "\"payload\":{\"token\":\"%s\",\"deviceType\":\"%s\"}}",
+        id_hex, token, device_type);
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: token too long\n"); return -1; }
 
     char resp[LOGIN_CONFIG_MAX];
@@ -511,28 +539,32 @@ static int redeem_enroll_token(const char *token) {
 static int cmd_login(int argc, char **argv) {
     const char *device_name = NULL;
     const char *token       = NULL;
+    const char *device_type = NULL;
     ko_longopt_t longopts[] = {
         { "help",        ko_no_argument,       'h' },
         { "device-name", ko_required_argument, 'n' },
         { "token",       ko_required_argument, 't' },
+        { "device-type", ko_required_argument, 'T' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:T:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "bridge", USAGE_LOGIN); return 0; }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
+        else if (c == 'T') device_type = opt.arg;
         else cli_parse_error("bridge", USAGE_LOGIN, argc, argv, &opt, c);
     }
     if (!device_name) device_name = getenv("EDGE_DEVICE_NAME");
     if (!token)       token       = getenv("EDGE_ENROLL_TOKEN");
+    if (!device_type) device_type = getenv("EDGE_DEVICE_TYPE");
 
     // Non-interactive path: redeem an enrollment token minted by another bridge
     // (or by the backend via `cli.enroll.mint` / REST). No browser, no polling.
-    // Token is the only capability needed; server picks sensible device defaults.
+    // Token is the only capability needed; caller declares its device type.
     if (token && *token) {
-        return redeem_enroll_token(token) == 0 ? 0 : 1;
+        return redeem_enroll_token(token, device_type) == 0 ? 0 : 1;
     }
 
     const char *addr, *pub;
@@ -697,15 +729,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // /proc/cmdline fallback (for kernel-driven sandbox boot) routes to sandbox path.
-    char cmdline_tok[512];
-    int from_cmdline = (read_cmdline_token(cmdline_tok, sizeof(cmdline_tok)) == 0);
-    (void)cmdline_tok; // cmdline token path is obsolete — device credentials are used instead
-    const char *path = from_cmdline ? DEFAULT_PATH_SANDBOX : DEFAULT_PATH;
-
     fprintf(stderr, "Connecting to %s:%u (noise) as device %s...\n", host, (unsigned)port, saved_creds.device_id);
 
-    bridge_conn_t *conn = bridge_conn_open(host, port, path, server_pubkey);
+    bridge_conn_t *conn = bridge_conn_open(host, port, DEFAULT_PATH, server_pubkey);
     if (!conn) { fprintf(stderr, "connect failed\n"); return 1; }
     fprintf(stderr, "Connected\n");
 
