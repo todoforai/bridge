@@ -388,7 +388,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret) {
         for (int i = 0; i < MAX_SESSIONS; i++) {
             session_t *s = &e->sessions[i];
             if (!s->active) continue;
-            fds[nfds].fd = s->pty.master_fd;
+            fds[nfds].fd = bridge_pty_pollfd(&s->pty);
             fds[nfds].events = POLLIN;
             fds[nfds].revents = 0;
             session_idx[nfds - pty_base] = i;

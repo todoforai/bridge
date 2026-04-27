@@ -112,3 +112,7 @@ int bridge_pty_close(bridge_pty_t *p) {
     }
     return code;
 }
+
+int bridge_pty_pollfd(const bridge_pty_t *p) {
+    return p->master_fd;
+}

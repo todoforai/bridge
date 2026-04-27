@@ -20,10 +20,10 @@ for the overall model.
 ## Wire protocol
 
 ```
-TCP → WebSocket → Noise_NX_25519_ChaChaPoly_BLAKE2s → JSON
+TCP → WebSocket → Noise_NX_25519_ChaChaPoly_BLAKE2b → JSON
 ```
 
-No TLS. No OpenSSL. All crypto handled by Noise (monocypher + blake2s,
+No TLS. No OpenSSL. All crypto handled by Noise (monocypher + blake2b,
 vendored in `noise/`).
 
 After the Noise handshake, each binary WS frame carries one encrypted
@@ -52,7 +52,7 @@ Server side: `backend/src/api/ws/handlers/BridgeHandler.ts`.
 | `identity.c` / `.h`   | Host identity gathering (`uname`, `pwd`, cwd)       |
 | `update.c` / `.h`     | Self-update: startup swap of staged `<exe>.new`     |
 | `json.h`              | Minimal JSON extraction (string/int by key)         |
-| `noise/`              | Vendored `noise.c` + `monocypher` + `blake2s`       |
+| `noise/`              | Vendored `noise.c` + `monocypher` (BLAKE2b)         |
 
 ## Build
 
@@ -83,7 +83,7 @@ make static
 # Via env
 EDGE_HOST=... EDGE_PORT=... EDGE_SERVER_PUBKEY=... ./build/bridge
 
-# Firecracker sandbox: presence of edge.token=... in /proc/cmdline
+# Firecracker sandbox: presence of enroll.token=... in /proc/cmdline
 # routes to DeviceType.SANDBOX path (?deviceType=SANDBOX).
 
 # Show version / help

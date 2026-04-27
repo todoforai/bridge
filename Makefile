@@ -11,12 +11,17 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
+# Platform PTY backend.
+PTY_SRC = pty_posix.c
+ifeq ($(OS),Windows_NT)
+  PTY_SRC = pty_win.c
+endif
+
 CORE = ../todoforai-c-core
-SRCS = main.c conn.c pty.c identity.c tools.c update.c util.c \
-       $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c $(CORE)/noise/vendor/blake2s.c
+SRCS = main.c conn.c $(PTY_SRC) identity.c tools.c update.c util.c \
+       $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 HDRS = conn.h pty.h identity.h tools.h update.h util.h json.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
-       $(CORE)/noise/vendor/blake2.h $(CORE)/noise/vendor/blake2-impl.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
 .PHONY: all clean

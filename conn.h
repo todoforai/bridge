@@ -3,7 +3,7 @@
 // Exposes a plaintext message-oriented API to main.c. Under the hood:
 //   1. plain TCP connect
 //   2. WebSocket client handshake (no Bearer; auth happens inside Noise)
-//   3. Noise_NX_25519_ChaChaPoly_BLAKE2s handshake as initiator (2 binary WS frames)
+//   3. Noise_NX_25519_ChaChaPoly_BLAKE2b handshake as initiator (2 binary WS frames)
 //   4. transport: each binary WS frame carries one Noise-encrypted JSON message
 #ifndef BRIDGE_CONN_H
 #define BRIDGE_CONN_H
