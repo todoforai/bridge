@@ -61,5 +61,11 @@ release-darwin-arm64: | build
 	clang -target arm64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/bridge-darwin-arm64 $(SRCS)
 	strip build/bridge-darwin-arm64 2>/dev/null || true
 
+# Smoke test for the live PATH watcher (Linux only).
+.PHONY: test-watch
+test-watch: | build
+	$(CC) -O0 -g -Wall -Wextra -o build/test-watch test_watch.c tools.c util.c -lpthread
+	./build/test-watch
+
 clean:
 	rm -rf build

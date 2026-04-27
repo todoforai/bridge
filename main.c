@@ -317,7 +317,6 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         char *out = malloc(MAX_MSG);
         if (!out) { free(buf); return 0; }
         int n = bridge_scan_tools(buf, w, out, MAX_MSG);
-        free(buf);
         if (n > 0) {
             send_json(e, out, (size_t)n);
             fprintf(stderr, "Scanned tools, %d bytes reported\n", n);
@@ -325,6 +324,17 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             fprintf(stderr, "Tool scan failed (overflow or empty)\n");
         }
         free(out);
+
+        // Arm the live PATH watcher so future installs/removals push deltas.
+        // Linux only — on macOS this is a no-op stub. Watcher delivers deltas
+        // via an eventfd polled by the main loop, so all WS sends stay on this
+        // thread (Noise transport is not thread-safe).
+        int wrc = bridge_tools_watch_init(buf, w);
+        free(buf);
+        if (wrc < 0) {
+            fprintf(stderr, "FATAL: tools watcher failed to start\n");
+            return -1;
+        }
     }
 
     #undef IS
@@ -361,19 +371,27 @@ static int run(edge_t *e, const char *device_id, const char *device_secret) {
             }
         }
 
-        struct pollfd fds[1 + MAX_SESSIONS];
+        // 0 = WS conn, 1 = (optional) tools watcher delta-ready eventfd,
+        // then active PTY master fds starting at `pty_base`.
+        struct pollfd fds[2 + MAX_SESSIONS];
         int session_idx[MAX_SESSIONS];
         fds[0].fd = bridge_conn_fd(e->conn);
-        fds[0].events = POLLIN;
-        fds[0].revents = 0;
+        fds[0].events = POLLIN; fds[0].revents = 0;
         nfds_t nfds = 1;
+        int tools_idx = -1;
+        int tools_fd = bridge_tools_watch_eventfd();
+        if (tools_fd >= 0) {
+            fds[nfds].fd = tools_fd; fds[nfds].events = POLLIN; fds[nfds].revents = 0;
+            tools_idx = (int)nfds; nfds++;
+        }
+        nfds_t pty_base = nfds;
         for (int i = 0; i < MAX_SESSIONS; i++) {
             session_t *s = &e->sessions[i];
             if (!s->active) continue;
             fds[nfds].fd = s->pty.master_fd;
             fds[nfds].events = POLLIN;
             fds[nfds].revents = 0;
-            session_idx[nfds - 1] = i;
+            session_idx[nfds - pty_base] = i;
             nfds++;
         }
 
@@ -384,11 +402,21 @@ static int run(edge_t *e, const char *device_id, const char *device_secret) {
         if (fds[0].revents & POLLIN) {
             long n = bridge_conn_recv(e->conn, e->msg_buf, sizeof(e->msg_buf));
             if (n <= 0) return -1;
-            (void)handle_command(e, (const char *)e->msg_buf, (size_t)n);
+            if (handle_command(e, (const char *)e->msg_buf, (size_t)n) != 0) return -1;
         }
 
-        for (nfds_t k = 1; k < nfds; k++) {
-            session_t *s = &e->sessions[session_idx[k - 1]];
+        // Drain the tools watcher: send queued delta on the main thread.
+        if (tools_idx >= 0 && (fds[tools_idx].revents & POLLIN)) {
+            char *delta = malloc(MAX_MSG);
+            if (delta) {
+                int dn = bridge_tools_watch_drain(delta, MAX_MSG);
+                if (dn > 0) send_json(e, delta, (size_t)dn);
+                free(delta);
+            }
+        }
+
+        for (nfds_t k = pty_base; k < nfds; k++) {
+            session_t *s = &e->sessions[session_idx[k - pty_base]];
             if (!s->active) continue;
             if (fds[k].revents & POLLIN) forward_pty_output(e, s);
             if (fds[k].revents & (POLLHUP | POLLERR)) {
@@ -405,6 +433,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret) {
 static const char *USAGE_MAIN   = "[--host HOST] [--port PORT] [--server-pubkey HEX]";
 static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--device-type TYPE]";
 static const char *USAGE_ENROLL = "enroll [--ttl SECONDS] [--device-name NAME] [--quiet]";
+static const char *USAGE_WHOAMI = "whoami";
 
 static int parse_pubkey_hex(const char *hex, uint8_t out[32]) {
     if (!hex || strlen(hex) != 64) return -1;
@@ -462,7 +491,7 @@ static int noise_oneshot(const char *backend_addr, const char *backend_pub,
 }
 
 // Parse device creds out of a successful enroll.redeem / login.poll response.
-// Looks for the nested "device":{"id":...,"secret":...,"name":...} object.
+// Looks for the nested "device":{...} and optional "user":{...} objects.
 static int parse_device_creds(const char *resp, login_credentials_t *creds) {
     memset(creds, 0, sizeof(*creds));
     const char *dev = strstr(resp, "\"device\"");
@@ -472,10 +501,12 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
     json_find_string(dev, "id",     creds->device_id,     sizeof(creds->device_id));
     json_find_string(dev, "secret", creds->device_secret, sizeof(creds->device_secret));
     json_find_string(dev, "name",   creds->device_name,   sizeof(creds->device_name));
-    json_find_string(resp, "browserManagerNoiseAddr",      creds->browser_manager_noise_addr,       sizeof(creds->browser_manager_noise_addr));
-    json_find_string(resp, "browserManagerNoisePublicKey", creds->browser_manager_noise_public_key, sizeof(creds->browser_manager_noise_public_key));
-    json_find_string(resp, "sandboxManagerNoiseAddr",      creds->sandbox_manager_noise_addr,       sizeof(creds->sandbox_manager_noise_addr));
-    json_find_string(resp, "sandboxManagerNoisePublicKey", creds->sandbox_manager_noise_public_key, sizeof(creds->sandbox_manager_noise_public_key));
+    const char *usr = strstr(resp, "\"user\"");
+    if (usr && (usr = strchr(usr, '{'))) {
+        json_find_string(usr, "id",    creds->user_id,    sizeof(creds->user_id));
+        json_find_string(usr, "email", creds->user_email, sizeof(creds->user_email));
+        json_find_string(usr, "name",  creds->user_name,  sizeof(creds->user_name));
+    }
     return (creds->device_id[0] && creds->device_secret[0]) ? 0 : -1;
 }
 
@@ -648,6 +679,19 @@ static int cmd_enroll(int argc, char **argv) {
     return 0;
 }
 
+// ── whoami subcommand ───────────────────────────────────────────────────────
+
+static int cmd_whoami(int argc, char **argv) {
+    ko_longopt_t longopts[] = {{ "help", ko_no_argument, 'h' }, { 0, 0, 0 }};
+    ketopt_t opt = KETOPT_INIT;
+    int c;
+    while ((c = ketopt(&opt, argc, argv, 1, "h", longopts)) >= 0) {
+        if (c == 'h') { cli_usage(stdout, "bridge", USAGE_WHOAMI); return 0; }
+        cli_parse_error("bridge", USAGE_WHOAMI, argc, argv, &opt, c);
+    }
+    return login_print_whoami("bridge");
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 static void print_help(void) {
@@ -659,10 +703,12 @@ static void print_help(void) {
            "      Interactive device login; use --token to skip the browser prompt.\n"
            "  bridge %s\n"
            "      Print a one-time enrollment token for provisioning another device.\n"
-           "  bridge --version | -v\n"
-           "  bridge --help    | -h\n\n"
+           "  bridge %s\n"
+           "      Show the logged-in user and device.\n"
+           "  bridge version | --version | -v\n"
+           "  bridge --help  | -h\n\n"
            "Env: EDGE_HOST, EDGE_PORT, EDGE_SERVER_PUBKEY, EDGE_DEVICE_NAME\n",
-           USAGE_MAIN, USAGE_LOGIN, USAGE_ENROLL);
+           USAGE_MAIN, USAGE_LOGIN, USAGE_ENROLL, USAGE_WHOAMI);
 }
 
 int main(int argc, char **argv) {
@@ -678,11 +724,17 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "enroll") == 0) {
         return cmd_enroll(argc - 1, argv + 1);
     }
+    if (argc >= 2 && strcmp(argv[1], "whoami") == 0) {
+        return cmd_whoami(argc - 1, argv + 1);
+    }
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "version") == 0)) {
+        printf("%s\n", BRIDGE_VERSION);
+        return 0;
+    }
 
     const char *host = NULL, *port_s = NULL, *pubkey_hex = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
-        { "version",       ko_no_argument,       'v' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "server-pubkey", ko_required_argument, 'k' },
@@ -690,9 +742,8 @@ int main(int argc, char **argv) {
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hvH:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:k:", longopts)) >= 0) {
         if      (c == 'h') { print_help(); return 0; }
-        else if (c == 'v') { printf("%s\n", BRIDGE_VERSION); return 0; }
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pubkey_hex = opt.arg;
@@ -741,6 +792,7 @@ int main(int argc, char **argv) {
 
     int rc = run(e, saved_creds.device_id, saved_creds.device_secret);
 
+    bridge_tools_watch_stop();
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
     }
