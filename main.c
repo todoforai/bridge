@@ -354,7 +354,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret) {
 
     // Identity
     char id_json[1024];
-    int id_len = bridge_identity_json(id_json, sizeof(id_json));
+    int id_len = bridge_identity_json(id_json, sizeof(id_json), 0);
     if (id_len < 0) return -1;
     if (send_json(e, id_json, (size_t)id_len) != 0) return -1;
     fprintf(stderr, "Identified\n");
@@ -431,7 +431,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret) {
 // ── Args / env ──────────────────────────────────────────────────────────────
 
 static const char *USAGE_MAIN   = "[--host HOST] [--port PORT] [--server-pubkey HEX]";
-static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--device-type TYPE]";
+static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN]";
 static const char *USAGE_ENROLL = "enroll [--ttl SECONDS] [--device-name NAME] [--quiet]";
 static const char *USAGE_WHOAMI = "whoami";
 
@@ -511,8 +511,10 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
 }
 
 // Redeem an enrollment token for fresh device credentials and save them.
-// deviceType defaults to "PC"; sandbox `/init` passes "SANDBOX".
-static int redeem_enroll_token(const char *token, const char *device_type) {
+// The redeemer self-describes via identity gathered from the host (uname,
+// /etc/os-release, sandbox marker, …). Backend derives `deviceType` from
+// `identity.deviceType` and stores the rest as device metadata.
+static int redeem_enroll_token(const char *token) {
     const char *addr, *pub;
     enroll_backend(&addr, &pub);
 
@@ -520,23 +522,16 @@ static int redeem_enroll_token(const char *token, const char *device_type) {
     noise_random(id_bytes, 4);
     login_hex_encode(id_hex, id_bytes, 4);
 
-    if (!device_type || !*device_type) device_type = "PC";
+    char identity[1024];
+    int ilen = bridge_identity_json(identity, sizeof(identity), 1);
+    if (ilen < 0) { fprintf(stderr, "error: failed to gather identity\n"); return -1; }
 
-    // deviceType is a restricted identifier — reject anything outside [A-Z0-9_]
-    // to avoid JSON injection and keep names tidy server-side.
-    for (const char *p = device_type; *p; p++) {
-        if (!((*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) {
-            fprintf(stderr, "error: invalid --device-type (allowed: A-Z 0-9 _)\n");
-            return -1;
-        }
-    }
-
-    char req[1024];
+    char req[2048];
     int n = snprintf(req, sizeof(req),
         "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
-        "\"payload\":{\"token\":\"%s\",\"deviceType\":\"%s\"}}",
-        id_hex, token, device_type);
-    if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: token too long\n"); return -1; }
+        "\"payload\":{\"token\":\"%s\",\"identity\":%s}}",
+        id_hex, token, identity);
+    if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: payload too long\n"); return -1; }
 
     char resp[LOGIN_CONFIG_MAX];
     int rn = noise_oneshot(addr, pub, req, (size_t)n, resp, sizeof(resp));
@@ -570,32 +565,29 @@ static int redeem_enroll_token(const char *token, const char *device_type) {
 static int cmd_login(int argc, char **argv) {
     const char *device_name = NULL;
     const char *token       = NULL;
-    const char *device_type = NULL;
     ko_longopt_t longopts[] = {
         { "help",        ko_no_argument,       'h' },
         { "device-name", ko_required_argument, 'n' },
         { "token",       ko_required_argument, 't' },
-        { "device-type", ko_required_argument, 'T' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:T:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "bridge", USAGE_LOGIN); return 0; }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
-        else if (c == 'T') device_type = opt.arg;
         else cli_parse_error("bridge", USAGE_LOGIN, argc, argv, &opt, c);
     }
     if (!device_name) device_name = getenv("EDGE_DEVICE_NAME");
     if (!token)       token       = getenv("EDGE_ENROLL_TOKEN");
-    if (!device_type) device_type = getenv("EDGE_DEVICE_TYPE");
 
     // Non-interactive path: redeem an enrollment token minted by another bridge
     // (or by the backend via `cli.enroll.mint` / REST). No browser, no polling.
-    // Token is the only capability needed; caller declares its device type.
+    // Token is the only capability needed; redeemer self-identifies via the
+    // identity payload (uname, /etc/os-release, sandbox marker).
     if (token && *token) {
-        return redeem_enroll_token(token, device_type) == 0 ? 0 : 1;
+        return redeem_enroll_token(token) == 0 ? 0 : 1;
     }
 
     const char *addr, *pub;
