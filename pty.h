@@ -11,8 +11,11 @@ typedef struct {
     int    alive;
 } bridge_pty_t;
 
-// Spawn `shell` in a new PTY. Returns 0 on success, -1 on failure.
-int bridge_pty_spawn(bridge_pty_t *p, const char *shell);
+// Spawn `shell` in a new PTY. `cwd` may be NULL. If `no_echo`, the slave
+// terminal starts with ECHO/ECHOE/ECHOK cleared (used by RUN to keep wrapper
+// command lines off the output stream — sentinel scanning relies on this).
+// Returns 0 on success, -1 on failure.
+int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no_echo);
 
 void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols);
 
@@ -34,5 +37,22 @@ int bridge_pty_close(bridge_pty_t *p);
 
 // Master fd, suitable for poll()/select(). POSIX-only.
 int bridge_pty_pollfd(const bridge_pty_t *p);
+
+// Probe whether any task in the PTY's foreground process group is parked in
+// a tty read — i.e. blocked waiting for stdin. Linux-only (uses /proc); on
+// other platforms returns 0.
+//
+//   echo_baseline     baseline of (c_lflag & ECHO) bool at session creation;
+//                     password_prompt fires only on transitions from that.
+//                     RUN sessions spawn with ECHO off (no_echo=1) so pass 0;
+//                     EXEC and other interactive sessions pass 1.
+//   *fg_pid           ← actual blocked pid when blocked (may be a child of
+//                     the pgrp leader, e.g. sudo/ssh)
+//   *password_prompt  ← 1 iff slave ECHO is off AND echo_baseline was on
+//                     (i.e. the user command turned echo off — getpass/sudo)
+//
+// Returns 1 if blocked-on-tty-read, 0 otherwise.
+int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
+                             pid_t *fg_pid, int *password_prompt);
 
 #endif
