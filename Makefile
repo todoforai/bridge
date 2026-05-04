@@ -14,7 +14,7 @@ endif
 CORE = ../todoforai-c-core
 SRCS = main.c conn.c pty_posix.c identity.c tools.c update.c util.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
-HDRS = conn.h pty.h identity.h tools.h update.h util.h json.h \
+HDRS = conn.h pty.h identity.h tools.h update.h util.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
