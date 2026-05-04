@@ -46,13 +46,15 @@ Server side: `backend/src/api/ws/handlers/BridgeHandler.ts`.
 | File                  | Purpose                                              |
 |-----------------------|------------------------------------------------------|
 | `main.c`              | Event loop, session table, command dispatch         |
+| `subcmd.c` / `.h`     | CLI subcommands: `login` / `enroll` / `whoami`      |
 | `conn.c` / `conn.h`   | TCP + WS client handshake + Noise_NX initiator      |
 | `util.c` / `util.h`   | Base64 + SHA-1 (for WS-Accept)                      |
 | `pty.c` / `pty.h`     | `forkpty` session: read/write/resize/signal         |
 | `identity.c` / `.h`   | Host identity gathering (`uname`, `pwd`, cwd)       |
+| `tools.c` / `.h`      | Probe installed CLI tools, emit `installed_tools`   |
 | `update.c` / `.h`     | Self-update: startup swap of staged `<exe>.new`     |
-| `json.h`              | Minimal JSON extraction (string/int by key)         |
 | `noise/`              | Vendored `noise.c` + `monocypher` (BLAKE2b)         |
+| `mongoose/`           | Vendored `mongoose` (WS, JSON, base64, printf)      |
 
 ## Build
 

@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,55 +115,27 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
         out[--used] = '\0';
     }
 
+    // Sanitize: replace control bytes (incl. ANSI ESC) with space. mg_print_esc
+    // only escapes \b\f\n\r\t\\\" — raw 0x00–0x1f would otherwise produce
+    // invalid JSON when embedded as a string value.
+    for (size_t i = 0; i < used; i++) {
+        if ((unsigned char)out[i] < 0x20) out[i] = ' ';
+    }
+
     if (WIFEXITED(exit_code)) return WEXITSTATUS(exit_code);
     return -1;
 }
 
-// Append a JSON-escaped string (enclosed in quotes) to `out`.
-// Returns 0 on success, -1 on overflow.
-static int json_append_quoted(char *out, size_t cap, size_t *used, const char *s) {
-    size_t u = *used;
-    if (u + 1 >= cap) return -1;
-    out[u++] = '"';
-    for (size_t i = 0; s[i]; i++) {
-        unsigned char c = (unsigned char)s[i];
-        const char *esc = NULL;
-        char esc_buf[8];
-        switch (c) {
-            case '"':  esc = "\\\""; break;
-            case '\\': esc = "\\\\"; break;
-            case '\n': esc = "\\n";  break;
-            case '\r': esc = "\\r";  break;
-            case '\t': esc = "\\t";  break;
-            case '\b': esc = "\\b";  break;
-            case '\f': esc = "\\f";  break;
-            default:
-                if (c < 0x20) {
-                    snprintf(esc_buf, sizeof(esc_buf), "\\u%04x", c);
-                    esc = esc_buf;
-                }
-                break;
-        }
-        if (esc) {
-            size_t el = strlen(esc);
-            if (u + el >= cap) return -1;
-            memcpy(out + u, esc, el); u += el;
-        } else {
-            if (u + 1 >= cap) return -1;
-            out[u++] = (char)c;
-        }
-    }
-    if (u + 1 >= cap) return -1;
-    out[u++] = '"';
-    *used = u;
+// Append `fmt` (mg_snprintf-style) at *used; advance *used. -1 on overflow.
+static int j_append(char *out, size_t cap, size_t *used, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    size_t avail = cap > *used ? cap - *used : 0;
+    size_t n = mg_vsnprintf(out + *used, avail, fmt, &ap);
+    va_end(ap);
+    if (n >= avail) return -1;
+    *used += n;
     return 0;
 }
-
-#define APPEND_LIT(lit) do { \
-    size_t _l = sizeof(lit) - 1; \
-    if (used + _l >= out_cap) return -1; \
-    memcpy(out + used, (lit), _l); used += _l; \
-} while (0)
 
 // Decode one catalog line: "<key>\t<b64_versionCmd>\t<b64_statusCmd>".
 // Returns 1 on success, 0 if the line is malformed/oversized.
@@ -210,35 +183,33 @@ static int probe_and_append(const char *key,
                     (!have_v && have_s && s_exit == 0);
     int authed = have_s ? (s_exit == 0) : installed;
 
-    if (!first) { if (*used + 1 >= out_cap) return -1; out[(*used)++] = ','; }
-    if (json_append_quoted(out, out_cap, used, key) != 0) return -1;
-    #define A(lit) do { size_t _l = sizeof(lit) - 1; \
-        if (*used + _l >= out_cap) return -1; \
-        memcpy(out + *used, (lit), _l); *used += _l; } while (0)
-    A(":{\"installed\":");
-    if (installed) A("true"); else A("false");
+    if (j_append(out, out_cap, used, "%s%m:{%m:%s",
+                 first ? "" : ",",
+                 MG_ESC(key),
+                 MG_ESC("installed"), installed ? "true" : "false") < 0) return -1;
     if (installed && have_v && v_exit == 0 && version_out[0] != '\0') {
         if (strlen(version_out) > VERSION_CAP) version_out[VERSION_CAP] = '\0';
-        A(",\"version\":");
-        if (json_append_quoted(out, out_cap, used, version_out) != 0) return -1;
+        if (j_append(out, out_cap, used, ",%m:%m",
+                     MG_ESC("version"), MG_ESC(version_out)) < 0) return -1;
     }
     if (installed && have_s) {
-        A(",\"authenticated\":");
-        if (authed) A("true"); else A("false");
+        if (j_append(out, out_cap, used, ",%m:%s",
+                     MG_ESC("authenticated"), authed ? "true" : "false") < 0) return -1;
         if (status_out[0] != '\0') {
-            A(",\"statusOutput\":");
-            if (json_append_quoted(out, out_cap, used, status_out) != 0) return -1;
+            if (j_append(out, out_cap, used, ",%m:%m",
+                         MG_ESC("statusOutput"), MG_ESC(status_out)) < 0) return -1;
         }
     }
-    A("}");
-    #undef A
+    if (j_append(out, out_cap, used, "}") < 0) return -1;
     return 0;
 }
 
 int bridge_scan_tools(const char *entries, size_t entries_len,
                       char *out, size_t out_cap) {
     size_t used = 0;
-    APPEND_LIT("{\"type\":\"installed_tools\",\"data\":{");
+    if (j_append(out, out_cap, &used, "{%m:%m,%m:{",
+                 MG_ESC("type"), MG_ESC("installed_tools"),
+                 MG_ESC("data")) < 0) return -1;
 
     int first = 1;
     const char *p = entries, *end = entries + entries_len;
@@ -260,7 +231,7 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
         p = line_end + 1;
     }
 
-    APPEND_LIT("}}");
+    if (j_append(out, out_cap, &used, "}}") < 0) return -1;
     if (used >= out_cap) return -1;
     out[used] = '\0';
     return (int)used;

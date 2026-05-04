@@ -252,7 +252,7 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
     } else {
         // Slow path: scan /proc for any task whose pgrp matches `fg` and that
         // is parked in a tty read. Costs ~one open+read per running task,
-        // gated by PAUSE_PROBE_MS so it runs at most a few Hz.
+        // gated by the caller's PAUSE_POLL_MS so it runs at most a few Hz.
         DIR *d = opendir("/proc");
         if (!d) return 0;
         pid_t blocked_pid = 0;

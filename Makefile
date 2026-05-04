@@ -3,6 +3,7 @@ CFLAGS  ?= -Os -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wno-unused-function
            -ffunction-sections -fdata-sections -fomit-frame-pointer \
            -DMG_TLS=MG_TLS_NONE -DMG_ENABLE_PACKED_FS=0 -DMG_ENABLE_FILE=0 \
            -DMG_ENABLE_MQTT=0 -DMG_ENABLE_SSI=0 -DMG_ENABLE_DIRECTORY_LISTING=0 \
+           -DMG_ENABLE_LOG=0 -DMG_ENABLE_CUSTOM_RANDOM=1 \
            -I../todoforai-c-core/noise -I../todoforai-c-core/cli \
            -I../todoforai-c-core/login -I../todoforai-c-core/vendor/mongoose
 LDFLAGS ?= -Wl,--gc-sections
@@ -15,10 +16,10 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 CORE = ../todoforai-c-core
-SRCS = main.c noise_ws.c pty_posix.c identity.c tools.c update.c \
+SRCS = main.c noise_ws.c pty_posix.c identity.c subcmd.c tools.c update.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c \
        $(CORE)/vendor/mongoose/mongoose.c
-HDRS = noise_ws.h pty.h identity.h tools.h update.h \
+HDRS = noise_ws.h pty.h identity.h subcmd.h tools.h update.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h \
        $(CORE)/vendor/mongoose/mongoose.h

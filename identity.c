@@ -10,6 +10,8 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include "mongoose.h"
+
 // Read first matching `KEY=value` line from a small text file. Strips surrounding
 // quotes. Returns 0 on found, -1 otherwise. Caller-owned `out` is NUL-terminated.
 static int read_kv(const char *path, const char *key, char *out, size_t out_cap) {
@@ -140,73 +142,47 @@ void bridge_identity_gather(bridge_identity_t *id) {
     if (!getcwd(id->cwd, sizeof(id->cwd))) {
         snprintf(id->cwd, sizeof(id->cwd), "/");
     }
-}
 
-// Append a JSON-escaped string (no surrounding quotes). Returns 0/-1 on overflow.
-static int append_escaped(char *out, size_t cap, size_t *used, const char *s) {
-    size_t o = *used;
-    for (size_t i = 0; s[i]; i++) {
-        unsigned char c = (unsigned char)s[i];
-        const char *esc = NULL;
-        char buf[8];
-        switch (c) {
-            case '"':  esc = "\\\""; break;
-            case '\\': esc = "\\\\"; break;
-            case '\n': esc = "\\n";  break;
-            case '\r': esc = "\\r";  break;
-            case '\t': esc = "\\t";  break;
-            case '\b': esc = "\\b";  break;
-            case '\f': esc = "\\f";  break;
-            default:
-                if (c < 0x20) { snprintf(buf, sizeof(buf), "\\u%04x", c); esc = buf; }
-                break;
-        }
-        if (esc) {
-            size_t el = strlen(esc);
-            if (o + el >= cap) return -1;
-            memcpy(out + o, esc, el); o += el;
-        } else {
-            if (o + 1 >= cap) return -1;
-            out[o++] = (char)c;
+    // Sanitize all fields: replace control bytes with space. mg_print_esc
+    // only escapes \b\f\n\r\t\\\"; raw 0x00–0x1f would produce invalid JSON.
+    char *fields[] = { id->os, id->arch, id->hostname, id->kernel, id->distro,
+                       id->distro_version, id->device_type, id->user,
+                       id->shell, id->home, id->cwd };
+    for (size_t f = 0; f < sizeof(fields)/sizeof(fields[0]); f++) {
+        for (char *p = fields[f]; *p; p++) {
+            if ((unsigned char)*p < 0x20) *p = ' ';
         }
     }
-    *used = o;
-    return 0;
 }
 
 int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     bridge_identity_t id;
     bridge_identity_gather(&id);
 
-    size_t u = 0;
-    #define LIT(s) do { size_t _l = sizeof(s) - 1; \
-        if (u + _l >= out_cap) return -1; \
-        memcpy(out + u, (s), _l); u += _l; } while (0)
-    #define FIELD(key, val) do { LIT("\"" key "\":\""); \
-        if (append_escaped(out, out_cap, &u, (val)) != 0) return -1; \
-        LIT("\""); } while (0)
+    // mg_snprintf %m + MG_ESC handles JSON escaping for free.
+    // Two near-identical formats — only the outer wrapper differs.
+    #define IDENTITY_FIELDS \
+        MG_ESC("edge_version"),   MG_ESC(BRIDGE_VERSION), \
+        MG_ESC("os"),             MG_ESC(id.os), \
+        MG_ESC("arch"),           MG_ESC(id.arch), \
+        MG_ESC("hostname"),       MG_ESC(id.hostname), \
+        MG_ESC("kernel"),         MG_ESC(id.kernel), \
+        MG_ESC("distro"),         MG_ESC(id.distro), \
+        MG_ESC("distro_version"), MG_ESC(id.distro_version), \
+        MG_ESC("deviceType"),     MG_ESC(id.device_type), \
+        MG_ESC("user"),           MG_ESC(id.user), \
+        MG_ESC("shell"),          MG_ESC(id.shell), \
+        MG_ESC("home"),           MG_ESC(id.home), \
+        MG_ESC("cwd"),            MG_ESC(id.cwd)
+    #define INNER "{%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m}"
 
-    LIT("{");
-    if (!top_level) LIT("\"type\":\"identity\",\"data\":{");
+    size_t n = top_level
+        ? mg_snprintf(out, out_cap, INNER, IDENTITY_FIELDS)
+        : mg_snprintf(out, out_cap, "{%m:%m,%m:" INNER "}",
+                      MG_ESC("type"), MG_ESC("identity"), MG_ESC("data"),
+                      IDENTITY_FIELDS);
 
-    LIT("\"edge_version\":\"" BRIDGE_VERSION "\",");
-    FIELD("os",             id.os);             LIT(",");
-    FIELD("arch",           id.arch);           LIT(",");
-    FIELD("hostname",       id.hostname);       LIT(",");
-    FIELD("kernel",         id.kernel);         LIT(",");
-    FIELD("distro",         id.distro);         LIT(",");
-    FIELD("distro_version", id.distro_version); LIT(",");
-    FIELD("deviceType",     id.device_type);    LIT(",");
-    FIELD("user",           id.user);           LIT(",");
-    FIELD("shell",          id.shell);          LIT(",");
-    FIELD("home",           id.home);           LIT(",");
-    FIELD("cwd",            id.cwd);
-
-    if (!top_level) LIT("}");
-    LIT("}");
-    if (u >= out_cap) return -1;
-    out[u] = '\0';
-    return (int)u;
-    #undef FIELD
-    #undef LIT
+    #undef INNER
+    #undef IDENTITY_FIELDS
+    return (n > 0 && n < out_cap) ? (int)n : -1;
 }
