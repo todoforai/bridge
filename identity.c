@@ -142,36 +142,71 @@ void bridge_identity_gather(bridge_identity_t *id) {
     }
 }
 
+// Append a JSON-escaped string (no surrounding quotes). Returns 0/-1 on overflow.
+static int append_escaped(char *out, size_t cap, size_t *used, const char *s) {
+    size_t o = *used;
+    for (size_t i = 0; s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        const char *esc = NULL;
+        char buf[8];
+        switch (c) {
+            case '"':  esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\n': esc = "\\n";  break;
+            case '\r': esc = "\\r";  break;
+            case '\t': esc = "\\t";  break;
+            case '\b': esc = "\\b";  break;
+            case '\f': esc = "\\f";  break;
+            default:
+                if (c < 0x20) { snprintf(buf, sizeof(buf), "\\u%04x", c); esc = buf; }
+                break;
+        }
+        if (esc) {
+            size_t el = strlen(esc);
+            if (o + el >= cap) return -1;
+            memcpy(out + o, esc, el); o += el;
+        } else {
+            if (o + 1 >= cap) return -1;
+            out[o++] = (char)c;
+        }
+    }
+    *used = o;
+    return 0;
+}
+
 int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     bridge_identity_t id;
     bridge_identity_gather(&id);
 
-    const char *prefix = top_level
-        ? "{"
-        : "{\"type\":\"identity\",\"data\":{";
-    const char *suffix = top_level ? "}" : "}}";
+    size_t u = 0;
+    #define LIT(s) do { size_t _l = sizeof(s) - 1; \
+        if (u + _l >= out_cap) return -1; \
+        memcpy(out + u, (s), _l); u += _l; } while (0)
+    #define FIELD(key, val) do { LIT("\"" key "\":\""); \
+        if (append_escaped(out, out_cap, &u, (val)) != 0) return -1; \
+        LIT("\""); } while (0)
 
-    int n = snprintf(out, out_cap,
-        "%s"
-        "\"edge_version\":\"%s\","
-        "\"os\":\"%s\","
-        "\"arch\":\"%s\","
-        "\"hostname\":\"%s\","
-        "\"kernel\":\"%s\","
-        "\"distro\":\"%s\","
-        "\"distro_version\":\"%s\","
-        "\"deviceType\":\"%s\","
-        "\"user\":\"%s\","
-        "\"shell\":\"%s\","
-        "\"home\":\"%s\","
-        "\"cwd\":\"%s\""
-        "%s",
-        prefix,
-        BRIDGE_VERSION, id.os, id.arch, id.hostname, id.kernel,
-        id.distro, id.distro_version, id.device_type,
-        id.user, id.shell, id.home, id.cwd,
-        suffix);
+    LIT("{");
+    if (!top_level) LIT("\"type\":\"identity\",\"data\":{");
 
-    if (n < 0 || (size_t)n >= out_cap) return -1;
-    return n;
+    LIT("\"edge_version\":\"" BRIDGE_VERSION "\",");
+    FIELD("os",             id.os);             LIT(",");
+    FIELD("arch",           id.arch);           LIT(",");
+    FIELD("hostname",       id.hostname);       LIT(",");
+    FIELD("kernel",         id.kernel);         LIT(",");
+    FIELD("distro",         id.distro);         LIT(",");
+    FIELD("distro_version", id.distro_version); LIT(",");
+    FIELD("deviceType",     id.device_type);    LIT(",");
+    FIELD("user",           id.user);           LIT(",");
+    FIELD("shell",          id.shell);          LIT(",");
+    FIELD("home",           id.home);           LIT(",");
+    FIELD("cwd",            id.cwd);
+
+    if (!top_level) LIT("}");
+    LIT("}");
+    if (u >= out_cap) return -1;
+    out[u] = '\0';
+    return (int)u;
+    #undef FIELD
+    #undef LIT
 }
