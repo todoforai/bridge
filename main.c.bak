@@ -1,0 +1,1267 @@
+// TODOforAI Bridge — C runtime. TCP → WebSocket → Noise_NX → PTY relay.
+//
+// Protocol (inside Noise transport):
+//   First encrypted msg (edge→server):
+//     {"type":"auth","deviceId":"dev_...","secret":"..."}
+//   Then v2 control messages (JSON). The bridge knows ONE identifier:
+//   `sessionId` (UUID it mints when a PTY is spawned via RUN with
+//   sessionId="new"). It has no notion of TODOs — that mapping lives in the
+//   backend. `blockId` rides on RUN frames as an RPC correlation key.
+//     → {"type":"identity","data":{...}}
+//     ← {"type":"run","sessionId":"new"|"uuid","blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
+//     → {"type":"run_started","sessionId":"uuid","blockId":"...","created":bool}
+//     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
+//     → {"type":"step_paused","sessionId":"uuid","blockId":"...","passwordPrompt":bool}
+//     → {"type":"step_done","sessionId":"uuid","blockId":"...","exitCode":N|null,"alive":bool,"timedOut":bool}
+//     ← {"type":"input","sessionId":"uuid","data":"base64"}        // resumes paused RUN
+//     ← {"type":"close","sessionId":"uuid","force":bool}
+//     → {"type":"exit","sessionId":"uuid","blockId":"...","code":N}
+//     ↔ {"type":"error","sessionId":"uuid","blockId":"...","code":"ERR","message":"..."}
+
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
+#define _GNU_SOURCE          // memmem (Linux glibc); harmless on musl/Darwin
+
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "args.h"      // ketopt + cli_usage helpers
+#include "conn.h"
+#include "identity.h"  // BRIDGE_VERSION
+#include "json.h"
+#include "noise.h"     // noise_random
+#include "pty.h"
+#include "tools.h"
+#include "update.h"
+#include "util.h"
+
+#define LOGIN_IMPLEMENTATION
+#include "login.h"
+
+// ── Defaults ────────────────────────────────────────────────────────────────
+
+#define DEFAULT_HOST         "api.todofor.ai"
+// Plain HTTP port — bridge has no TLS client; Noise provides end-to-end crypto.
+#define DEFAULT_PORT         80
+#define DEFAULT_PATH         "/ws/v2/bridge"
+#define DEFAULT_SHELL        "/bin/sh"
+#define BUF_SIZE             4096
+#define MAX_SESSIONS         16
+#define SESSION_ID_LEN       36
+#define BLOCK_ID_CAP         64
+#define MAX_MSG              (64 * 1024)
+
+// Server's Noise static public key (X25519, 32 bytes hex = 64 chars).
+// Overridable via EDGE_SERVER_PUBKEY env or --server-pubkey flag.
+// Same key used by sandbox-manager / browser-manager CLIs on port 4100 —
+// backend uses NOISE_LOCAL_PRIVATE_KEY for both the TCP RPC server and the
+// bridge WS handler.
+#define DEFAULT_SERVER_PUBKEY_HEX \
+    "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a"
+
+// ── Session ─────────────────────────────────────────────────────────────────
+
+// Per-step sentinel envelope (bridge owns this; backend never sees raw bytes).
+//   Wrapper:    { <user-cmd>\n}; __RC=$?; printf '\n<sentinel>:%d\n' "$__RC"\n
+//   Sentinel:   __BRIDGE_STEP_<32 hex>__   → 16 + 32 + 2 = 50 chars; pad to 64.
+#define SENTINEL_CAP   64
+// Upper bound: previous read may have left up to (sentinel_len - 1) bytes in
+// the tail; the next read appends ≤ BUF_SIZE bytes. SENTINEL_CAP overshoots
+// `sentinel_len - 1` and rounds the buffer to a power of two.
+#define TAIL_CAP       (BUF_SIZE + SENTINEL_CAP)
+
+typedef enum { SESS_IDLE = 0, SESS_RUNNING } sess_state_t;
+
+typedef struct {
+    int active;
+    // PTY identity. UUID v4 minted by the bridge on RUN with sessionId="new".
+    // Authoritative routing key; the bridge looks up sessions by this.
+    char session_id[SESSION_ID_LEN + 1];
+    bridge_pty_t pty;
+
+    // Opaque echo label set from RunMessage.todoId. Bridge never interprets
+    // it — just stashes it on the session and echoes it on every related
+    // frame so the backend's OUTPUT/EXIT/ERROR routing is self-describing.
+    char todo_id[BLOCK_ID_CAP + 1];
+    size_t todo_id_len;
+
+    // RUN state machine ----------------------------------------------------
+    // PTY echo is disabled at spawn, so the wrapper command line never
+    // appears in OUTPUT and the sentinel scan is unambiguous.
+    sess_state_t state;
+    char sentinel[SENTINEL_CAP];
+    size_t sentinel_len;
+    // Per-step routing (echoed in OUTPUT/STEP_DONE while running).
+    char run_block_id[BLOCK_ID_CAP + 1];
+    size_t run_block_id_len;
+    int64_t deadline_ms;                 // 0 = no deadline
+    // Rolling tail buffer: holds the trailing (sentinel_len) bytes that
+    // could be the start of a sentinel split across read() chunks.
+    uint8_t tail_buf[TAIL_CAP];
+    size_t  tail_len;
+    // Idle-GC: monotonic ms of last activity (spawn / INPUT / OUTPUT / STEP_DONE).
+    // Sessions in SESS_IDLE that go quiet for IDLE_TIMEOUT_MS are SIGKILL'd to
+    // free the slot. SESS_RUNNING sessions are exempt — they have deadline_ms.
+    int64_t last_active_ms;
+    // Pause detection (RUN only). last_pty_byte_ms is reset on every PTY read;
+    // when it goes quiet for PAUSE_PROBE_MS and the foreground process is
+    // parked in n_tty_read, we emit STEP_PAUSED exactly once per blocked-read.
+    // paused_emitted is cleared when input arrives or new bytes flow.
+    int64_t last_pty_byte_ms;
+    int     paused_emitted;
+} session_t;
+
+// PTY-quiet window before we probe for "blocked on tty read". Tuned to feel
+// instant to the agent while sitting comfortably above bursty-write gaps from
+// commands like apt / npm install.
+#define PAUSE_PROBE_MS  150
+
+// 30 min — see Phase 3 step 6. Picked to outlive a typical agent step but
+// reclaim slots when an agent crashes / forgets to CLOSE.
+#define IDLE_TIMEOUT_MS (30 * 60 * 1000)
+
+typedef struct {
+    bridge_conn_t *conn;
+    session_t sessions[MAX_SESSIONS];
+
+    uint8_t  pty_buf[BUF_SIZE];
+    char     b64_buf[BUF_SIZE * 2];
+    uint8_t  msg_buf[MAX_MSG];
+} edge_t;
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+static int64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void hex_encode(char *out, const uint8_t *in, size_t n) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[i*2]     = H[in[i] >> 4];
+        out[i*2 + 1] = H[in[i] & 0xF];
+    }
+    out[n*2] = '\0';
+}
+
+// Build a UUID v4 string into out[37].
+static void gen_uuid_v4(char out[37]) {
+    uint8_t b[16];
+    noise_random(b, 16);
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    static const char H[] = "0123456789abcdef";
+    int o = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out[o++] = '-';
+        out[o++] = H[b[i] >> 4];
+        out[o++] = H[b[i] & 0xF];
+    }
+    out[o] = '\0';
+}
+
+// Generate `__BRIDGE_STEP_<32 hex>__` into out (≤ SENTINEL_CAP). Returns length.
+static size_t gen_sentinel(char *out, size_t cap) {
+    static const char prefix[] = "__BRIDGE_STEP_";
+    static const char suffix[] = "__";
+    uint8_t rnd[16];
+    noise_random(rnd, sizeof(rnd));
+    char hex[33];
+    hex_encode(hex, rnd, sizeof(rnd));
+    int n = snprintf(out, cap, "%s%s%s", prefix, hex, suffix);
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+// JSON-escape `in` (len bytes) into `out` (cap bytes). Truncates safely.
+// Handles \", \\, \n, \r, \t, and control bytes via \u00XX.
+static size_t json_escape(char *out, size_t cap, const char *in, size_t len) {
+    size_t o = 0;
+    for (size_t i = 0; i < len && o + 7 < cap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        switch (c) {
+            case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+            case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+            case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+            case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+            case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+            default:
+                if (c < 0x20) {
+                    o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c);
+                } else {
+                    out[o++] = (char)c;
+                }
+        }
+    }
+    if (o < cap) out[o] = '\0';
+    return o;
+}
+
+static int is_valid_uuid(const char *s, size_t len) {
+    if (len != 36) return 0;
+    for (size_t i = 0; i < 36; i++) {
+        char c = s[i];
+        int is_dash = (i == 8 || i == 13 || i == 18 || i == 23);
+        if (is_dash) { if (c != '-') return 0; }
+        else if (!isxdigit((unsigned char)c)) return 0;
+    }
+    return 1;
+}
+
+// Restrict free-form IDs (blockId) to a charset that's both shell- and
+// JSON-safe so we can interpolate them raw with %s. Backend chooses these
+// IDs, so the constraint is enforceable upstream.
+static int is_valid_id(const char *s, size_t len) {
+    if (len == 0 || len > BLOCK_ID_CAP) return 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+static session_t *find_session(edge_t *e, const char *sid, size_t sid_len) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        session_t *s = &e->sessions[i];
+        if (s->active && strlen(s->session_id) == sid_len &&
+            memcmp(s->session_id, sid, sid_len) == 0) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+static session_t *free_slot(edge_t *e) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!e->sessions[i].active) return &e->sessions[i];
+    }
+    return NULL;
+}
+
+static int send_json(edge_t *e, const char *s, size_t n) {
+    return bridge_conn_send(e->conn, (const uint8_t *)s, n);
+}
+
+static int send_error(edge_t *e,
+                      const char *sid, size_t sid_len,
+                      const char *bid, size_t bid_len,
+                      const char *code, const char *message) {
+    // JSON-escape message — callers may interpolate user-provided strings now
+    // that RUN exposes blockId/cmd to error paths.
+    char emsg[512];
+    json_escape(emsg, sizeof(emsg), message, strlen(message));
+    char buf[1024];
+    int n;
+    if (sid && bid) {
+        n = snprintf(buf, sizeof(buf),
+            "{\"type\":\"error\",\"sessionId\":\"%.*s\",\"blockId\":\"%.*s\","
+            "\"code\":\"%s\",\"message\":\"%s\"}",
+            (int)sid_len, sid, (int)bid_len, bid, code, emsg);
+    } else if (sid) {
+        n = snprintf(buf, sizeof(buf),
+            "{\"type\":\"error\",\"sessionId\":\"%.*s\","
+            "\"code\":\"%s\",\"message\":\"%s\"}",
+            (int)sid_len, sid, code, emsg);
+    } else {
+        n = snprintf(buf, sizeof(buf),
+            "{\"type\":\"error\",\"code\":\"%s\",\"message\":\"%s\"}",
+            code, emsg);
+    }
+    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    fprintf(stderr, "error %s: %s\n", code, message);
+    return 0;
+}
+
+// Optional `,"todoId":"..."` fragment if the session has an echo label.
+// `todo_id` charset is is_valid_id-validated, safe to interpolate raw.
+#define TODO_FRAG_FMT "%s%s%s"
+#define TODO_FRAG_ARGS(s) \
+    (s)->todo_id_len > 0 ? ",\"todoId\":\"" : "", \
+    (s)->todo_id_len > 0 ? (s)->todo_id      : "", \
+    (s)->todo_id_len > 0 ? "\""              : ""
+
+static void send_exit(edge_t *e, session_t *s, int code) {
+    char buf[384];
+    int n;
+    if (s->run_block_id_len > 0) {
+        n = snprintf(buf, sizeof(buf),
+            "{\"type\":\"exit\",\"sessionId\":\"%s\"" TODO_FRAG_FMT ",\"blockId\":\"%s\",\"code\":%d}",
+            s->session_id, TODO_FRAG_ARGS(s), s->run_block_id, code);
+    } else {
+        n = snprintf(buf, sizeof(buf),
+            "{\"type\":\"exit\",\"sessionId\":\"%s\"" TODO_FRAG_FMT ",\"code\":%d}",
+            s->session_id, TODO_FRAG_ARGS(s), code);
+    }
+    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    fprintf(stderr, "PTY exited: %s code=%d\n", s->session_id, code);
+}
+
+// Emit OUTPUT for `len` bytes of PTY stream. blockId is included only while
+// a RUN is in flight (echoed from the RUN frame for backend correlation).
+static void send_output_bytes(edge_t *e, session_t *s,
+                              const uint8_t *data, size_t len) {
+    if (len == 0) return;
+    size_t bn = b64_encode(data, len, e->b64_buf);
+    size_t cap = bn + 256;
+    char *msg = malloc(cap);
+    if (!msg) return;
+    int mn;
+    if (s->state == SESS_RUNNING && s->run_block_id_len > 0) {
+        mn = snprintf(msg, cap,
+            "{\"type\":\"output\",\"sessionId\":\"%s\"" TODO_FRAG_FMT ",\"blockId\":\"%s\",\"data\":\"%.*s\"}",
+            s->session_id, TODO_FRAG_ARGS(s), s->run_block_id, (int)bn, e->b64_buf);
+    } else {
+        mn = snprintf(msg, cap,
+            "{\"type\":\"output\",\"sessionId\":\"%s\"" TODO_FRAG_FMT ",\"data\":\"%.*s\"}",
+            s->session_id, TODO_FRAG_ARGS(s), (int)bn, e->b64_buf);
+    }
+    if (mn > 0 && (size_t)mn < cap) send_json(e, msg, (size_t)mn);
+    free(msg);
+}
+
+static void send_run_started(edge_t *e, session_t *s, int created) {
+    char buf[384];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"run_started\",\"sessionId\":\"%s\"" TODO_FRAG_FMT
+        ",\"blockId\":\"%s\",\"created\":%s}",
+        s->session_id, TODO_FRAG_ARGS(s), s->run_block_id, created ? "true" : "false");
+    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+}
+
+// exit_code < 0 ⇒ emit `null`. alive=false means shell died during the step.
+static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
+                           int alive, int timed_out) {
+    char buf[512];
+    char rc[24];
+    if (has_code) snprintf(rc, sizeof(rc), "%d", exit_code);
+    else          snprintf(rc, sizeof(rc), "null");
+    int n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"step_done\",\"sessionId\":\"%s\"" TODO_FRAG_FMT
+        ",\"blockId\":\"%s\",\"exitCode\":%s,\"alive\":%s,\"timedOut\":%s}",
+        s->session_id, TODO_FRAG_ARGS(s), s->run_block_id,
+        rc, alive ? "true" : "false", timed_out ? "true" : "false");
+    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+}
+
+// Bridge → server: "command is blocked waiting for stdin". The PTY stays
+// alive and the RUN stays in flight; backend resolves the pending RUN promise
+// with `paused:true` so the agent gets the prompt text and can resume by
+// sending INPUT on the same sessionId.
+// `passwordPrompt` is true when the slave has ECHO disabled (sudo/getpass/ssh).
+static void send_step_paused(edge_t *e, session_t *s, int password_prompt) {
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"step_paused\",\"sessionId\":\"%s\"" TODO_FRAG_FMT
+        ",\"blockId\":\"%s\",\"passwordPrompt\":%s}",
+        s->session_id, TODO_FRAG_ARGS(s), s->run_block_id,
+        password_prompt ? "true" : "false");
+    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+}
+
+// Reset per-step state. Subsequent PTY bytes (e.g. trailing async output)
+// emit OUTPUT without a blockId — the backend routes them to the session.
+static void run_finish(session_t *s) {
+    s->state = SESS_IDLE;
+    s->tail_len = 0;
+    s->deadline_ms = 0;
+    s->run_block_id_len = 0;
+    s->run_block_id[0] = '\0';
+    s->sentinel_len = 0;
+    s->paused_emitted = 0;
+    // Idle-GC: command just finished; restart the idle timer from now.
+    s->last_active_ms = monotonic_ms();
+}
+
+// Search tail_buf for sentinel start (returns offset, or -1 if absent).
+static ssize_t find_sentinel(const session_t *s) {
+    if (s->tail_len < s->sentinel_len) return -1;
+    void *m = memmem(s->tail_buf, s->tail_len, s->sentinel, s->sentinel_len);
+    return m ? (ssize_t)((uint8_t *)m - s->tail_buf) : -1;
+}
+
+// Append `data[len]` into the tail buffer. By construction (see TAIL_CAP),
+// the buffer always has room for one full PTY read plus the held-back tail.
+static void tail_append(session_t *s, const uint8_t *data, size_t len) {
+    if (len > TAIL_CAP - s->tail_len) len = TAIL_CAP - s->tail_len;
+    memcpy(s->tail_buf + s->tail_len, data, len);
+    s->tail_len += len;
+}
+
+static void forward_pty_output(edge_t *e, session_t *s) {
+    long n = bridge_pty_read(&s->pty, e->pty_buf, sizeof(e->pty_buf));
+    if (n <= 0) return;
+    int64_t now = monotonic_ms();
+    s->last_active_ms = now;
+    s->last_pty_byte_ms = now;
+    // New bytes flowed: any prior "paused" assertion is no longer valid.
+    s->paused_emitted = 0;
+
+    if (s->state != SESS_RUNNING) {
+        send_output_bytes(e, s, e->pty_buf, (size_t)n);
+        return;
+    }
+
+    // PTY echo is OFF on this session (set at spawn), so what we read is the
+    // command's actual output followed by our sentinel line. Funnel through
+    // tail_buf to handle a sentinel that straddles read() boundaries.
+    tail_append(s, e->pty_buf, (size_t)n);
+
+    ssize_t found = find_sentinel(s);
+    if (found < 0) {
+        // Hold back the trailing (sentinel_len - 1) bytes — they could be the
+        // start of the sentinel arriving in the next read.
+        size_t keep = s->sentinel_len > 0 ? s->sentinel_len - 1 : 0;
+        size_t emit = s->tail_len > keep ? s->tail_len - keep : 0;
+        if (emit > 0) {
+            send_output_bytes(e, s, s->tail_buf, emit);
+            memmove(s->tail_buf, s->tail_buf + emit, s->tail_len - emit);
+            s->tail_len -= emit;
+        }
+        return;
+    }
+
+    // Strict result-line parse: require "<sentinel>:<int>\r?\n". Anything
+    // else (e.g. a sentinel-shaped string in user output without the suffix)
+    // is treated as ordinary output and we keep scanning past it.
+    size_t after = (size_t)found + s->sentinel_len;
+    int reject = 0;
+    int has_code = 0, exit_code = 0;
+    size_t line_end = 0;  // byte index of the terminating \n
+
+    if (after >= s->tail_len) {
+        // Could still be ours — wait for more bytes.
+        // Fall through to "hold" path below.
+    } else if (s->tail_buf[after] != ':') {
+        reject = 1;
+    } else {
+        size_t p = after + 1;
+        int sign = 1;
+        if (p < s->tail_len && s->tail_buf[p] == '-') { sign = -1; p++; }
+        long v = 0; int any = 0;
+        while (p < s->tail_len && s->tail_buf[p] >= '0' && s->tail_buf[p] <= '9') {
+            v = v * 10 + (s->tail_buf[p] - '0'); p++; any = 1;
+        }
+        if (!any) {
+            reject = 1;
+        } else if (p >= s->tail_len) {
+            // Need more bytes for the terminator — fall through to hold.
+        } else if (s->tail_buf[p] == '\r' && p + 1 >= s->tail_len) {
+            // Saw \r, need \n — hold.
+        } else if (s->tail_buf[p] == '\n' || (s->tail_buf[p] == '\r' && s->tail_buf[p + 1] == '\n')) {
+            has_code = 1;
+            exit_code = (int)(sign * v);
+            line_end = (s->tail_buf[p] == '\r') ? p + 1 : p;
+        } else {
+            reject = 1;  // garbage after digits — not our line
+        }
+    }
+
+    if (reject) {
+        // Treat this sentinel position as ordinary output and resume scanning
+        // after the first byte of the false candidate.
+        size_t skip = (size_t)found + 1;
+        send_output_bytes(e, s, s->tail_buf, skip);
+        memmove(s->tail_buf, s->tail_buf + skip, s->tail_len - skip);
+        s->tail_len -= skip;
+        // Loop hint: caller will run again on next read; if more sentinel
+        // candidates already in tail, they'll be discovered then.
+        return;
+    }
+
+    if (!has_code) {
+        // Incomplete line — emit pre-sentinel bytes, keep candidate.
+        // Drop the leading separator our printf injected ("\n" or "\r\n").
+        size_t trim_back = 0;
+        if (found >= 2 && s->tail_buf[found - 2] == '\r' && s->tail_buf[found - 1] == '\n') trim_back = 2;
+        else if (found >= 1 && s->tail_buf[found - 1] == '\n') trim_back = 1;
+        size_t emit = (size_t)found - trim_back;
+        if (emit > 0) send_output_bytes(e, s, s->tail_buf, emit);
+        size_t keep = s->tail_len - (size_t)found;
+        memmove(s->tail_buf, s->tail_buf + (size_t)found, keep);
+        s->tail_len = keep;
+        return;
+    }
+
+    // Success. Emit pre-sentinel bytes minus the injected separator.
+    size_t trim_back = 0;
+    if (found >= 2 && s->tail_buf[found - 2] == '\r' && s->tail_buf[found - 1] == '\n') trim_back = 2;
+    else if (found >= 1 && s->tail_buf[found - 1] == '\n') trim_back = 1;
+    size_t pre = (size_t)found - trim_back;
+    if (pre > 0) send_output_bytes(e, s, s->tail_buf, pre);
+
+    (void)line_end;  // bytes after the sentinel line are silently dropped (they shouldn't exist).
+    send_step_done(e, s, has_code, exit_code, /*alive=*/1, /*timedOut=*/0);
+    run_finish(s);
+}
+
+// ── Command dispatch ────────────────────────────────────────────────────────
+
+static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
+    const char *type = NULL; size_t type_len = 0;
+    if (!json_str(msg, msg_len, "type", &type, &type_len)) return 0;
+
+    const char *bid = NULL; size_t bid_len = 0;
+    int has_bid = json_str(msg, msg_len, "blockId", &bid, &bid_len);
+    if (has_bid && !is_valid_id(bid, bid_len))
+        return send_error(e, NULL, 0, NULL, 0, "INVALID_BLOCK_ID",
+                          "blockId must be 1-64 chars of [A-Za-z0-9_.-]");
+
+    #define IS(s) (type_len == sizeof(s) - 1 && memcmp(type, s, sizeof(s) - 1) == 0)
+
+    if (IS("run")) {
+        // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
+        // Required fields: sessionId ("new" or UUID), blockId, cmdB64.
+        const char *sid = NULL; size_t sid_len = 0;
+        if (!json_str(msg, msg_len, "sessionId", &sid, &sid_len))
+            return send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "run requires sessionId");
+        if (!has_bid || bid_len == 0)
+            return send_error(e, NULL, 0, NULL, 0, "MISSING_BLOCK_ID", "run requires blockId");
+
+        // `cmd` is base64-encoded shell text. Avoids JSON-escape ambiguity in
+        // our minimal parser (no \" / \uXXXX support) and keeps binary-safe.
+        const char *cmd_b64 = NULL; size_t cmd_b64_len = 0;
+        if (!json_str(msg, msg_len, "cmdB64", &cmd_b64, &cmd_b64_len))
+            return send_error(e, NULL, 0, bid, bid_len, "MISSING_CMD", "run requires cmdB64");
+        uint8_t *cmd = malloc(cmd_b64_len + 4);
+        if (!cmd) return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory");
+        long cmd_len = b64_decode(cmd_b64, cmd_b64_len, cmd);
+        if (cmd_len < 0) {
+            free(cmd);
+            return send_error(e, NULL, 0, bid, bid_len, "INVALID_BASE64", "cmdB64 is not valid base64");
+        }
+
+        // Resolve / allocate session.
+        session_t *s = NULL;
+        int created = 0;
+        int is_new = (sid_len == 3 && memcmp(sid, "new", 3) == 0);
+        if (is_new) {
+            s = free_slot(e);
+            if (!s) { free(cmd); return send_error(e, NULL, 0, bid, bid_len, "MAX_SESSIONS", "max 16 concurrent sessions"); }
+            // Paths can legitimately contain JSON-escaped bytes; decode properly.
+            char cwd_buf[1024]; cwd_buf[0] = '\0'; size_t cwd_len = 0;
+            int has_cwd = json_str_decoded(msg, msg_len, "cwd", cwd_buf, sizeof(cwd_buf), &cwd_len);
+            if (has_cwd) {
+                // Validate up front so a bad path surfaces as ERROR before we
+                // spawn a doomed PTY (otherwise chdir silently fails in child).
+                struct stat st;
+                if (stat(cwd_buf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                    free(cmd);
+                    return send_error(e, NULL, 0, bid, bid_len, "INVALID_CWD", "cwd does not exist or is not a directory");
+                }
+            }
+            if (bridge_pty_spawn(&s->pty, DEFAULT_SHELL, has_cwd ? cwd_buf : NULL, /*no_echo=*/1) != 0) {
+                free(cmd);
+                return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", "failed to spawn PTY");
+            }
+            gen_uuid_v4(s->session_id);
+            s->active = 1;
+            s->state = SESS_IDLE;
+            s->tail_len = 0;
+            s->todo_id_len = 0;
+            s->todo_id[0] = '\0';
+            s->last_active_ms = monotonic_ms();
+            created = 1;
+            fprintf(stderr, "PTY spawned %s (run)\n", s->session_id);
+        } else {
+            if (!is_valid_uuid(sid, sid_len)) { free(cmd); return send_error(e, NULL, 0, bid, bid_len, "INVALID_SESSION_ID", "sessionId must be \"new\" or a UUID"); }
+            s = find_session(e, sid, sid_len);
+            if (!s) { free(cmd); return send_error(e, sid, sid_len, bid, bid_len, "SESSION_NOT_FOUND", "no session for sessionId"); }
+            if (s->state == SESS_RUNNING) { free(cmd); return send_error(e, sid, sid_len, bid, bid_len, "SESSION_BUSY", "session already running a step"); }
+        }
+
+        // Helper: on a fatal error after the new session was spawned, free
+        // the slot so it doesn't leak. No-op for resumed sessions.
+        #define RUN_FAIL_CLEANUP() do { \
+            if (created) { bridge_pty_close(&s->pty); s->active = 0; s->state = SESS_IDLE; } \
+        } while (0)
+
+        // Update opaque echo label from this RUN. Validated charset (same as
+        // blockId) so it's safe to interpolate raw with %s. Absent ⇒ keep the
+        // existing value; explicit "" ⇒ clear.
+        const char *utid = NULL; size_t utid_len = 0;
+        if (json_str(msg, msg_len, "todoId", &utid, &utid_len)) {
+            if (utid_len > 0 && !is_valid_id(utid, utid_len)) {
+                free(cmd); RUN_FAIL_CLEANUP();
+                return send_error(e, NULL, 0, bid, bid_len, "INVALID_TODO_ID",
+                                  "todoId must be 1-64 chars of [A-Za-z0-9_.-]");
+            }
+            memcpy(s->todo_id, utid, utid_len);
+            s->todo_id[utid_len] = '\0';
+            s->todo_id_len = utid_len;
+        }
+
+        // Stash per-step routing on the session.
+        size_t bn = bid_len < BLOCK_ID_CAP ? bid_len : BLOCK_ID_CAP;
+        memcpy(s->run_block_id, bid, bn);
+        s->run_block_id[bn] = '\0';
+        s->run_block_id_len = bn;
+
+        s->sentinel_len = gen_sentinel(s->sentinel, sizeof(s->sentinel));
+        long timeout_ms = 0;
+        json_int(msg, msg_len, "timeoutMs", &timeout_ms);
+        // Cap to ~1 year so monotonic_ms() + timeout can't overflow int64_t.
+        if (timeout_ms > 365LL * 24 * 60 * 60 * 1000) timeout_ms = 365LL * 24 * 60 * 60 * 1000;
+        s->deadline_ms = timeout_ms > 0 ? monotonic_ms() + timeout_ms : 0;
+
+        // Wrapper: brace-group tolerates trailing operators in user input;
+        // printf with explicit \n on both sides makes the sentinel its own line.
+        size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + 64;
+        char *wrapped = malloc(wrapped_cap);
+        if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
+        int wn = snprintf(wrapped, wrapped_cap,
+            "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+            (int)cmd_len, (char *)cmd, s->sentinel);
+        free(cmd);
+        if (wn <= 0 || (size_t)wn >= wrapped_cap) {
+            free(wrapped);
+            RUN_FAIL_CLEANUP();
+            return send_error(e, NULL, 0, bid, bid_len, "INTERNAL", "wrapper too large");
+        }
+
+        s->state = SESS_RUNNING;
+        s->tail_len = 0;
+        s->last_active_ms = monotonic_ms();
+        s->last_pty_byte_ms = s->last_active_ms;
+        s->paused_emitted = 0;
+
+        send_run_started(e, s, created);
+
+        if (bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) != 0) {
+            free(wrapped);
+            // STEP_DONE is the terminal response (RUN_STARTED was already sent);
+            // a separate ERROR would race against the resolved promise. Log only.
+            fprintf(stderr, "PTY_WRITE_FAILED for session %s\n", s->session_id);
+            send_step_done(e, s, /*has_code=*/0, 0, /*alive=*/0, /*timedOut=*/0);
+            run_finish(s);
+            RUN_FAIL_CLEANUP();
+            return 0;
+        }
+        free(wrapped);
+        #undef RUN_FAIL_CLEANUP
+
+    } else if (IS("input")) {
+        // Forward raw stdin bytes — used to resume a paused RUN. The bridge
+        // doesn't track which RUN consumes the bytes; the PTY/kernel/shell do.
+        const char *sid = NULL; size_t sid_len = 0;
+        if (!json_str(msg, msg_len, "sessionId", &sid, &sid_len))
+            return send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "input requires sessionId");
+        if (!is_valid_uuid(sid, sid_len))
+            return send_error(e, NULL, 0, NULL, 0, "INVALID_SESSION_ID", "sessionId must be a UUID");
+        session_t *s = find_session(e, sid, sid_len);
+        if (!s)
+            return send_error(e, sid, sid_len, NULL, 0, "SESSION_NOT_FOUND", "no session for sessionId");
+
+        const char *b64 = NULL; size_t b64_len = 0;
+        if (!json_str(msg, msg_len, "data", &b64, &b64_len))
+            return send_error(e, sid, sid_len, NULL, 0, "MISSING_DATA", "input requires data");
+        if (b64_len / 4 * 3 > BUF_SIZE)
+            return send_error(e, sid, sid_len, NULL, 0, "INPUT_TOO_LARGE", "input exceeds 4096 bytes");
+
+        uint8_t decoded[BUF_SIZE + 4];
+        long dec_len = b64_decode(b64, b64_len, decoded);
+        if (dec_len < 0)
+            return send_error(e, sid, sid_len, NULL, 0, "INVALID_BASE64", "data is not valid base64");
+
+        if (bridge_pty_write_all(&s->pty, decoded, (size_t)dec_len) != 0) {
+            fprintf(stderr, "PTY write error\n");
+        }
+        s->last_active_ms = monotonic_ms();
+        // Input arrived: any prior pause is consumed. Clearing also re-arms
+        // detection if the next read blocks again on the same step.
+        s->paused_emitted = 0;
+        s->last_pty_byte_ms = s->last_active_ms;
+
+    } else if (IS("close")) {
+        const char *sid = NULL; size_t sid_len = 0;
+        if (!json_str(msg, msg_len, "sessionId", &sid, &sid_len))
+            return send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "close requires sessionId");
+        if (!is_valid_uuid(sid, sid_len))
+            return send_error(e, NULL, 0, NULL, 0, "INVALID_SESSION_ID", "sessionId must be a UUID");
+        session_t *s = find_session(e, sid, sid_len);
+        if (!s)
+            return send_error(e, sid, sid_len, NULL, 0, "SESSION_NOT_FOUND", "no session for sessionId");
+        int force = 0;
+        json_bool(msg, msg_len, "force", &force);
+        if (force) {
+            bridge_pty_signal(&s->pty, /*SIGKILL=*/9);
+        } else {
+            // Best-effort gentle close. EXIT will arrive via reap.
+            (void)bridge_pty_write_all(&s->pty, "exit\n", 5);
+        }
+
+    } else if (IS("tool_catalog")) {
+        // Server pushed the shell-command catalog; scan and reply.
+        const char *entries = NULL; size_t entries_len = 0;
+        if (!json_str(msg, msg_len, "entries", &entries, &entries_len)) return 0;
+
+        // Unescape JSON \t, \n, \\, \" in place (we own a decoded copy).
+        char *buf = malloc(entries_len + 1);
+        if (!buf) return 0;
+        size_t w = 0;
+        for (size_t i = 0; i < entries_len; i++) {
+            char c = entries[i];
+            if (c == '\\' && i + 1 < entries_len) {
+                char n = entries[++i];
+                switch (n) {
+                    case 't':  buf[w++] = '\t'; break;
+                    case 'n':  buf[w++] = '\n'; break;
+                    case 'r':  buf[w++] = '\r'; break;
+                    case '\\': buf[w++] = '\\'; break;
+                    case '"':  buf[w++] = '"';  break;
+                    case '/':  buf[w++] = '/';  break;
+                    default:   buf[w++] = n;    break;
+                }
+            } else {
+                buf[w++] = c;
+            }
+        }
+        buf[w] = '\0';
+
+        char *out = malloc(MAX_MSG);
+        if (!out) { free(buf); return 0; }
+        int n = bridge_scan_tools(buf, w, out, MAX_MSG);
+        if (n > 0) {
+            send_json(e, out, (size_t)n);
+            fprintf(stderr, "Scanned tools, %d bytes reported\n", n);
+        } else {
+            fprintf(stderr, "Tool scan failed (overflow or empty)\n");
+        }
+        free(out);
+        free(buf);
+    }
+
+    #undef IS
+    return 0;
+}
+
+// ── Main loop ───────────────────────────────────────────────────────────────
+
+static int run(edge_t *e, const char *device_id, const char *device_secret) {
+    // Auth: first encrypted message carries the device credentials
+    char auth[1024];
+    int an = snprintf(auth, sizeof(auth),
+                      "{\"type\":\"auth\",\"deviceId\":\"%s\",\"secret\":\"%s\"}",
+                      device_id, device_secret);
+    if (an < 0 || (size_t)an >= sizeof(auth)) return -1;
+    if (send_json(e, auth, (size_t)an) != 0) return -1;
+
+    // Identity
+    char id_json[1024];
+    int id_len = bridge_identity_json(id_json, sizeof(id_json), 0);
+    if (id_len < 0) return -1;
+    if (send_json(e, id_json, (size_t)id_len) != 0) return -1;
+    fprintf(stderr, "Identified\n");
+
+    for (;;) {
+        int64_t now = monotonic_ms();
+
+        // Reap exited shells; if a step was in flight, surface STEP_DONE first
+        // so the backend's pending RUN promise settles cleanly.
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &e->sessions[i];
+            if (!s->active) continue;
+            int code;
+            if (bridge_pty_reap(&s->pty, &code)) {
+                if (s->state == SESS_RUNNING) {
+                    // Flush any pre-sentinel tail that hadn't been emitted yet.
+                    if (s->tail_len > 0) {
+                        send_output_bytes(e, s, s->tail_buf, s->tail_len);
+                        s->tail_len = 0;
+                    }
+                    send_step_done(e, s, /*has_code=*/1, code, /*alive=*/0, /*timedOut=*/0);
+                    run_finish(s);
+                }
+                send_exit(e, s, code);
+                bridge_pty_close(&s->pty);
+                s->active = 0;
+            }
+        }
+
+        // Per-step deadline. Don't kill the shell — just settle the RUN.
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &e->sessions[i];
+            if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
+            if (now < s->deadline_ms) continue;
+            if (s->tail_len > 0) {
+                send_output_bytes(e, s, s->tail_buf, s->tail_len);
+                s->tail_len = 0;
+            }
+            send_step_done(e, s, /*has_code=*/0, 0, /*alive=*/1, /*timedOut=*/1);
+            run_finish(s);
+        }
+
+        // Pause detection. After PAUSE_PROBE_MS of PTY-quiet, ask the kernel
+        // (via /proc/<fg>/wchan on Linux) whether the foreground process is
+        // parked in n_tty_read — i.e. blocked waiting for stdin. If yes,
+        // flush any pre-sentinel tail and emit STEP_PAUSED once. The PTY and
+        // the RUN both stay alive; the backend resolves the pending run with
+        // `paused:true` so the agent can sendInput().
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &e->sessions[i];
+            if (!s->active || s->state != SESS_RUNNING) continue;
+            if (s->paused_emitted) continue;
+            if (now - s->last_pty_byte_ms < PAUSE_PROBE_MS) continue;
+            pid_t fg = 0; int pwd = 0;
+            // RUN sessions spawn with no_echo=1; baseline=0. Password-prompt
+            // detection requires a transition from echo-on→off, so it's only
+            // informative on EXEC-style sessions. Returning false here is
+            // honest — the agent still gets STEP_PAUSED and the prompt text.
+            if (!bridge_pty_probe_blocked(&s->pty, /*echo_baseline=*/0, &fg, &pwd)) continue;
+            if (s->tail_len > 0) {
+                send_output_bytes(e, s, s->tail_buf, s->tail_len);
+                s->tail_len = 0;
+            }
+            send_step_paused(e, s, pwd);
+            s->paused_emitted = 1;
+            fprintf(stderr, "RUN paused (waiting for stdin): %s fg=%d pwd=%d\n",
+                    s->run_block_id, (int)fg, pwd);
+        }
+
+        // Idle-session GC. SIGKILL idle (non-RUNNING) sessions that haven't
+        // seen activity in IDLE_TIMEOUT_MS — reaper picks up EXIT next tick
+        // and the slot frees naturally.
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &e->sessions[i];
+            if (!s->active || s->state == SESS_RUNNING) continue;
+            if (now - s->last_active_ms < IDLE_TIMEOUT_MS) continue;
+            fprintf(stderr, "Idle GC: killing %s (idle %lld ms)\n",
+                    s->session_id, (long long)(now - s->last_active_ms));
+            bridge_pty_signal(&s->pty, /*SIGKILL=*/9);
+            // Bump so we don't re-kill on every tick before reap.
+            s->last_active_ms = now;
+        }
+
+        // 0 = WS conn, then active PTY master fds starting at `pty_base`.
+        struct pollfd fds[1 + MAX_SESSIONS];
+        int session_idx[MAX_SESSIONS];
+        fds[0].fd = bridge_conn_fd(e->conn);
+        fds[0].events = POLLIN; fds[0].revents = 0;
+        nfds_t nfds = 1;
+        nfds_t pty_base = nfds;
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &e->sessions[i];
+            if (!s->active) continue;
+            fds[nfds].fd = bridge_pty_pollfd(&s->pty);
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            session_idx[nfds - pty_base] = i;
+            nfds++;
+        }
+
+        // Cap poll timeout against the nearest RUN deadline so we wake to
+        // fire STEP_DONE { timedOut: true } on time.
+        int poll_ms = 100;
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &e->sessions[i];
+            if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
+            int64_t left = s->deadline_ms - now;
+            if (left < 0) left = 0;
+            if (left < poll_ms) poll_ms = (int)left;
+        }
+        int pr = poll(fds, nfds, poll_ms);
+        if (pr < 0) { if (errno == EINTR) continue; return -1; }
+
+        if (fds[0].revents & (POLLERR | POLLHUP)) return -1;
+        if (fds[0].revents & POLLIN) {
+            long n = bridge_conn_recv(e->conn, e->msg_buf, sizeof(e->msg_buf));
+            if (n <= 0) return -1;
+            if (handle_command(e, (const char *)e->msg_buf, (size_t)n) != 0) return -1;
+        }
+
+        for (nfds_t k = pty_base; k < nfds; k++) {
+            session_t *s = &e->sessions[session_idx[k - pty_base]];
+            if (!s->active) continue;
+            if (fds[k].revents & POLLIN) forward_pty_output(e, s);
+            if (fds[k].revents & (POLLHUP | POLLERR)) {
+                int code = bridge_pty_close(&s->pty);
+                if (s->state == SESS_RUNNING) {
+                    if (s->tail_len > 0) {
+                        send_output_bytes(e, s, s->tail_buf, s->tail_len);
+                        s->tail_len = 0;
+                    }
+                    send_step_done(e, s, /*has_code=*/1, code, /*alive=*/0, /*timedOut=*/0);
+                    run_finish(s);
+                }
+                send_exit(e, s, code);
+                s->active = 0;
+            }
+        }
+    }
+}
+
+// ── Args / env ──────────────────────────────────────────────────────────────
+
+static const char *USAGE_MAIN   = "[--host HOST] [--port PORT] [--server-pubkey HEX]";
+static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN]";
+static const char *USAGE_ENROLL = "enroll [--ttl SECONDS] [--device-name NAME] [--quiet]";
+static const char *USAGE_WHOAMI = "whoami";
+
+static int parse_pubkey_hex(const char *hex, uint8_t out[32]) {
+    if (!hex || strlen(hex) != 64) return -1;
+    for (int i = 0; i < 32; i++) {
+        unsigned v;
+        if (sscanf(hex + i * 2, "%2x", &v) != 1) return -1;
+        out[i] = (uint8_t)v;
+    }
+    return 0;
+}
+
+// ── Noise one-shot RPC helper (reuses transport code from login.h) ──────────
+
+// Resolve backend Noise addr + pubkey from env, with sensible defaults.
+static void enroll_backend(const char **addr, const char **pub) {
+    *addr = getenv("NOISE_BACKEND_ADDR");
+    *pub  = getenv("NOISE_BACKEND_PUBLIC_KEY");
+    if (!*addr) *addr = "api.todofor.ai:4100";
+    if (!*pub)  *pub  = "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a";
+}
+
+// Connect, handshake, send one encrypted JSON request, return decrypted reply.
+// Returns response length (>= 0) or -1 on error. Writes NUL-terminated JSON
+// into resp_buf (truncated to resp_cap-1 if needed).
+static int noise_oneshot(const char *backend_addr, const char *backend_pub,
+                         const char *req, size_t req_len,
+                         char *resp_buf, size_t resp_cap) {
+    login_sock_init();
+
+    uint8_t remote_pub[32];
+    if (login_hex_decode(remote_pub, 32, backend_pub) < 0) return -1;
+
+    char host[256], port_str[16];
+    const char *colon = strrchr(backend_addr, ':');
+    if (!colon) return -1;
+    size_t hlen = (size_t)(colon - backend_addr);
+    if (hlen >= sizeof(host)) return -1;
+    memcpy(host, backend_addr, hlen);
+    host[hlen] = '\0';
+    snprintf(port_str, sizeof(port_str), "%s", colon + 1);
+
+    login_session_t session;
+    if (login_noise_connect(&session, host, port_str, remote_pub) < 0) return -1;
+
+    uint8_t *dec = NULL;
+    int dec_len = login_noise_rpc(session.fd, &session.transport, req, req_len, &dec);
+    login_sock_close(session.fd);
+    if (dec_len < 0) { if (dec) free(dec); return -1; }
+
+    size_t copy = (size_t)dec_len < resp_cap - 1 ? (size_t)dec_len : resp_cap - 1;
+    memcpy(resp_buf, dec, copy);
+    resp_buf[copy] = '\0';
+    free(dec);
+    return (int)copy;
+}
+
+// Parse device creds out of a successful enroll.redeem / login.poll response.
+// Looks for the nested "device":{...} and optional "user":{...} objects.
+static int parse_device_creds(const char *resp, login_credentials_t *creds) {
+    memset(creds, 0, sizeof(*creds));
+    const char *dev = strstr(resp, "\"device\"");
+    if (!dev) return -1;
+    dev = strchr(dev, '{');
+    if (!dev) return -1;
+    json_find_string(dev, "id",     creds->device_id,     sizeof(creds->device_id));
+    json_find_string(dev, "secret", creds->device_secret, sizeof(creds->device_secret));
+    json_find_string(dev, "name",   creds->device_name,   sizeof(creds->device_name));
+    const char *usr = strstr(resp, "\"user\"");
+    if (usr && (usr = strchr(usr, '{'))) {
+        json_find_string(usr, "id",    creds->user_id,    sizeof(creds->user_id));
+        json_find_string(usr, "email", creds->user_email, sizeof(creds->user_email));
+        json_find_string(usr, "name",  creds->user_name,  sizeof(creds->user_name));
+    }
+    return (creds->device_id[0] && creds->device_secret[0]) ? 0 : -1;
+}
+
+// Redeem an enrollment token for fresh device credentials and save them.
+// The redeemer self-describes via identity gathered from the host (uname,
+// /etc/os-release, sandbox marker, …). Backend derives `deviceType` from
+// `identity.deviceType` and stores the rest as device metadata.
+static int redeem_enroll_token(const char *token) {
+    const char *addr, *pub;
+    enroll_backend(&addr, &pub);
+
+    uint8_t id_bytes[4]; char id_hex[9];
+    noise_random(id_bytes, 4);
+    login_hex_encode(id_hex, id_bytes, 4);
+
+    char identity[1024];
+    int ilen = bridge_identity_json(identity, sizeof(identity), 1);
+    if (ilen < 0) { fprintf(stderr, "error: failed to gather identity\n"); return -1; }
+
+    char req[2048];
+    int n = snprintf(req, sizeof(req),
+        "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
+        "\"payload\":{\"token\":\"%s\",\"identity\":%s}}",
+        id_hex, token, identity);
+    if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: payload too long\n"); return -1; }
+
+    char resp[LOGIN_CONFIG_MAX];
+    int rn = noise_oneshot(addr, pub, req, (size_t)n, resp, sizeof(resp));
+    if (rn < 0) { fprintf(stderr, "error: enroll redeem request failed\n"); return -1; }
+
+    if (json_envelope_is_error(resp)) {
+        char err_msg[256];
+        json_find_string(resp, "message", err_msg, sizeof(err_msg));
+        fprintf(stderr, "error: %s\n", err_msg[0] ? err_msg : resp);
+        return -1;
+    }
+
+    login_credentials_t creds;
+    if (parse_device_creds(resp, &creds) < 0) {
+        fprintf(stderr, "error: unexpected response: %s\n", resp);
+        return -1;
+    }
+    if (login_save_credentials(&creds) < 0) {
+        fprintf(stderr, "error: failed to save credentials\n");
+        return -1;
+    }
+    char path[1024];
+    login_config_path(path, sizeof(path));
+    fprintf(stderr, "\033[32m\xe2\x9c\x85 Enrolled as %s (device %s). Credentials saved to %s\033[0m\n",
+            creds.device_name, creds.device_id, path);
+    return 0;
+}
+
+// ── login subcommand ────────────────────────────────────────────────────────
+
+static int cmd_login(int argc, char **argv) {
+    const char *device_name = NULL;
+    const char *token       = NULL;
+    ko_longopt_t longopts[] = {
+        { "help",        ko_no_argument,       'h' },
+        { "device-name", ko_required_argument, 'n' },
+        { "token",       ko_required_argument, 't' },
+        { 0, 0, 0 }
+    };
+    ketopt_t opt = KETOPT_INIT;
+    int c;
+    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:", longopts)) >= 0) {
+        if      (c == 'h') { cli_usage(stdout, "bridge", USAGE_LOGIN); return 0; }
+        else if (c == 'n') device_name = opt.arg;
+        else if (c == 't') token = opt.arg;
+        else cli_parse_error("bridge", USAGE_LOGIN, argc, argv, &opt, c);
+    }
+    if (!device_name) device_name = getenv("EDGE_DEVICE_NAME");
+    if (!token)       token       = getenv("EDGE_ENROLL_TOKEN");
+
+    // Non-interactive path: redeem an enrollment token minted by another bridge
+    // (or by the backend via `cli.enroll.mint` / REST). No browser, no polling.
+    // Token is the only capability needed; redeemer self-identifies via the
+    // identity payload (uname, /etc/os-release, sandbox marker).
+    if (token && *token) {
+        return redeem_enroll_token(token) == 0 ? 0 : 1;
+    }
+
+    const char *addr, *pub;
+    enroll_backend(&addr, &pub);
+    return login_device_flow(addr, pub, "bridge", device_name) == 0 ? 0 : 1;
+}
+
+// ── enroll subcommand ───────────────────────────────────────────────────────
+
+static int cmd_enroll(int argc, char **argv) {
+    long ttl_sec = 300;
+    const char *device_name = NULL;
+    int quiet = 0;
+    ko_longopt_t longopts[] = {
+        { "help",        ko_no_argument,       'h' },
+        { "ttl",         ko_required_argument, 'T' },
+        { "device-name", ko_required_argument, 'n' },
+        { "quiet",       ko_no_argument,       'q' },
+        { 0, 0, 0 }
+    };
+    ketopt_t opt = KETOPT_INIT;
+    int c;
+    while ((c = ketopt(&opt, argc, argv, 1, "hT:n:q", longopts)) >= 0) {
+        if      (c == 'h') { cli_usage(stdout, "bridge", USAGE_ENROLL); return 0; }
+        else if (c == 'T') ttl_sec = atol(opt.arg);
+        else if (c == 'n') device_name = opt.arg;
+        else if (c == 'q') quiet = 1;
+        else cli_parse_error("bridge", USAGE_ENROLL, argc, argv, &opt, c);
+    }
+
+    // Must have device creds on disk — only a logged-in bridge can mint.
+    login_credentials_t creds;
+    memset(&creds, 0, sizeof(creds));
+    if (login_load_credentials(&creds) < 0 || !creds.device_id[0] || !creds.device_secret[0]) {
+        fprintf(stderr, "error: no device credentials found. Run `bridge login` first.\n");
+        return 1;
+    }
+
+    const char *addr, *pub;
+    enroll_backend(&addr, &pub);
+
+    uint8_t id_bytes[4]; char id_hex[9];
+    noise_random(id_bytes, 4);
+    login_hex_encode(id_hex, id_bytes, 4);
+
+    char req[1024];
+    int n = snprintf(req, sizeof(req),
+        "{\"id\":\"%s\",\"type\":\"cli.enroll.mint\","
+        "\"payload\":{\"deviceId\":\"%s\",\"secret\":\"%s\",\"ttlSec\":%ld}}",
+        id_hex, creds.device_id, creds.device_secret, ttl_sec);
+    if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: request too long\n"); return 1; }
+
+    char resp[LOGIN_CONFIG_MAX];
+    int rn = noise_oneshot(addr, pub, req, (size_t)n, resp, sizeof(resp));
+    if (rn < 0) { fprintf(stderr, "error: mint request failed\n"); return 1; }
+
+    if (json_envelope_is_error(resp)) {
+        char err_msg[256];
+        json_find_string(resp, "message", err_msg, sizeof(err_msg));
+        fprintf(stderr, "error: %s\n", err_msg[0] ? err_msg : resp);
+        return 1;
+    }
+
+    char token[256], expires[32];
+    json_find_string(resp, "token",     token,   sizeof(token));
+    json_find_string(resp, "expiresIn", expires, sizeof(expires));
+    if (!token[0]) { fprintf(stderr, "error: no token in response: %s\n", resp); return 1; }
+
+    if (quiet) {
+        // Script-friendly: just the token on stdout.
+        printf("%s\n", token);
+    } else {
+        fprintf(stderr, "\033[1m\xf0\x9f\x94\x91 Enrollment token (expires in %s s):\033[0m\n", expires[0] ? expires : "?");
+        printf("%s\n", token);
+        fprintf(stderr, "\n\033[2mRun on the new host:\033[0m\n");
+        fprintf(stderr, "  bridge login --token %s%s%s\n",
+                token,
+                device_name ? " --device-name " : "",
+                device_name ? device_name : "");
+    }
+    return 0;
+}
+
+// ── whoami subcommand ───────────────────────────────────────────────────────
+
+static int cmd_whoami(int argc, char **argv) {
+    ko_longopt_t longopts[] = {{ "help", ko_no_argument, 'h' }, { 0, 0, 0 }};
+    ketopt_t opt = KETOPT_INIT;
+    int c;
+    while ((c = ketopt(&opt, argc, argv, 1, "h", longopts)) >= 0) {
+        if (c == 'h') { cli_usage(stdout, "bridge", USAGE_WHOAMI); return 0; }
+        cli_parse_error("bridge", USAGE_WHOAMI, argc, argv, &opt, c);
+    }
+    return login_print_whoami("bridge");
+}
+
+// ── main ────────────────────────────────────────────────────────────────────
+
+static void print_help(void) {
+    printf("bridge " BRIDGE_VERSION " — TODOforAI edge agent\n\n"
+           "Usage:\n"
+           "  bridge %s\n"
+           "      Run the edge agent (default).\n"
+           "  bridge %s\n"
+           "      Interactive device login; use --token to skip the browser prompt.\n"
+           "  bridge %s\n"
+           "      Print a one-time enrollment token for provisioning another device.\n"
+           "  bridge %s\n"
+           "      Show the logged-in user and device.\n"
+           "  bridge version | --version | -v\n"
+           "  bridge --help  | -h\n\n"
+           "Env: EDGE_HOST, EDGE_PORT, EDGE_SERVER_PUBKEY, EDGE_DEVICE_NAME\n",
+           USAGE_MAIN, USAGE_LOGIN, USAGE_ENROLL, USAGE_WHOAMI);
+}
+
+int main(int argc, char **argv) {
+    // If a new binary was staged next to us (by a prior `exec` update command),
+    // swap it in before we do anything else. See update.h.
+    bridge_update_swap_on_start(argv[0]);
+
+    // Subcommand dispatch (must come before option parsing so `bridge login -h`
+    // shows the login-specific usage).
+    if (argc >= 2 && strcmp(argv[1], "login") == 0) {
+        return cmd_login(argc - 1, argv + 1);
+    }
+    if (argc >= 2 && strcmp(argv[1], "enroll") == 0) {
+        return cmd_enroll(argc - 1, argv + 1);
+    }
+    if (argc >= 2 && strcmp(argv[1], "whoami") == 0) {
+        return cmd_whoami(argc - 1, argv + 1);
+    }
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "version") == 0)) {
+        printf("%s\n", BRIDGE_VERSION);
+        return 0;
+    }
+
+    const char *host = NULL, *port_s = NULL, *pubkey_hex = NULL;
+    ko_longopt_t longopts[] = {
+        { "help",          ko_no_argument,       'h' },
+        { "host",          ko_required_argument, 'H' },
+        { "port",          ko_required_argument, 'p' },
+        { "server-pubkey", ko_required_argument, 'k' },
+        { 0, 0, 0 }
+    };
+    ketopt_t opt = KETOPT_INIT;
+    int c;
+    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:k:", longopts)) >= 0) {
+        if      (c == 'h') { print_help(); return 0; }
+        else if (c == 'H') host = opt.arg;
+        else if (c == 'p') port_s = opt.arg;
+        else if (c == 'k') pubkey_hex = opt.arg;
+        else cli_parse_error("bridge", USAGE_MAIN, argc, argv, &opt, c);
+    }
+
+    // Load saved device credentials from `bridge login`
+    login_credentials_t saved_creds;
+    memset(&saved_creds, 0, sizeof(saved_creds));
+    (void)login_load_credentials(&saved_creds);
+
+    if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
+        fprintf(stderr, "No device credentials found. Run `bridge login [--device-name NAME]` first.\n\n");
+        print_help();
+        return 1;
+    }
+
+    if (!host) host = getenv("EDGE_HOST");
+    if (!host) host = DEFAULT_HOST;
+
+    if (!port_s) port_s = getenv("EDGE_PORT");
+    uint16_t port = DEFAULT_PORT;
+    if (port_s) {
+        int p = atoi(port_s);
+        if (p > 0 && p <= 65535) port = (uint16_t)p;
+    }
+
+    if (!pubkey_hex) pubkey_hex = getenv("EDGE_SERVER_PUBKEY");
+    if (!pubkey_hex) pubkey_hex = DEFAULT_SERVER_PUBKEY_HEX;
+
+    uint8_t server_pubkey[32];
+    if (parse_pubkey_hex(pubkey_hex, server_pubkey) != 0) {
+        fprintf(stderr, "invalid server pubkey (need 64 hex chars)\n");
+        return 1;
+    }
+
+    fprintf(stderr, "Connecting to %s:%u (noise) as device %s...\n", host, (unsigned)port, saved_creds.device_id);
+
+    bridge_conn_t *conn = bridge_conn_open(host, port, DEFAULT_PATH, server_pubkey);
+    if (!conn) { fprintf(stderr, "connect failed\n"); return 1; }
+    fprintf(stderr, "Connected\n");
+
+    edge_t *e = calloc(1, sizeof(*e));
+    if (!e) { bridge_conn_close(conn); return 1; }
+    e->conn = conn;
+
+    int rc = run(e, saved_creds.device_id, saved_creds.device_secret);
+
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
+    }
+    bridge_conn_close(conn);
+    free(e);
+
+    if (rc != 0) fprintf(stderr, "Disconnected\n");
+    return rc == 0 ? 0 : 1;
+}
