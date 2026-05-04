@@ -60,11 +60,12 @@ release-darwin-arm64: | build
 	clang -target arm64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/bridge-darwin-arm64 $(SRCS)
 	strip build/bridge-darwin-arm64 2>/dev/null || true
 
-# Smoke test for the live PATH watcher (Linux only).
-.PHONY: test-watch
-test-watch: | build
-	$(CC) -O0 -g -Wall -Wextra -o build/test-watch test_watch.c tools.c util.c -lpthread
-	./build/test-watch
+# Sentinel-scanner smoke test: spawns a real PTY with echo off, runs a few
+# wrapped commands, asserts the bridge's emit/parse logic matches.
+.PHONY: test-run
+test-run: | build
+	$(CC) -O0 -g -Wall -Wextra -o build/test-run test_run.c pty_posix.c -lutil
+	./build/test-run
 
 clean:
 	rm -rf build
