@@ -138,7 +138,7 @@ case ":$PATH:" in
             *":$HOME/.local/bin:"*)
                 mkdir -p "$HOME/.local/bin"
                 ln -sf "$PREFIX/bridge" "$HOME/.local/bin/bridge"
-                ok "linked ~/.local/bin/bridge → $PREFIX/bridge (available as \`bridge\` in every new shell)"
+                ok "linked into ~/.local/bin (available as \`bridge\` in every new shell)"
                 CMD=bridge
                 ;;
             *)
