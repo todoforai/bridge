@@ -108,12 +108,17 @@ case ":$PATH:" in
     *":$PREFIX:"*) ;;
     *)
         line="export PATH=\"$PREFIX:\$PATH\""
-        for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
-            [ -f "$rc" ] || continue
-            grep -qsF "$line" "$rc" && continue
+        case "${SHELL##*/}" in
+            zsh)  rc="$HOME/.zshrc" ;;
+            bash) rc="$HOME/.bashrc" ;;
+            *)    rc="$HOME/.profile" ;;
+        esac
+        if grep -qsF "$line" "$rc" 2>/dev/null; then
+            :
+        else
             printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
             ok "added $PREFIX to PATH in $rc"
-        done
+        fi
         info "open a new shell or: $line"
         ;;
 esac
