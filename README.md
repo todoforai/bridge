@@ -132,7 +132,9 @@ No new protocol messages, no in-binary HTTP client, no extra dependencies.
   spawns `bash.exe` inside ConPTY — set `BRIDGE_SHELL` to override, otherwise
   it probes PATH then Git for Windows install paths, falling back to `cmd.exe`
   (RUN/tool catalog assume bash semantics — install Git for Windows or WSL).
-  `step_paused` (auto-detect of stdin-blocked) is Linux-only.
+  `step_paused` works on Linux, macOS, and Windows; on Windows the
+  `passwordPrompt` flag is always 0 (the child's ECHO state isn't exposed
+  through the ConPTY API).
 - Session limit is 16 concurrent PTYs (`MAX_SESSIONS` in `main.c`).
 - WebSocket uses plain `ws://` — TLS is replaced by Noise end-to-end.
   Typically deployed behind nginx/Cloudflare which terminates external
