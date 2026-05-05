@@ -138,7 +138,7 @@ case ":$PATH:" in
             *":$HOME/.local/bin:"*)
                 mkdir -p "$HOME/.local/bin"
                 ln -sf "$PREFIX/bridge" "$HOME/.local/bin/bridge"
-                ok "linked into ~/.local/bin (available as \`bridge\` in every new shell)"
+                ok "linked into ~/.local/bin → run \`bridge\`"
                 CMD=bridge
                 ;;
             *)
@@ -152,7 +152,7 @@ case ":$PATH:" in
                     # ensure trailing newline before appending
                     [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
                     printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
-                    ok "added $PREFIX to PATH in $rc (available as \`bridge\` in every new shell)"
+                    ok "added $PREFIX to PATH in $rc → run \`bridge\` in a new shell"
                 fi
                 info "for this shell: $line"
                 ;;
