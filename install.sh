@@ -9,7 +9,7 @@ PREFIX="${TODOFORAI_PREFIX:-$HOME/.todoforai/bin}"
 TAG="${TODOFORAI_TAG:-}"
 TOKEN=""
 DEVICE_NAME=""
-DO_SERVICE=1
+DO_SERVICE=0
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m::\033[0m %s\n' "$*" >&2; }
@@ -28,7 +28,7 @@ Options:
   --name NAME       device name to register under
   --prefix DIR      install dir (default: $HOME/.todoforai/bin)
   --tag TAG         specific release tag (default: latest)
-  --no-service      skip systemd/launchd supervisor setup (don't auto-start)
+  --service         install systemd/launchd supervisor so bridge auto-starts at login
 EOF
 }
 
@@ -41,7 +41,7 @@ while [ $# -gt 0 ]; do
         --name)       need_val "$1" "${2:-}"; DEVICE_NAME=$2; shift 2 ;;
         --prefix)     need_val "$1" "${2:-}"; PREFIX=$2;      shift 2 ;;
         --tag)        need_val "$1" "${2:-}"; TAG=$2;         shift 2 ;;
-        --no-service) DO_SERVICE=0; shift ;;
+        --service)    DO_SERVICE=1; shift ;;
         -h|--help)    usage; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac

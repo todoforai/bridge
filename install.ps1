@@ -11,7 +11,7 @@ param(
     [string]$Name = "",
     [string]$Prefix = "",
     [string]$Tag = "",
-    [switch]$NoService,
+    [switch]$Service,
     [switch]$Help
 )
 
@@ -39,7 +39,7 @@ Options:
   -Name NAME       device name to register under
   -Prefix DIR      install dir (default: %USERPROFILE%\.todoforai\bin)
   -Tag TAG         specific release tag (default: latest)
-  -NoService       skip Scheduled Task supervisor setup (don't auto-start)
+  -Service         install Scheduled Task so bridge auto-starts at logon
   -Help            show this help
 "@ | Write-Host
     exit 0
@@ -131,7 +131,7 @@ if ($Token) {
 }
 
 # ── supervisor setup (Scheduled Task at logon) ──────────────────────────────
-if (-not $NoService) {
+if ($Service) {
     try {
         $taskName = 'TODOforAI Bridge'
         $action   = New-ScheduledTaskAction   -Execute $Bridge
