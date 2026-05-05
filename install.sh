@@ -104,22 +104,34 @@ human=$(awk -v b="$size" 'BEGIN{ s="BKMGT"; for(i=1; b>=1024 && i<5; i++) b/=102
 ok "installed $PREFIX/bridge ($human, $TAG)"
 
 # ── PATH setup ──────────────────────────────────────────────────────────────
+# 1) prefix already on PATH → done
+# 2) ~/.local/bin on PATH → symlink there (no rc mutation)
+# 3) fallback → append to active shell's rc file
 case ":$PATH:" in
     *":$PREFIX:"*) ;;
     *)
-        line="export PATH=\"$PREFIX:\$PATH\""
-        case "${SHELL##*/}" in
-            zsh)  rc="$HOME/.zshrc" ;;
-            bash) rc="$HOME/.bashrc" ;;
-            *)    rc="$HOME/.profile" ;;
+        case ":$PATH:" in
+            *":$HOME/.local/bin:"*)
+                mkdir -p "$HOME/.local/bin"
+                ln -sf "$PREFIX/bridge" "$HOME/.local/bin/bridge"
+                ok "linked to ~/.local/bin/bridge"
+                ;;
+            *)
+                line="export PATH=\"$PREFIX:\$PATH\""
+                case "${SHELL##*/}" in
+                    zsh)  rc="$HOME/.zshrc" ;;
+                    bash) rc="$HOME/.bashrc" ;;
+                    *)    rc="$HOME/.profile" ;;
+                esac
+                if ! grep -qsF "$line" "$rc" 2>/dev/null; then
+                    # ensure trailing newline before appending
+                    [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
+                    printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
+                    ok "added $PREFIX to PATH in $rc"
+                fi
+                info "open a new shell or: $line"
+                ;;
         esac
-        if ! grep -qsF "$line" "$rc" 2>/dev/null; then
-            # ensure trailing newline before appending ($(...) strips \n, so empty == ends in \n)
-            [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
-            printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
-            ok "added $PREFIX to PATH in $rc"
-        fi
-        info "open a new shell or: $line"
         ;;
 esac
 
