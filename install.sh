@@ -161,7 +161,7 @@ case ":$PATH:" in
         esac
         ;;
 esac
-ok "installed $WHERE → run \`$CMD\`$HINT"
+ok "installed $WHERE$HINT"
 
 # ── login ───────────────────────────────────────────────────────────────────
 if [ -n "$TOKEN" ]; then
@@ -173,7 +173,7 @@ if [ -n "$TOKEN" ]; then
     fi
     ok "enrolled"
 else
-    info "authenticate with: $CMD login"
+    printf '\033[33m→\033[0m next: %s login\n' "$CMD" >&2
 fi
 
 # ── supervisor setup ────────────────────────────────────────────────────────
