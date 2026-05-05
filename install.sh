@@ -96,18 +96,26 @@ else
     die "need sha256sum or shasum"
 fi
 [ "$expected" = "$actual" ] || die "sha256 mismatch: expected $expected, got $actual"
-ok "checksum ok"
 
 chmod +x "$tmp/bridge"
 mv "$tmp/bridge" "$PREFIX/bridge"
 size=$(wc -c <"$PREFIX/bridge" | tr -d ' ')
 human=$(awk -v b="$size" 'BEGIN{ s="BKMGT"; for(i=1; b>=1024 && i<5; i++) b/=1024; printf (i==1?"%d %s":"%.1f %siB"), b, substr(s,i,1) }')
-ok "installed to $PREFIX/bridge ($human)"
+ok "installed $PREFIX/bridge ($human, $TAG)"
 
-# ── PATH hint ───────────────────────────────────────────────────────────────
+# ── PATH setup ──────────────────────────────────────────────────────────────
 case ":$PATH:" in
     *":$PREFIX:"*) ;;
-    *) info "add to PATH:  export PATH=\"$PREFIX:\$PATH\"" ;;
+    *)
+        line="export PATH=\"$PREFIX:\$PATH\""
+        for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+            [ -f "$rc" ] || continue
+            grep -qsF "$line" "$rc" && continue
+            printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
+            ok "added $PREFIX to PATH in $rc"
+        done
+        info "open a new shell or: $line"
+        ;;
 esac
 
 BRIDGE="$PREFIX/bridge"
