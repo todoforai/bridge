@@ -28,6 +28,9 @@ HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h \
 
 .PHONY: all clean
 
+# Dev build: dynamic glibc (~113 KiB). Smaller than release (~161 KiB) only
+# because libc isn't embedded. For release-equivalent static musl, use
+# `make static` or `make release-linux-x64`.
 all: build/todoforai-bridge
 
 build/todoforai-bridge: $(SRCS) $(HDRS) | build

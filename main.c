@@ -91,7 +91,7 @@ bool mg_random(void *buf, size_t len) {
 // backend uses NOISE_LOCAL_PRIVATE_KEY for both the TCP RPC server and the
 // bridge WS handler.
 #define DEFAULT_SERVER_PUBKEY_HEX \
-    "7215aaeea295f0c1234d3fd8aa42da6fb93da010cc8dd2d2f6c1d43435c8fe2f"
+    "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a"
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
@@ -1163,7 +1163,7 @@ int main(int argc, char **argv) {
     (void)login_load_credentials(&saved_creds);
 
     if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
-        fprintf(stderr, "No device credentials found. Run `bridge login [--device-name NAME]` first.\n\n");
+        fprintf(stderr, "No device credentials found. Run `todoforai-bridge login [--device-name NAME]` first.\n\n");
         print_help();
         return 1;
     }
@@ -1207,7 +1207,7 @@ int main(int argc, char **argv) {
                 case 4401:
                     fprintf(stderr,
                         "Authentication failed: %s.\n"
-                        "Your device credentials were rejected. Re-run `bridge login` "
+                        "Your device credentials were rejected. Re-run `todoforai-bridge login` "
                         "(the device may have been removed or the secret rotated).\n",
                         e->close_reason[0] ? e->close_reason : "invalid device credentials");
                     break;
@@ -1221,7 +1221,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr,
                         "Handshake failed: %s.\n"
                         "Wrong server pubkey, incompatible build, or server-side error. "
-                        "Try `bridge --version` and ensure you're up to date.\n",
+                        "Try `todoforai-bridge --version` and ensure you're up to date.\n",
                         e->close_reason[0] ? e->close_reason : "handshake failed");
                     break;
                 case 4003:
@@ -1248,9 +1248,15 @@ int main(int argc, char **argv) {
         } else if (!e->identity_sent) {
             fprintf(stderr,
                 "Disconnected during authentication — credentials likely rejected.\n"
-                "Re-run `bridge login`.\n");
+                "Re-run `todoforai-bridge login`.\n");
         } else {
-            fprintf(stderr, "Disconnected.\n");
+            // Unreachable in normal operation: rc != 0 means something set it,
+            // and every path that does also records a close frame or err_msg.
+            // If you see this, it's a bug — please report with the line below.
+            fprintf(stderr,
+                "Disconnected with no diagnostic (BUG: %s:%d, rc=%d). "
+                "Please report at https://github.com/todoforai\n",
+                __FILE__, __LINE__, rc);
         }
     }
     return rc == 0 ? 0 : 1;
