@@ -11,11 +11,14 @@ typedef struct {
 #ifdef _WIN32
     // ConPTY backend (see pty_win.c). Opaque void* so callers don't pull
     // windows.h. h_in_write = stdin pipe to child; h_out_read = stdout pipe
-    // from child; h_pcon = pseudo-console handle; h_process = child process.
+    // from child; h_pcon = pseudo-console handle; h_process = child process;
+    // h_job = job object grouping the shell + all its descendants so that
+    // TerminateJobObject / closing the handle nukes the whole tree.
     void          *h_process;
     void          *h_pcon;
     void          *h_in_write;
     void          *h_out_read;
+    void          *h_job;
     unsigned long  pid;
 #else
     int    master_fd;

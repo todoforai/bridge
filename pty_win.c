@@ -81,21 +81,44 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     // Quoting: shell path may contain spaces. ConPTY child gets argv[0] = sh.
     snprintf(cmdline, sizeof(cmdline), "\"%s\"", sh);
 
+    // Job object: groups the shell with every process it spawns. Closing the
+    // job handle (or TerminateJobObject) kills the whole tree at once — the
+    // POSIX-pgrp-equivalent we'd otherwise lack on Windows. Created suspended-
+    // by-flag (CREATE_SUSPENDED) so we can assign before the shell runs.
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    }
+
     PROCESS_INFORMATION pi = {0};
+    // EXTENDED_STARTUPINFO_PRESENT: STARTUPINFOEX in use.
+    // CREATE_SUSPENDED: assign-to-job before first instruction runs.
+    DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
-                             EXTENDED_STARTUPINFO_PRESENT,
-                             NULL, (cwd && *cwd) ? cwd : NULL,
+                             flags, NULL, (cwd && *cwd) ? cwd : NULL,
                              &si.StartupInfo, &pi);
     DeleteProcThreadAttributeList(si.lpAttributeList);
     HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
 
-    if (!ok) { ClosePseudoConsole(hpc); goto fail; }
+    if (!ok) {
+        if (job) CloseHandle(job);
+        ClosePseudoConsole(hpc);
+        goto fail;
+    }
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        // Already-jobbed (rare: nested job without BREAKAWAY) — proceed without.
+        CloseHandle(job); job = NULL;
+    }
+    ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
     p->h_process    = pi.hProcess;
     p->h_pcon       = hpc;
     p->h_in_write   = in_write;
     p->h_out_read   = out_read;
+    p->h_job        = job;
     p->pid          = pi.dwProcessId;
     p->alive        = 1;
     (void)no_echo;  // ConPTY has no direct ECHO toggle; bash -c handles it.
@@ -149,6 +172,11 @@ int bridge_pty_signal(bridge_pty_t *p, int sig) {
         return bridge_pty_write_all(p, "\x03", 1) == 0 ? 1 : 0;
     }
     if (sig == 15 || sig == 9) {
+        // Prefer the job: nukes the shell AND every child it spawned. Falls
+        // back to the process if no job (rare: AssignProcessToJobObject failed).
+        if (p->h_job) {
+            return TerminateJobObject((HANDLE)p->h_job, sig == 9 ? 9 : 15) ? 1 : 0;
+        }
         return TerminateProcess((HANDLE)p->h_process, sig == 9 ? 9 : 15) ? 1 : 0;
     }
     return 0;
@@ -181,6 +209,8 @@ int bridge_pty_close(bridge_pty_t *p) {
         CloseHandle((HANDLE)p->h_process);
         p->h_process = NULL;
     }
+    // Closing the job handle (with KILL_ON_JOB_CLOSE set) reaps any stragglers.
+    if (p->h_job) { CloseHandle((HANDLE)p->h_job); p->h_job = NULL; }
     return code;
 }
 
