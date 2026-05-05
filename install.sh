@@ -1,19 +1,6 @@
 #!/bin/sh
-# TODOforAI Bridge installer.
-#
-#   curl -fsSL https://todofor.ai/bridge | sh
-#   curl -fsSL https://todofor.ai/bridge | sh -s -- --token ENROLL_TOKEN
-#   curl -fsSL https://todofor.ai/bridge | sh -s -- --token TOK --name host-02
-#
-# Options:
-#   --token TOKEN     redeem an enrollment token (non-interactive login)
-#   --name NAME       device name to register under
-#   --prefix DIR      install dir (default: $HOME/.todoforai/bin)
-#   --tag TAG         specific release tag (default: latest)
-#   --no-service      skip systemd/launchd supervisor setup
-#   --no-start        install but don't start the bridge
-#
-# Environment overrides: TODOFORAI_PREFIX, TODOFORAI_TAG.
+# TODOforAI Bridge installer. Run -h for usage.
+# Env overrides: TODOFORAI_PREFIX, TODOFORAI_TAG.
 
 set -eu
 
@@ -23,7 +10,6 @@ TAG="${TODOFORAI_TAG:-}"
 TOKEN=""
 DEVICE_NAME=""
 DO_SERVICE=1
-DO_START=1
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m::\033[0m %s\n' "$*" >&2; }
@@ -42,8 +28,7 @@ Options:
   --name NAME       device name to register under
   --prefix DIR      install dir (default: $HOME/.todoforai/bin)
   --tag TAG         specific release tag (default: latest)
-  --no-service      skip systemd/launchd supervisor setup
-  --no-start        install but don't start the bridge
+  --no-service      skip systemd/launchd supervisor setup (don't auto-start)
 EOF
 }
 
@@ -57,7 +42,6 @@ while [ $# -gt 0 ]; do
         --prefix)     need_val "$1" "${2:-}"; PREFIX=$2;      shift 2 ;;
         --tag)        need_val "$1" "${2:-}"; TAG=$2;         shift 2 ;;
         --no-service) DO_SERVICE=0; shift ;;
-        --no-start)   DO_START=0; shift ;;
         -h|--help)    usage; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -191,21 +175,14 @@ Type=simple
 ExecStart=$BRIDGE
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
 [Install]
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    if [ "$DO_START" = 1 ]; then
-        systemctl --user enable --now bridge.service
-        command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "$USER" 2>/dev/null || true
-        ok "systemd user service enabled and started"
-    else
-        systemctl --user enable bridge.service
-        ok "systemd user service enabled (not started)"
-    fi
+    systemctl --user enable --now bridge.service
+    command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || true
+    ok "systemd user service enabled and started"
 }
 
 install_launchd() {
@@ -226,29 +203,9 @@ install_launchd() {
 </dict>
 </plist>
 EOF
-    if [ "$DO_START" = 1 ]; then
-        launchctl unload "$plist" 2>/dev/null || true
-        launchctl load -w "$plist"
-        ok "launchd agent loaded"
-    else
-        ok "launchd plist written (not loaded)"
-    fi
-}
-
-install_loop_fallback() {
-    loop="$PREFIX/bridge-loop"
-    cat >"$loop" <<EOF
-#!/bin/sh
-while :; do
-    "$BRIDGE"
-    rc=\$?
-    case \$rc in 0|143) sleep 1 ;; *) sleep 5 ;; esac
-done
-EOF
-    chmod +x "$loop"
-    ok "restart loop written to $loop"
-    info "start in background:  nohup $loop >/tmp/bridge.log 2>&1 &"
-    info "persist across reboot: add '@reboot $loop >/tmp/bridge.log 2>&1 &' to crontab"
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl load -w "$plist"
+    ok "launchd agent loaded"
 }
 
 if [ "$DO_SERVICE" = 1 ]; then
@@ -258,7 +215,7 @@ if [ "$DO_SERVICE" = 1 ]; then
     elif [ "$os" = darwin ]; then
         install_launchd
     else
-        install_loop_fallback
+        info "no supervisor detected; run manually: nohup $BRIDGE >/tmp/bridge.log 2>&1 &"
     fi
 fi
 
