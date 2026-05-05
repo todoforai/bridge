@@ -89,7 +89,6 @@ fi
 
 # ── resolve release tag (default: latest) ──────────────────────────────────
 if [ -z "$TAG" ]; then
-    info "finding latest release"
     TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
     [ -z "$TAG" ] && die "could not determine latest release (see https://github.com/$REPO/releases)"
