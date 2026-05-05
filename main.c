@@ -26,12 +26,29 @@
 
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+// Portable byte-substring search: glibc has memmem; mingw/MSVCRT does not.
+static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
+    if (nl == 0) return (void *)h;
+    if (hl < nl) return NULL;
+    const uint8_t *hp = h, *np = n;
+    for (size_t i = 0; i + nl <= hl; i++) {
+        if (hp[i] == np[0] && memcmp(hp + i, np, nl) == 0) return (void *)(hp + i);
+    }
+    return NULL;
+}
+#  define memmem(h, hl, n, nl) memmem_compat((h), (hl), (n), (nl))
+#else
+#  include <unistd.h>
+#endif
 
 #include "args.h"      // ketopt + cli_usage helpers
 #include "identity.h"  // BRIDGE_VERSION
@@ -56,7 +73,12 @@ bool mg_random(void *buf, size_t len) {
 // Plain HTTP port — bridge has no TLS client; Noise provides end-to-end crypto.
 #define DEFAULT_PORT         80
 #define DEFAULT_PATH         "/ws/v2/bridge"
+#ifdef _WIN32
+// pty_win.c resolves NULL → $BRIDGE_SHELL → bash.exe (PATH) → Git Bash → cmd.exe.
+#define DEFAULT_SHELL        NULL
+#else
 #define DEFAULT_SHELL        "/bin/sh"
+#endif
 #define BUF_SIZE             4096
 #define MAX_SESSIONS         16
 #define SESSION_ID_LEN       36
@@ -157,9 +179,13 @@ typedef struct {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 static int64_t monotonic_ms(void) {
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
 }
 
 static void hex_encode(char *out, const uint8_t *in, size_t n) {
@@ -715,8 +741,9 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->run_block_id_len = bn;
 
         s->sentinel_len = gen_sentinel(s->sentinel, sizeof(s->sentinel));
-        long timeout_ms = 0;
-        json_int(msg, msg_len, "timeoutMs", &timeout_ms);
+        long timeout_ms_raw = 0;
+        json_int(msg, msg_len, "timeoutMs", &timeout_ms_raw);
+        int64_t timeout_ms = (int64_t)timeout_ms_raw;
         // Cap to ~1 year so monotonic_ms() + timeout can't overflow int64_t.
         if (timeout_ms > 365LL * 24 * 60 * 60 * 1000) timeout_ms = 365LL * 24 * 60 * 60 * 1000;
         s->deadline_ms = timeout_ms > 0 ? monotonic_ms() + timeout_ms : 0;
@@ -970,7 +997,7 @@ static void service_sessions(edge_t *e) {
         if (now - s->last_pause_poll_ms < PAUSE_POLL_MS) continue;
         s->last_pause_poll_ms = now;
 
-        pid_t fg = 0; int pwd = 0;
+        long fg = 0; int pwd = 0;
         int blocked = bridge_pty_probe_blocked(&s->pty, /*echo_baseline=*/0, &fg, &pwd);
         if (!blocked) { s->pause_consec_ticks = 0; continue; }
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
@@ -980,8 +1007,8 @@ static void service_sessions(edge_t *e) {
             s->tail_len = 0;
         }
         send_step_paused(e, s, pwd);
-        fprintf(stderr, "RUN paused (waiting for stdin): %s fg=%d pwd=%d\n",
-                s->run_block_id, (int)fg, pwd);
+        fprintf(stderr, "RUN paused (waiting for stdin): %s fg=%ld pwd=%d\n",
+                s->run_block_id, fg, pwd);
     }
 
     // Idle-session GC.

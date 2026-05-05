@@ -67,6 +67,9 @@ make
 
 # Static musl build via `zig cc` — ~90 KB, single-file, zero deps
 make static
+
+# Windows x64 build via `zig cc` (mingw-w64) — ~150 KB
+make release-windows-x64
 ```
 
 ## Run
@@ -124,7 +127,12 @@ No new protocol messages, no in-binary HTTP client, no extra dependencies.
 
 ## Notes
 
-- POSIX-only. Windows port would need ConPTY.
+- POSIX + Windows (ConPTY, Win10 1809+). Windows build via
+  `make release-windows-x64` (zig cc + mingw-w64). On Windows the bridge
+  spawns `bash.exe` inside ConPTY — set `BRIDGE_SHELL` to override, otherwise
+  it probes PATH then Git for Windows install paths, falling back to `cmd.exe`
+  (RUN/tool catalog assume bash semantics — install Git for Windows or WSL).
+  `step_paused` (auto-detect of stdin-blocked) is Linux-only.
 - Session limit is 16 concurrent PTYs (`MAX_SESSIONS` in `main.c`).
 - WebSocket uses plain `ws://` — TLS is replaced by Noise end-to-end.
   Typically deployed behind nginx/Cloudflare which terminates external

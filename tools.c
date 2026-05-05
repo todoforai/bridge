@@ -17,16 +17,22 @@
 #include "mongoose.h"   // mg_base64_decode
 
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <poll.h>
+#  include <signal.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 
 #define VERSION_TIMEOUT_MS 5000
 #define STATUS_TIMEOUT_MS  10000
@@ -36,6 +42,121 @@
 // Run a shell command with a deadline. Captures up to `cap` bytes of combined
 // stdout+stderr into `out` (NUL-terminated, trimmed of trailing whitespace).
 // Returns the child exit code (0 = success), or -1 on spawn/timeout failure.
+#ifdef _WIN32
+// Locate a POSIX-ish shell. Catalog commands assume `sh -c` semantics, so on
+// Windows we run them through bash.exe (Git Bash / MSYS2 / WSL). $BRIDGE_SHELL
+// overrides; otherwise let CreateProcess search PATH for "bash.exe".
+static const char *win_shell(void) {
+    static char buf[MAX_PATH];
+    static int  resolved = 0;
+    if (resolved) return buf[0] ? buf : NULL;
+    resolved = 1;
+    const char *env = getenv("BRIDGE_SHELL");
+    if (env && *env) { snprintf(buf, sizeof(buf), "%s", env); return buf; }
+    if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0) return buf;
+    const char *fallbacks[] = {
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+        NULL,
+    };
+    for (int i = 0; fallbacks[i]; i++) {
+        if (GetFileAttributesA(fallbacks[i]) != INVALID_FILE_ATTRIBUTES) {
+            snprintf(buf, sizeof(buf), "%s", fallbacks[i]);
+            return buf;
+        }
+    }
+    buf[0] = '\0';
+    return NULL;
+}
+
+static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
+    if (cap) out[0] = '\0';
+    const char *sh = win_shell();
+    if (!sh) return -1;
+
+    SECURITY_ATTRIBUTES sa = { .nLength = sizeof(sa), .bInheritHandle = TRUE };
+    HANDLE r = NULL, w = NULL;
+    if (!CreatePipe(&r, &w, &sa, 0)) return -1;
+    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+
+    char cmdline[2048];
+    // Quote shell path; pass `cmd` as a single argument to `-c`.
+    int n = snprintf(cmdline, sizeof(cmdline), "\"%s\" -c \"%s\"", sh, cmd);
+    if (n <= 0 || (size_t)n >= sizeof(cmdline)) { CloseHandle(r); CloseHandle(w); return -1; }
+
+    STARTUPINFOA si = { .cb = sizeof(si), .dwFlags = STARTF_USESTDHANDLES,
+                        .hStdOutput = w, .hStdError = w, .hStdInput = NULL };
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(r); CloseHandle(w);
+        return -1;
+    }
+    CloseHandle(w);  // child holds the only writer now
+
+    DWORD start = GetTickCount();
+    size_t used = 0;
+    int timed_out = 0;
+
+    for (;;) {
+        DWORD elapsed = GetTickCount() - start;
+        DWORD remaining = (DWORD)timeout_ms > elapsed ? (DWORD)timeout_ms - elapsed : 0;
+        DWORD avail = 0;
+        // PeekNamedPipe avoids blocking; ReadFile would block until child closes.
+        if (PeekNamedPipe(r, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+            if (used + 1 < cap) {
+                DWORD got = 0;
+                DWORD want = (DWORD)(cap - 1 - used);
+                if (avail < want) want = avail;
+                if (ReadFile(r, out + used, want, &got, NULL) && got > 0) {
+                    used += got; out[used] = '\0';
+                    continue;
+                }
+            } else {
+                char scratch[256]; DWORD got = 0;
+                ReadFile(r, scratch, sizeof(scratch), &got, NULL);
+            }
+        }
+        DWORD wr = WaitForSingleObject(pi.hProcess, 50);
+        if (wr == WAIT_OBJECT_0) break;
+        if (remaining == 0) { timed_out = 1; break; }
+    }
+
+    if (timed_out) TerminateProcess(pi.hProcess, 1);
+
+    // Final drain.
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(r, NULL, 0, NULL, &avail, NULL) || avail == 0) break;
+        if (used + 1 >= cap) {
+            char scratch[256]; DWORD got = 0;
+            if (!ReadFile(r, scratch, sizeof(scratch), &got, NULL) || got == 0) break;
+        } else {
+            DWORD got = 0;
+            DWORD want = (DWORD)(cap - 1 - used);
+            if (avail < want) want = avail;
+            if (!ReadFile(r, out + used, want, &got, NULL) || got == 0) break;
+            used += got; out[used] = '\0';
+        }
+    }
+
+    DWORD exit_code = 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    CloseHandle(r);
+
+    while (used > 0 && (out[used-1] == '\n' || out[used-1] == '\r' ||
+                        out[used-1] == ' '  || out[used-1] == '\t')) {
+        out[--used] = '\0';
+    }
+    for (size_t i = 0; i < used; i++) {
+        if ((unsigned char)out[i] < 0x20) out[i] = ' ';
+    }
+
+    return timed_out ? -1 : (int)exit_code;
+}
+#else
 static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
     if (cap) out[0] = '\0';
 
@@ -125,6 +246,7 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
     if (WIFEXITED(exit_code)) return WEXITSTATUS(exit_code);
     return -1;
 }
+#endif
 
 // Append `fmt` (mg_snprintf-style) at *used; advance *used. -1 on overflow.
 static int j_append(char *out, size_t cap, size_t *used, const char *fmt, ...) {

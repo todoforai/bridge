@@ -16,10 +16,12 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 CORE = ../todoforai-c-core
-SRCS = main.c noise_ws.c pty_posix.c identity.c subcmd.c tools.c update.c \
+COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c \
        $(CORE)/vendor/mongoose/mongoose.c
-HDRS = noise_ws.h pty.h identity.h subcmd.h tools.h update.h \
+SRCS = $(COMMON_SRCS) pty_posix.c
+WIN_SRCS = $(COMMON_SRCS) pty_win.c
+HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h \
        $(CORE)/vendor/mongoose/mongoose.h
@@ -45,7 +47,7 @@ static: | build
 # Produce a single stripped artifact named build/bridge-<os>-<arch>.
 # Used by CI; locally requires `zig` (Linux) or Xcode clang (macOS).
 
-.PHONY: release-linux-x64 release-linux-arm64 release-darwin-x64 release-darwin-arm64
+.PHONY: release-linux-x64 release-linux-arm64 release-darwin-x64 release-darwin-arm64 release-windows-x64
 
 release-linux-x64: | build
 	zig cc -target x86_64-linux-musl -static $(CFLAGS) -o build/bridge-linux-x64 $(SRCS) -lutil
@@ -65,6 +67,19 @@ release-darwin-x64: | build
 release-darwin-arm64: | build
 	clang -target arm64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/bridge-darwin-arm64 $(SRCS)
 	strip build/bridge-darwin-arm64 2>/dev/null || true
+
+# Windows: ConPTY backend (pty_win.c) + winsock; mongoose auto-selects its
+# Win32 arch via _WIN32. zig cc bundles a recent mingw-w64.
+# _WIN32_WINNT=0x0A00 unlocks CreatePseudoConsole (Win10 1809+).
+release-windows-x64: | build
+	zig cc -target x86_64-windows-gnu \
+	    -U_WIN32_WINNT -UNTDDI_VERSION -UWINVER \
+	    -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006 -DWINVER=0x0A00 \
+	    -Wno-macro-redefined \
+	    $(CFLAGS) \
+	    -o build/bridge-windows-x64.exe $(WIN_SRCS) \
+	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
+	strip build/bridge-windows-x64.exe 2>/dev/null || true
 
 # Sentinel-scanner smoke test: spawns a real PTY with echo off, runs a few
 # wrapped commands, asserts the bridge's emit/parse logic matches.

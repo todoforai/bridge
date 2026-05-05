@@ -276,7 +276,7 @@ static int darwin_is_blocked_on_tty(pid_t pid) {
 #endif
 
 int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
-                             pid_t *fg_pid, int *password_prompt) {
+                             long *fg_pid, int *password_prompt) {
     if (fg_pid) *fg_pid = 0;
     if (password_prompt) *password_prompt = 0;
     if (!p || p->master_fd < 0 || !p->alive) return 0;

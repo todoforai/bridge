@@ -1,14 +1,24 @@
 #define _POSIX_C_SOURCE 200809L
 #include "identity.h"
 
-#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/stat.h>
-#include <sys/utsname.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <lmcons.h>      // UNLEN
+#  include <direct.h>      // _getcwd
+#  define strcasecmp  _stricmp
+#  define strncasecmp _strnicmp
+#else
+#  include <pwd.h>
+#  include <strings.h>
+#  include <sys/utsname.h>
+#  include <unistd.h>
+#endif
 
 #include "mongoose.h"
 
@@ -112,6 +122,57 @@ static void detect_device_type(const char *os_sysname, char *out, size_t cap) {
 void bridge_identity_gather(bridge_identity_t *id) {
     memset(id, 0, sizeof(*id));
 
+#ifdef _WIN32
+    snprintf(id->os, sizeof(id->os), "Windows");
+    SYSTEM_INFO si; GetNativeSystemInfo(&si);
+    const char *arch = "unknown";
+    switch (si.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64: arch = "x86_64"; break;
+        case PROCESSOR_ARCHITECTURE_ARM64: arch = "aarch64"; break;
+        case PROCESSOR_ARCHITECTURE_INTEL: arch = "i686"; break;
+    }
+    snprintf(id->arch, sizeof(id->arch), "%s", arch);
+
+    DWORD hn = sizeof(id->hostname);
+    if (!GetComputerNameExA(ComputerNameDnsHostname, id->hostname, &hn))
+        snprintf(id->hostname, sizeof(id->hostname), "unknown");
+
+    // RtlGetVersion gives the actual OS version (GetVersionEx lies post-Win8.1).
+    typedef LONG (WINAPI *RtlGetVersion_t)(OSVERSIONINFOEXW *);
+    OSVERSIONINFOEXW vi = { .dwOSVersionInfoSize = sizeof(vi) };
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    RtlGetVersion_t fn = ntdll ? (RtlGetVersion_t)(void*)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    if (fn && fn(&vi) == 0) {
+        snprintf(id->kernel, sizeof(id->kernel), "%lu.%lu.%lu",
+                 (unsigned long)vi.dwMajorVersion,
+                 (unsigned long)vi.dwMinorVersion,
+                 (unsigned long)vi.dwBuildNumber);
+        snprintf(id->distro, sizeof(id->distro), "windows");
+        snprintf(id->distro_version, sizeof(id->distro_version), "%lu.%lu.%lu",
+                 (unsigned long)vi.dwMajorVersion,
+                 (unsigned long)vi.dwMinorVersion,
+                 (unsigned long)vi.dwBuildNumber);
+    } else {
+        snprintf(id->kernel, sizeof(id->kernel), "unknown");
+        snprintf(id->distro, sizeof(id->distro), "windows");
+    }
+
+    snprintf(id->device_type, sizeof(id->device_type), "PC");
+
+    char ubuf[UNLEN + 1]; DWORD ulen = sizeof(ubuf);
+    if (GetUserNameA(ubuf, &ulen)) snprintf(id->user, sizeof(id->user), "%s", ubuf);
+    else                           snprintf(id->user, sizeof(id->user), "unknown");
+
+    const char *home = getenv("USERPROFILE");
+    snprintf(id->home, sizeof(id->home), "%s", home ? home : "C:\\");
+
+    const char *sh = getenv("BRIDGE_SHELL");
+    if (!sh) sh = getenv("SHELL");
+    snprintf(id->shell, sizeof(id->shell), "%s", sh ? sh : "bash.exe");
+
+    if (!_getcwd(id->cwd, sizeof(id->cwd)))
+        snprintf(id->cwd, sizeof(id->cwd), "C:\\");
+#else
     struct utsname un;
     if (uname(&un) == 0) {
         snprintf(id->os,       sizeof(id->os),       "%s", un.sysname);
@@ -142,6 +203,7 @@ void bridge_identity_gather(bridge_identity_t *id) {
     if (!getcwd(id->cwd, sizeof(id->cwd))) {
         snprintf(id->cwd, sizeof(id->cwd), "/");
     }
+#endif
 
     // Sanitize all fields: replace control bytes with space. mg_print_esc
     // only escapes \b\f\n\r\t\\\"; raw 0x00–0x1f would produce invalid JSON.

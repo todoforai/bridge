@@ -38,9 +38,9 @@ int main(void) {
         const char *cmd = "read -r v; echo got=$v\n";
         bridge_pty_write_all(&p, cmd, strlen(cmd));
         drain(&p, 300);
-        pid_t fg=0; int pwd=0;
+        long fg=0; int pwd=0;
         int r = bridge_pty_probe_blocked(&p, /*echo_baseline=*/0, &fg, &pwd);
-        printf("[read]  blocked=%d fg=%d pwd=%d\n", r, (int)fg, pwd); fflush(stdout);
+        printf("[read]  blocked=%d fg=%ld pwd=%d\n", r, fg, pwd); fflush(stdout);
         bridge_pty_write_all(&p, "hi\n", 3);
         msleep(100);
         bridge_pty_close(&p);
@@ -53,9 +53,9 @@ int main(void) {
         const char *cmd = "read -s -p 'pw: ' v; echo got=$v\n";
         bridge_pty_write_all(&p, cmd, strlen(cmd));
         drain(&p, 400);
-        pid_t fg=0; int pwd=0;
+        long fg=0; int pwd=0;
         int r = bridge_pty_probe_blocked(&p, /*echo_baseline=*/1, &fg, &pwd);
-        printf("[read -s] blocked=%d fg=%d pwd=%d (expect pwd=1)\n", r, (int)fg, pwd); fflush(stdout);
+        printf("[read -s] blocked=%d fg=%ld pwd=%d (expect pwd=1)\n", r, fg, pwd); fflush(stdout);
         bridge_pty_write_all(&p, "hi\n", 3);
         msleep(100);
         bridge_pty_close(&p);
@@ -67,9 +67,9 @@ int main(void) {
         const char *cmd = "while :; do :; done\n";
         bridge_pty_write_all(&p, cmd, strlen(cmd));
         drain(&p, 300);
-        pid_t fg=0; int pwd=0;
+        long fg=0; int pwd=0;
         int r = bridge_pty_probe_blocked(&p, /*echo_baseline=*/1, &fg, &pwd);
-        printf("[busy]  blocked=%d fg=%d pwd=%d (expect blocked=0)\n", r, (int)fg, pwd); fflush(stdout);
+        printf("[busy]  blocked=%d fg=%ld pwd=%d (expect blocked=0)\n", r, fg, pwd); fflush(stdout);
         bridge_pty_signal(&p, 9);
         bridge_pty_close(&p);
     }
