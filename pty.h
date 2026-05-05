@@ -39,8 +39,8 @@ int bridge_pty_close(bridge_pty_t *p);
 int bridge_pty_pollfd(const bridge_pty_t *p);
 
 // Probe whether any task in the PTY's foreground process group is parked in
-// a tty read — i.e. blocked waiting for stdin. Linux-only (uses /proc); on
-// other platforms returns 0.
+// a tty read — i.e. blocked waiting for stdin. Linux uses /proc, macOS uses
+// libproc (/dev/ttys* fd + sleeping thread heuristic). Other platforms: 0.
 //
 //   echo_baseline     baseline of (c_lflag & ECHO) bool at session creation;
 //                     password_prompt fires only on transitions from that.

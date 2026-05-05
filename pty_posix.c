@@ -20,6 +20,11 @@
 #  include <pty.h>
 #endif
 
+#if defined(__APPLE__)
+#  include <libproc.h>
+#  include <sys/proc_info.h>
+#endif
+
 int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no_echo) {
     // Pre-build termios so the slave starts in the desired mode. Setting echo
     // from the child after fork races against the parent's first write.
@@ -231,13 +236,85 @@ static pid_t proc_pgrp(pid_t pid) {
 }
 #endif
 
+#if defined(__APPLE__)
+// True iff `pid` has any open fd whose vnode path is a pty slave (/dev/ttys*).
+// Cheaper than enumerating every fd: we early-exit on first hit.
+static int darwin_pid_has_tty_fd(pid_t pid) {
+    int bufsize = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+    if (bufsize <= 0) return 0;
+    struct proc_fdinfo *fds = (struct proc_fdinfo *)malloc((size_t)bufsize);
+    if (!fds) return 0;
+    int n = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, bufsize);
+    int hit = 0;
+    int count = (n > 0) ? n / (int)sizeof(struct proc_fdinfo) : 0;
+    for (int i = 0; i < count; i++) {
+        if (fds[i].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+        struct vnode_fdinfowithpath v;
+        int r = proc_pidfdinfo(pid, fds[i].proc_fd, PROC_PIDFDVNODEPATHINFO,
+                               &v, sizeof v);
+        if (r != (int)sizeof v) continue;
+        if (strncmp(v.pvip.vip_path, "/dev/ttys", 9) == 0) { hit = 1; break; }
+    }
+    free(fds);
+    return hit;
+}
+
+// True iff `pid` has no thread currently on-CPU. Darwin doesn't expose
+// per-syscall info like /proc/<pid>/syscall, so we approximate:
+// "no running thread + holds a pty fd". Combined with the tcgetpgrp gate
+// from the caller this matches the Linux signal in practice.
+static int darwin_pid_is_waiting(pid_t pid) {
+    struct proc_taskallinfo ti;
+    int r = proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, &ti, sizeof ti);
+    if (r != (int)sizeof ti) return 0;
+    return ti.ptinfo.pti_numrunning == 0;
+}
+
+static int darwin_is_blocked_on_tty(pid_t pid) {
+    return darwin_pid_is_waiting(pid) && darwin_pid_has_tty_fd(pid);
+}
+#endif
+
 int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
                              pid_t *fg_pid, int *password_prompt) {
     if (fg_pid) *fg_pid = 0;
     if (password_prompt) *password_prompt = 0;
     if (!p || p->master_fd < 0 || !p->alive) return 0;
 
-#if defined(__linux__)
+#if defined(__APPLE__)
+    pid_t fg = tcgetpgrp(p->master_fd);
+    if (fg <= 0) return 0;
+
+    pid_t blocked_pid = 0;
+    if (darwin_is_blocked_on_tty(fg)) {
+        blocked_pid = fg;
+    } else {
+        // Enumerate the foreground process group via libproc. Both calls
+        // return a byte count (NOT a pid count).
+        int bytes = proc_listpgrppids(fg, NULL, 0);
+        if (bytes <= 0) return 0;
+        pid_t *pids = (pid_t *)malloc((size_t)bytes);
+        if (!pids) return 0;
+        bytes = proc_listpgrppids(fg, pids, bytes);
+        int count = (bytes > 0) ? bytes / (int)sizeof(pid_t) : 0;
+        for (int i = 0; i < count; i++) {
+            pid_t pid = pids[i];
+            if (pid <= 0 || pid == fg) continue;
+            if (darwin_is_blocked_on_tty(pid)) { blocked_pid = pid; break; }
+        }
+        free(pids);
+        if (blocked_pid == 0) return 0;
+    }
+    if (fg_pid) *fg_pid = blocked_pid;
+
+    if (password_prompt && echo_baseline) {
+        struct termios t;
+        if (tcgetattr(p->master_fd, &t) == 0 && !(t.c_lflag & ECHO)) {
+            *password_prompt = 1;
+        }
+    }
+    return 1;
+#elif defined(__linux__)
     // Foreground process *group* on our PTY. tcgetpgrp returns a pgid, NOT the
     // pid of the actual reader — for `sudo cmd`, the shell may be in wait()
     // while sudo (a child in the same fg pgrp) is the one parked in n_tty_read.
