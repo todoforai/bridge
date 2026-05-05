@@ -2,7 +2,7 @@
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# Builds bridge-{linux,darwin}-{x64,arm64} + .sha256 sidecars, then creates a
+# Builds todoforai-bridge-{linux,darwin}-{x64,arm64} + .sha256 sidecars, then creates a
 # GitHub Release with those assets. The installer at
 # https://todofor.ai/bridge reads `releases/latest` via the public GitHub API.
 
@@ -70,7 +70,7 @@ jobs:
       - name: Compute sha256
         working-directory: bridge/build
         env:
-          ASSET: bridge-${{ matrix.target }}${{ matrix.ext }}
+          ASSET: todoforai-bridge-${{ matrix.target }}${{ matrix.ext }}
         run: |
           if command -v sha256sum >/dev/null; then
             sha256sum "$ASSET" > "$ASSET.sha256"
@@ -89,15 +89,15 @@ jobs:
           (matrix.target == 'linux-arm64'  && runner.arch == 'ARM64') ||
           (matrix.target == 'darwin-x64'   && runner.arch == 'X64')   ||
           (matrix.target == 'darwin-arm64' && runner.arch == 'ARM64')
-        run: ./bridge-${{ matrix.target }} --version
+        run: ./todoforai-bridge-${{ matrix.target }} --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bridge-${{ matrix.target }}
+          name: todoforai-bridge-${{ matrix.target }}
           path: |
-            bridge/build/bridge-${{ matrix.target }}${{ matrix.ext }}
-            bridge/build/bridge-${{ matrix.target }}${{ matrix.ext }}.sha256
+            bridge/build/todoforai-bridge-${{ matrix.target }}${{ matrix.ext }}
+            bridge/build/todoforai-bridge-${{ matrix.target }}${{ matrix.ext }}.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -136,6 +136,6 @@ jobs:
             gh release upload "$tag" dist/* --clobber
           else
             gh release create "$tag" dist/* \
-              --title "bridge $tag" \
+              --title "todoforai-bridge $tag" \
               --generate-notes
           fi

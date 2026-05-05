@@ -52,7 +52,7 @@ $arch = switch ($pa) {
     'ARM64' { 'arm64' }
     default { Die "unsupported arch: $pa" }
 }
-$asset = "bridge-windows-$arch.exe"
+$asset = "todoforai-bridge-windows-$arch.exe"
 
 # ── resolve release tag (default: latest) ───────────────────────────────────
 if (-not $Tag) {
@@ -66,11 +66,11 @@ $shaUrl = "$url.sha256"
 
 # ── download + verify ───────────────────────────────────────────────────────
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("bridge-" + [guid]::NewGuid())
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("todoforai-bridge-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
-    $bin    = Join-Path $tmp 'bridge.exe'
-    $shaTxt = Join-Path $tmp 'bridge.sha'
+    $bin    = Join-Path $tmp 'todoforai-bridge.exe'
+    $shaTxt = Join-Path $tmp 'todoforai-bridge.sha'
     try { Invoke-WebRequest -UseBasicParsing -Uri $url    -OutFile $bin    } catch { Die "download failed: $url" }
     try { Invoke-WebRequest -UseBasicParsing -Uri $shaUrl -OutFile $shaTxt } catch { Die "checksum fetch failed: $shaUrl" }
 
@@ -85,7 +85,7 @@ try {
              else                   { "$size B" }
     Ok "downloaded $asset $Tag ($human)"
 
-    $dest = Join-Path $Prefix 'bridge.exe'
+    $dest = Join-Path $Prefix 'todoforai-bridge.exe'
     # stop existing task if present so we can overwrite a running exe
     Get-ScheduledTask -TaskName 'TODOforAI Bridge' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
     Move-Item -Force $bin $dest
@@ -93,7 +93,7 @@ try {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
-$Bridge = Join-Path $Prefix 'bridge.exe'
+$Bridge = Join-Path $Prefix 'todoforai-bridge.exe'
 $Cmd    = $Bridge
 $Where  = $Bridge
 $Hint   = ""
@@ -101,7 +101,7 @@ $Hint   = ""
 # ── PATH setup (user PATH) ──────────────────────────────────────────────────
 $pathParts = ($env:Path -split ';') | Where-Object { $_ }
 if ($pathParts -contains $Prefix) {
-    $Cmd = 'bridge'
+    $Cmd = 'todoforai-bridge'
 } else {
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $userParts = if ($userPath) { ($userPath -split ';') | Where-Object { $_ } } else { @() }
@@ -112,7 +112,7 @@ if ($pathParts -contains $Prefix) {
         $Hint  = " (open a new shell to pick up PATH)"
     }
     $env:Path = "$env:Path;$Prefix"
-    $Cmd = 'bridge'
+    $Cmd = 'todoforai-bridge'
 }
 Ok "installed $Where$Hint"
 

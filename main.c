@@ -86,7 +86,7 @@ bool mg_random(void *buf, size_t len) {
 #define MAX_MSG              (64 * 1024)
 
 // Server's Noise static public key (X25519, 32 bytes hex = 64 chars).
-// Overridable via EDGE_SERVER_PUBKEY env or --server-pubkey flag.
+// Overridable via BRIDGE_SERVER_PUBKEY env or --server-pubkey flag.
 // Same key used by sandbox-manager / browser-manager CLIs on port 4100 —
 // backend uses NOISE_LOCAL_PRIVATE_KEY for both the TCP RPC server and the
 // bridge WS handler.
@@ -169,6 +169,13 @@ typedef struct {
     // until the auth round-trip has had time to settle on the backend.
     int identity_sent;
     int64_t auth_sent_ms;
+
+    // Last disconnect reason — surfaced by main() so users get actionable output
+    // instead of a bare "Disconnected".
+    uint16_t close_code;
+    int      got_close_frame;
+    char     close_reason[128];
+    char     err_msg[160];
 
     session_t sessions[MAX_SESSIONS];
     uint8_t  pty_buf[BUF_SIZE];
@@ -1032,20 +1039,22 @@ static void service_sessions(edge_t *e) {
 static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
     edge_t *e = c->fn_data;
     if (ev == MG_EV_ERROR) {
-        fprintf(stderr, "WS error: %s\n", (char *)ev_data);
+        snprintf(e->err_msg, sizeof e->err_msg, "%s", (const char *)ev_data);
         e->rc = 1; e->done = 1;
     }
     else if (ev == MG_EV_CLOSE)   { e->ws = NULL; e->done = 1; }
     else if (ev == MG_EV_WS_CTL) {
         struct mg_ws_message *wm = ev_data;
         if (wm->flags & 8) {  // close opcode
-            uint16_t code = 0;
+            e->got_close_frame = 1;
             if (wm->data.len >= 2)
-                code = ((uint8_t)wm->data.buf[0] << 8) | (uint8_t)wm->data.buf[1];
-            fprintf(stderr, "WS close: code=%u reason=%.*s\n",
-                    code,
-                    (int)(wm->data.len > 2 ? wm->data.len - 2 : 0),
-                    wm->data.len > 2 ? wm->data.buf + 2 : "");
+                e->close_code = ((uint8_t)wm->data.buf[0] << 8) | (uint8_t)wm->data.buf[1];
+            if (wm->data.len > 2) {
+                size_t n = wm->data.len - 2;
+                if (n >= sizeof e->close_reason) n = sizeof e->close_reason - 1;
+                memcpy(e->close_reason, wm->data.buf + 2, n);
+                e->close_reason[n] = 0;
+            }
         }
     }
     else if (ev == MG_EV_WS_OPEN) { noise_ws_start(&e->noise, c); }
@@ -1145,7 +1154,7 @@ int main(int argc, char **argv) {
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pubkey_hex = opt.arg;
-        else cli_parse_error("bridge", USAGE_MAIN, argc, argv, &opt, c);
+        else cli_parse_error("todoforai-bridge", USAGE_MAIN, argc, argv, &opt, c);
     }
 
     // Load saved device credentials from `bridge login`
@@ -1159,17 +1168,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!host) host = getenv("EDGE_HOST");
+    if (!host) host = getenv("BRIDGE_HOST");
     if (!host) host = DEFAULT_HOST;
 
-    if (!port_s) port_s = getenv("EDGE_PORT");
+    if (!port_s) port_s = getenv("BRIDGE_PORT");
     uint16_t port = DEFAULT_PORT;
     if (port_s) {
         int p = atoi(port_s);
         if (p > 0 && p <= 65535) port = (uint16_t)p;
     }
 
-    if (!pubkey_hex) pubkey_hex = getenv("EDGE_SERVER_PUBKEY");
+    if (!pubkey_hex) pubkey_hex = getenv("BRIDGE_SERVER_PUBKEY");
     if (!pubkey_hex) pubkey_hex = DEFAULT_SERVER_PUBKEY_HEX;
 
     uint8_t server_pubkey[32];
@@ -1192,6 +1201,57 @@ int main(int argc, char **argv) {
     }
     free(e);
 
-    if (rc != 0) fprintf(stderr, "Disconnected\n");
+    if (rc != 0) {
+        if (e->got_close_frame) {
+            switch (e->close_code) {
+                case 4401:
+                    fprintf(stderr,
+                        "Authentication failed: %s.\n"
+                        "Your device credentials were rejected. Re-run `bridge login` "
+                        "(the device may have been removed or the secret rotated).\n",
+                        e->close_reason[0] ? e->close_reason : "invalid device credentials");
+                    break;
+                case 4408:
+                    fprintf(stderr,
+                        "Authentication timed out: %s.\n"
+                        "The server didn't receive auth in time — check your network/firewall.\n",
+                        e->close_reason[0] ? e->close_reason : "auth timeout");
+                    break;
+                case 4001:
+                    fprintf(stderr,
+                        "Handshake failed: %s.\n"
+                        "Wrong server pubkey, incompatible build, or server-side error. "
+                        "Try `bridge --version` and ensure you're up to date.\n",
+                        e->close_reason[0] ? e->close_reason : "handshake failed");
+                    break;
+                case 4003:
+                    fprintf(stderr, "Protocol error: %s.\n",
+                        e->close_reason[0] ? e->close_reason : "binary frames only");
+                    break;
+                default:
+                    fprintf(stderr, "Disconnected by server (code=%u%s%s).\n",
+                        e->close_code,
+                        e->close_reason[0] ? ", reason=" : "",
+                        e->close_reason);
+            }
+        } else if (e->err_msg[0]) {
+            // Transport-level failure before/without a WS close frame.
+            int dns_or_conn = strstr(e->err_msg, "resolve") || strstr(e->err_msg, "connect")
+                           || strstr(e->err_msg, "DNS")     || strstr(e->err_msg, "refused");
+            fprintf(stderr, "Connection failed: %s.\n", e->err_msg);
+            if (dns_or_conn)
+                fprintf(stderr, "Check your network and that --host/--port are reachable.\n");
+        } else if (!e->noise.handshake_done) {
+            fprintf(stderr,
+                "Disconnected before Noise handshake completed.\n"
+                "Likely a network/TLS issue or wrong --server-pubkey.\n");
+        } else if (!e->identity_sent) {
+            fprintf(stderr,
+                "Disconnected during authentication — credentials likely rejected.\n"
+                "Re-run `bridge login`.\n");
+        } else {
+            fprintf(stderr, "Disconnected.\n");
+        }
+    }
     return rc == 0 ? 0 : 1;
 }

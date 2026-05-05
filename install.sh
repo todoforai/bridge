@@ -60,7 +60,7 @@ case "$uname_m" in
     aarch64|arm64) arch=arm64 ;;
     *) die "unsupported arch: $uname_m" ;;
 esac
-asset="bridge-${os}-${arch}"
+asset="todoforai-bridge-${os}-${arch}"
 
 # ── fetch tool ──────────────────────────────────────────────────────────────
 if command -v curl >/dev/null 2>&1; then
@@ -85,29 +85,29 @@ mkdir -p "$PREFIX"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-fetch "$url"     "$tmp/bridge"     || die "download failed: $url"
-fetch "$sha_url" "$tmp/bridge.sha" || die "checksum fetch failed: $sha_url"
+fetch "$url"     "$tmp/todoforai-bridge"     || die "download failed: $url"
+fetch "$sha_url" "$tmp/todoforai-bridge.sha" || die "checksum fetch failed: $sha_url"
 
-expected=$(awk '{print $1}' "$tmp/bridge.sha")
+expected=$(awk '{print $1}' "$tmp/todoforai-bridge.sha")
 if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$tmp/bridge" | awk '{print $1}')
+    actual=$(sha256sum "$tmp/todoforai-bridge" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "$tmp/bridge" | awk '{print $1}')
+    actual=$(shasum -a 256 "$tmp/todoforai-bridge" | awk '{print $1}')
 else
     die "need sha256sum or shasum"
 fi
 [ "$expected" = "$actual" ] || die "sha256 mismatch: expected $expected, got $actual"
 
-size=$(wc -c <"$tmp/bridge" | tr -d ' ')
+size=$(wc -c <"$tmp/todoforai-bridge" | tr -d ' ')
 human=$(awk -v b="$size" 'BEGIN{ s="BKMGT"; for(i=1; b>=1024 && i<5; i++) b/=1024; printf (i==1?"%d %s":"%.1f %siB"), b, substr(s,i,1) }')
 ok "downloaded $asset $TAG ($human)"
 
-chmod +x "$tmp/bridge"
-mv "$tmp/bridge" "$PREFIX/bridge"
+chmod +x "$tmp/todoforai-bridge"
+mv "$tmp/todoforai-bridge" "$PREFIX/todoforai-bridge"
 
-BRIDGE="$PREFIX/bridge"
+BRIDGE="$PREFIX/todoforai-bridge"
 CMD="$BRIDGE"   # what to suggest in user-facing messages
-WHERE="$PREFIX/bridge"
+WHERE="$PREFIX/todoforai-bridge"
 HINT=""
 
 # ── PATH setup ──────────────────────────────────────────────────────────────
@@ -116,14 +116,14 @@ HINT=""
 # 3) fallback → append to active shell's rc file
 case ":$PATH:" in
     *":$PREFIX:"*)
-        CMD=bridge
+        CMD=todoforai-bridge
         ;;
     *)
         case ":$PATH:" in
             *":$HOME/.local/bin:"*)
                 mkdir -p "$HOME/.local/bin"
-                ln -sf "$PREFIX/bridge" "$HOME/.local/bin/bridge"
-                CMD=bridge
+                ln -sf "$PREFIX/todoforai-bridge" "$HOME/.local/bin/todoforai-bridge"
+                CMD=todoforai-bridge
                 WHERE="$WHERE, linked into ~/.local/bin"
                 ;;
             *)
@@ -139,7 +139,7 @@ case ":$PATH:" in
                     printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
                     WHERE="$WHERE, added to PATH in ~/${rc#$HOME/}"
                 fi
-                CMD=bridge
+                CMD=todoforai-bridge
                 HINT=" (in a new shell, or: $line)"
                 ;;
         esac
@@ -164,7 +164,7 @@ fi
 install_systemd_user() {
     unit_dir="$HOME/.config/systemd/user"
     mkdir -p "$unit_dir"
-    cat >"$unit_dir/bridge.service" <<EOF
+    cat >"$unit_dir/todoforai-bridge.service" <<EOF
 [Unit]
 Description=TODOforAI Bridge
 After=network-online.target
@@ -180,26 +180,26 @@ RestartSec=2
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable --now bridge.service
+    systemctl --user enable --now todoforai-bridge.service
     command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || true
     ok "systemd user service enabled and started"
 }
 
 install_launchd() {
-    plist="$HOME/Library/LaunchAgents/ai.todofor.bridge.plist"
+    plist="$HOME/Library/LaunchAgents/ai.todofor.todoforai-bridge.plist"
     mkdir -p "$(dirname "$plist")"
     cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>ai.todofor.bridge</string>
+  <key>Label</key><string>ai.todofor.todoforai-bridge</string>
   <key>ProgramArguments</key><array><string>$BRIDGE</string></array>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
   <key>ThrottleInterval</key><integer>2</integer>
-  <key>StandardOutPath</key><string>/tmp/bridge.log</string>
-  <key>StandardErrorPath</key><string>/tmp/bridge.log</string>
+  <key>StandardOutPath</key><string>/tmp/todoforai-bridge.log</string>
+  <key>StandardErrorPath</key><string>/tmp/todoforai-bridge.log</string>
 </dict>
 </plist>
 EOF
@@ -215,7 +215,7 @@ if [ "$DO_SERVICE" = 1 ]; then
     elif [ "$os" = darwin ]; then
         install_launchd
     else
-        info "no supervisor detected; run manually: nohup $BRIDGE >/tmp/bridge.log 2>&1 &"
+        info "no supervisor detected; run manually: nohup $BRIDGE >/tmp/todoforai-bridge.log 2>&1 &"
     fi
 fi
 

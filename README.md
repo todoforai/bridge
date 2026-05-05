@@ -33,7 +33,7 @@ JSON message. First encrypted message from edge is auth:
 {"type":"auth","deviceId":"dev_...","secret":"..."}
 ```
 
-Device credentials are provisioned via `bridge login` (stored on disk by
+Device credentials are provisioned via `todoforai-bridge login` (stored on disk by
 the shared c-core login helper). Then the v2 multi-session protocol:
 - `identity` (→ server, once)
 - `exec` / `input` / `resize` / `signal` / `kill` (← server)
@@ -63,7 +63,7 @@ Only libc + `libutil` (for `forkpty`, in libc on macOS).
 ```sh
 # Dynamic build (default system cc) — ~77 KB stripped, libc only
 make
-./build/bridge --help
+./build/todoforai-bridge --help
 
 # Static musl build via `zig cc` — ~90 KB, single-file, zero deps
 make static
@@ -76,29 +76,43 @@ make release-windows-x64
 
 ```sh
 # First time: provision device credentials (opens browser / device flow)
-./build/bridge login [--device-name NAME]
+./build/todoforai-bridge login [--device-name NAME]
 
 # Then connect — defaults to api.todofor.ai:80 (Noise is end-to-end;
 # no TLS on the wire — typically Cloudflare/nginx terminates 443 in front)
-./build/bridge
+./build/todoforai-bridge
 
 # Custom server
-./build/bridge --host 127.0.0.1 --port 4000
+./build/todoforai-bridge --host 127.0.0.1 --port 4000
 
-# Via env
-EDGE_HOST=... EDGE_PORT=... EDGE_SERVER_PUBKEY=... ./build/bridge
+# Local-dev login/enroll against a backend on a different host/port
+# (Noise TCP RPC port — defaults to api.todofor.ai:4100; for `bun run dev` use 14100)
+./build/todoforai-bridge login  --host 127.0.0.1 --port 14100 --server-pubkey <hex>
+./build/todoforai-bridge enroll --host 127.0.0.1 --port 14100 --server-pubkey <hex>
 
 # Firecracker sandbox: presence of enroll.token=... in /proc/cmdline
 # routes to DeviceType.SANDBOX path (?deviceType=SANDBOX).
 
 # Show version / help
-./build/bridge --version
-./build/bridge --help
+./build/todoforai-bridge --version
+./build/todoforai-bridge --help
 ```
 
+## Environment variables
+
+CLI flags take precedence; env vars are fallbacks for non-interactive
+deployments (sandbox init, systemd units, CI).
+
+| Variable                   | Used by         | Equivalent flag    | Purpose                                                |
+|----------------------------|-----------------|--------------------|--------------------------------------------------------|
+| `BRIDGE_HOST`              | run             | `--host`           | Backend host for the persistent WS                     |
+| `BRIDGE_PORT`              | run             | `--port`           | Backend port for the persistent WS                     |
+| `BRIDGE_SERVER_PUBKEY`     | run             | `--server-pubkey`  | Noise static pubkey (32 bytes, hex)                    |
+| `NOISE_BACKEND_ADDR`       | login / enroll  | `--host` / `--port`| Noise TCP RPC endpoint (`host:port`)                   |
+| `NOISE_BACKEND_PUBLIC_KEY` | login / enroll  | `--server-pubkey`  | Noise pubkey for the RPC endpoint                      |
+
 The server's Noise static public key (32 bytes, X25519, hex-encoded)
-must match what the backend advertises at startup. Set via
-`EDGE_SERVER_PUBKEY` or `--server-pubkey`. Default is baked into
+must match what the backend advertises at startup. Default is baked into
 `DEFAULT_SERVER_PUBKEY_HEX` in `main.c`.
 
 ## Updates
@@ -116,7 +130,7 @@ shell itself:
 
 ```sh
 EXE=$(readlink -f /proc/$PPID/exe) \
-  && curl -fsSL https://github.com/todoforai/bridge/releases/latest/download/bridge-linux-x64 -o "$EXE.tmp" \
+  && curl -fsSL https://github.com/todoforai/bridge/releases/latest/download/todoforai-bridge-linux-x64 -o "$EXE.tmp" \
   && echo "<sha256>  $EXE.tmp" | sha256sum -c - \
   && chmod +x "$EXE.tmp" \
   && mv "$EXE.tmp" "$EXE.new" \

@@ -11,7 +11,7 @@
 // Example `exec` sent by the server (one chained shell command, && chained):
 //
 //   EXE=$(readlink -f /proc/$PPID/exe)
-//   curl -fsSL https://github.com/todoforai/bridge/releases/latest/download/bridge-linux-x64 -o "$EXE.tmp"
+//   curl -fsSL https://github.com/todoforai/bridge/releases/latest/download/todoforai-bridge-linux-x64 -o "$EXE.tmp"
 //   echo "<sha256>  $EXE.tmp" | sha256sum -c -
 //   chmod +x "$EXE.tmp" && mv "$EXE.tmp" "$EXE.new"
 //   kill -TERM $PPID
