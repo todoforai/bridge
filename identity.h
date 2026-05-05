@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-#define BRIDGE_VERSION "0.1.0"
+#define BRIDGE_VERSION "1.2.1"
 
 // Build identity JSON into out. Returns length written, or -1 on overflow.
 // `top_level`: when non-zero, emit just the inner data object (for embedding

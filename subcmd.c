@@ -205,7 +205,7 @@ int cmd_login(int argc, char **argv) {
     const char *addr, *pub;
     char addr_buf[280];
     enroll_backend(host, port_s, pub_hex, addr_buf, sizeof(addr_buf), &addr, &pub);
-    return login_device_flow(addr, pub, "todoforai-bridge", device_name) == 0 ? 0 : 1;
+    return login_device_flow(addr, pub, "bridge", device_name) == 0 ? 0 : 1;
 }
 
 // ── enroll subcommand ───────────────────────────────────────────────────────
