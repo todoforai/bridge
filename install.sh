@@ -101,7 +101,6 @@ mkdir -p "$PREFIX"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-info "downloading $asset ($TAG)"
 fetch "$url"     "$tmp/bridge"     || die "download failed: $url"
 fetch "$sha_url" "$tmp/bridge.sha" || die "checksum fetch failed: $sha_url"
 
@@ -115,14 +114,17 @@ else
 fi
 [ "$expected" = "$actual" ] || die "sha256 mismatch: expected $expected, got $actual"
 
+size=$(wc -c <"$tmp/bridge" | tr -d ' ')
+human=$(awk -v b="$size" 'BEGIN{ s="BKMGT"; for(i=1; b>=1024 && i<5; i++) b/=1024; printf (i==1?"%d %s":"%.1f %siB"), b, substr(s,i,1) }')
+ok "downloaded $asset $TAG ($human)"
+
 chmod +x "$tmp/bridge"
 mv "$tmp/bridge" "$PREFIX/bridge"
-size=$(wc -c <"$PREFIX/bridge" | tr -d ' ')
-human=$(awk -v b="$size" 'BEGIN{ s="BKMGT"; for(i=1; b>=1024 && i<5; i++) b/=1024; printf (i==1?"%d %s":"%.1f %siB"), b, substr(s,i,1) }')
-ok "installed $PREFIX/bridge ($human, $TAG)"
 
 BRIDGE="$PREFIX/bridge"
 CMD="$BRIDGE"   # what to suggest in user-facing messages
+WHERE="$PREFIX/bridge"
+HINT=""
 
 # ── PATH setup ──────────────────────────────────────────────────────────────
 # 1) prefix already on PATH → done
@@ -137,8 +139,8 @@ case ":$PATH:" in
             *":$HOME/.local/bin:"*)
                 mkdir -p "$HOME/.local/bin"
                 ln -sf "$PREFIX/bridge" "$HOME/.local/bin/bridge"
-                ok "linked into ~/.local/bin → run \`bridge\`"
                 CMD=bridge
+                WHERE="$WHERE, linked into ~/.local/bin"
                 ;;
             *)
                 line="export PATH=\"$PREFIX:\$PATH\""
@@ -151,13 +153,15 @@ case ":$PATH:" in
                     # ensure trailing newline before appending
                     [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
                     printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
-                    ok "added $PREFIX to PATH in $rc → run \`bridge\` in a new shell"
+                    WHERE="$WHERE, added to PATH in ~/${rc#$HOME/}"
                 fi
-                info "for this shell: $line"
+                CMD=bridge
+                HINT=" (in a new shell, or: $line)"
                 ;;
         esac
         ;;
 esac
+ok "installed $WHERE → run \`$CMD\`$HINT"
 
 # ── login ───────────────────────────────────────────────────────────────────
 if [ -n "$TOKEN" ]; then
