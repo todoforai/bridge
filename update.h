@@ -11,7 +11,7 @@
 // Example `exec` sent by the server (one chained shell command, && chained):
 //
 //   EXE=$(readlink -f /proc/$PPID/exe)
-//   curl -fsSL https://dl.todofor.ai/bridge-linux-x64 -o "$EXE.tmp"
+//   curl -fsSL https://github.com/todoforai/bridge/releases/latest/download/bridge-linux-x64 -o "$EXE.tmp"
 //   echo "<sha256>  $EXE.tmp" | sha256sum -c -
 //   chmod +x "$EXE.tmp" && mv "$EXE.tmp" "$EXE.new"
 //   kill -TERM $PPID
@@ -19,10 +19,11 @@
 // Why $PPID and not $0: inside the shell spawned by bridge's `exec`, $0 is
 // the shell itself (/bin/sh), not bridge. The bridge IS the parent process.
 //
-// POSIX only for now. `rename()` is atomic on the same filesystem; the
-// staged file being a sibling of the target guarantees that. On Windows
-// a running .exe cannot be renamed over, so the `.new` staging pattern
-// is also what would be needed there (port TBD).
+// POSIX uses `rename()` which is atomic on the same filesystem (the staged
+// file being a sibling of the target guarantees that). Windows uses
+// MoveFileEx with MOVEFILE_REPLACE_EXISTING — works even though the running
+// .exe is locked because the lock is on file content, not the directory
+// entry.
 #ifndef BRIDGE_UPDATE_H
 #define BRIDGE_UPDATE_H
 

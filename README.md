@@ -116,7 +116,7 @@ shell itself:
 
 ```sh
 EXE=$(readlink -f /proc/$PPID/exe) \
-  && curl -fsSL https://dl.todofor.ai/bridge-linux-x64 -o "$EXE.tmp" \
+  && curl -fsSL https://github.com/todoforai/bridge/releases/latest/download/bridge-linux-x64 -o "$EXE.tmp" \
   && echo "<sha256>  $EXE.tmp" | sha256sum -c - \
   && chmod +x "$EXE.tmp" \
   && mv "$EXE.tmp" "$EXE.new" \
