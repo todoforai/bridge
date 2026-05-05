@@ -113,9 +113,9 @@ case ":$PATH:" in
             bash) rc="$HOME/.bashrc" ;;
             *)    rc="$HOME/.profile" ;;
         esac
-        if grep -qsF "$line" "$rc" 2>/dev/null; then
-            :
-        else
+        if ! grep -qsF "$line" "$rc" 2>/dev/null; then
+            # ensure trailing newline before appending ($(...) strips \n, so empty == ends in \n)
+            [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
             printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
             ok "added $PREFIX to PATH in $rc"
         fi
