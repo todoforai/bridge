@@ -29,17 +29,36 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m::\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
 
+usage() {
+    cat <<'EOF'
+TODOforAI Bridge installer.
+
+  curl -fsSL https://todofor.ai/bridge | sh
+  curl -fsSL https://todofor.ai/bridge | sh -s -- --token ENROLL_TOKEN
+  curl -fsSL https://todofor.ai/bridge | sh -s -- --token TOK --name host-02
+
+Options:
+  --token TOKEN     redeem an enrollment token (non-interactive login)
+  --name NAME       device name to register under
+  --prefix DIR      install dir (default: $HOME/.todoforai/bin)
+  --tag TAG         specific release tag (default: latest)
+  --no-service      skip systemd/launchd supervisor setup
+  --no-start        install but don't start the bridge
+EOF
+}
+
+need_val() { [ -n "${2:-}" ] || die "$1 requires a value"; }
+
 # ── parse args ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
-        --token)      TOKEN="${2:-}"; shift 2 ;;
-        --name)       DEVICE_NAME="${2:-}"; shift 2 ;;
-        --prefix)     PREFIX="${2:-}"; shift 2 ;;
-        --tag)        TAG="${2:-}"; shift 2 ;;
+        --token)      need_val "$1" "${2:-}"; TOKEN=$2;       shift 2 ;;
+        --name)       need_val "$1" "${2:-}"; DEVICE_NAME=$2; shift 2 ;;
+        --prefix)     need_val "$1" "${2:-}"; PREFIX=$2;      shift 2 ;;
+        --tag)        need_val "$1" "${2:-}"; TAG=$2;         shift 2 ;;
         --no-service) DO_SERVICE=0; shift ;;
         --no-start)   DO_START=0; shift ;;
-        -h|--help)
-            sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    usage; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
 done
@@ -103,18 +122,24 @@ size=$(wc -c <"$PREFIX/bridge" | tr -d ' ')
 human=$(awk -v b="$size" 'BEGIN{ s="BKMGT"; for(i=1; b>=1024 && i<5; i++) b/=1024; printf (i==1?"%d %s":"%.1f %siB"), b, substr(s,i,1) }')
 ok "installed $PREFIX/bridge ($human, $TAG)"
 
+BRIDGE="$PREFIX/bridge"
+CMD="$BRIDGE"   # what to suggest in user-facing messages
+
 # ── PATH setup ──────────────────────────────────────────────────────────────
 # 1) prefix already on PATH → done
 # 2) ~/.local/bin on PATH → symlink there (no rc mutation)
 # 3) fallback → append to active shell's rc file
 case ":$PATH:" in
-    *":$PREFIX:"*) ;;
+    *":$PREFIX:"*)
+        CMD=bridge
+        ;;
     *)
         case ":$PATH:" in
             *":$HOME/.local/bin:"*)
                 mkdir -p "$HOME/.local/bin"
                 ln -sf "$PREFIX/bridge" "$HOME/.local/bin/bridge"
-                ok "linked to ~/.local/bin/bridge"
+                ok "linked ~/.local/bin/bridge → $PREFIX/bridge (available as \`bridge\` in every new shell)"
+                CMD=bridge
                 ;;
             *)
                 line="export PATH=\"$PREFIX:\$PATH\""
@@ -127,15 +152,13 @@ case ":$PATH:" in
                     # ensure trailing newline before appending
                     [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
                     printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
-                    ok "added $PREFIX to PATH in $rc"
+                    ok "added $PREFIX to PATH in $rc (available as \`bridge\` in every new shell)"
                 fi
-                info "open a new shell or: $line"
+                info "for this shell: $line"
                 ;;
         esac
         ;;
 esac
-
-BRIDGE="$PREFIX/bridge"
 
 # ── login ───────────────────────────────────────────────────────────────────
 if [ -n "$TOKEN" ]; then
@@ -147,7 +170,7 @@ if [ -n "$TOKEN" ]; then
     fi
     ok "enrolled"
 else
-    info "no --token passed; run \`$BRIDGE login\` to authenticate"
+    info "authenticate with: $CMD login"
 fi
 
 # ── supervisor setup ────────────────────────────────────────────────────────
