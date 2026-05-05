@@ -2,8 +2,8 @@
 # Env overrides: TODOFORAI_PREFIX, TODOFORAI_TAG.
 #
 #   irm https://todofor.ai/bridge.ps1 | iex
-#   & ([scriptblock]::Create((irm https://todofor.ai/bridge.ps1))) -Token ENROLL_TOKEN
-#   & ([scriptblock]::Create((irm https://todofor.ai/bridge.ps1))) -Token TOK -Name host-02
+#   iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token ENROLL_TOKEN"
+#   iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token TOK -Name host-02"
 
 [CmdletBinding()]
 param(
@@ -31,8 +31,8 @@ if ($Help) {
 TODOforAI Bridge installer (Windows).
 
   irm https://todofor.ai/bridge.ps1 | iex
-  & ([scriptblock]::Create((irm https://todofor.ai/bridge.ps1))) -Token ENROLL_TOKEN
-  & ([scriptblock]::Create((irm https://todofor.ai/bridge.ps1))) -Token TOK -Name host-02
+  iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token ENROLL_TOKEN"
+  iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token TOK -Name host-02"
 
 Options:
   -Token TOKEN     redeem an enrollment token (non-interactive login)
@@ -40,15 +40,17 @@ Options:
   -Prefix DIR      install dir (default: %USERPROFILE%\.todoforai\bin)
   -Tag TAG         specific release tag (default: latest)
   -NoService       skip Scheduled Task supervisor setup (don't auto-start)
+  -Help            show this help
 "@ | Write-Host
     exit 0
 }
 
 # ── detect arch ─────────────────────────────────────────────────────────────
-$arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+$pa = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$arch = switch ($pa) {
     'AMD64' { 'x64' }
     'ARM64' { 'arm64' }
-    default { Die "unsupported arch: $($env:PROCESSOR_ARCHITECTURE)" }
+    default { Die "unsupported arch: $pa" }
 }
 $asset = "bridge-windows-$arch.exe"
 
@@ -84,6 +86,8 @@ try {
     Ok "downloaded $asset $Tag ($human)"
 
     $dest = Join-Path $Prefix 'bridge.exe'
+    # stop existing task if present so we can overwrite a running exe
+    Get-ScheduledTask -TaskName 'TODOforAI Bridge' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
     Move-Item -Force $bin $dest
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -131,7 +135,7 @@ if (-not $NoService) {
     try {
         $taskName = 'TODOforAI Bridge'
         $action   = New-ScheduledTaskAction   -Execute $Bridge
-        $trigger  = New-ScheduledTaskTrigger  -AtLogOn -User $env:USERNAME
+        $trigger  = New-ScheduledTaskTrigger  -AtLogOn
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                         -StartWhenAvailable -RestartInterval (New-TimeSpan -Seconds 5) -RestartCount 9999 `
                         -ExecutionTimeLimit ([TimeSpan]::Zero)
