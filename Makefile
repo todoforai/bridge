@@ -32,6 +32,7 @@ all: build/bridge
 
 build/bridge: $(SRCS) $(HDRS) | build
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(LIBS)
+	strip $@ 2>/dev/null || true
 
 build:
 	mkdir -p build
@@ -42,6 +43,7 @@ build:
 static: | build
 	zig cc -target x86_64-linux-musl -static $(CFLAGS) -o build/bridge-static \
 	    $(SRCS) -lutil
+	strip build/bridge-static 2>/dev/null || true
 
 # ── Release targets ─────────────────────────────────────────────────────────
 # Produce a single stripped artifact named build/bridge-<os>-<arch>.
