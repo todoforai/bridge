@@ -173,7 +173,7 @@ if [ -n "$TOKEN" ]; then
     fi
     ok "enrolled"
 else
-    printf '\033[33m→\033[0m next: %s login\n' "$CMD" >&2
+    printf '\033[36m→\033[0m next: %s login\n' "$CMD" >&2
 fi
 
 # ── supervisor setup ────────────────────────────────────────────────────────
