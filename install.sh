@@ -100,7 +100,9 @@ ok "checksum ok"
 
 chmod +x "$tmp/bridge"
 mv "$tmp/bridge" "$PREFIX/bridge"
-ok "installed to $PREFIX/bridge"
+size=$(wc -c <"$PREFIX/bridge" | tr -d ' ')
+human=$(awk -v b="$size" 'BEGIN{ s="BKMGT"; for(i=1; b>=1024 && i<5; i++) b/=1024; printf (i==1?"%d %s":"%.1f %siB"), b, substr(s,i,1) }')
+ok "installed to $PREFIX/bridge ($human)"
 
 # ── PATH hint ───────────────────────────────────────────────────────────────
 case ":$PATH:" in
