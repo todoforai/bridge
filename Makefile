@@ -1,7 +1,13 @@
 CC      ?= cc
 
 # Locate todoforai-c-core: prefer vendored submodule, else sibling checkout.
-CORE := $(if $(wildcard vendor/todoforai-c-core/noise),vendor/todoforai-c-core,../todoforai-c-core)
+# An uninitialized submodule (empty vendor/todoforai-c-core dir) falls through
+# to the sibling path; if neither exists, fail loudly instead of cryptic
+# "no such file" from the compiler.
+CORE := $(if $(wildcard vendor/todoforai-c-core/noise),vendor/todoforai-c-core,$(if $(wildcard ../todoforai-c-core/noise),../todoforai-c-core,))
+ifeq ($(CORE),)
+$(error todoforai-c-core not found. Run: git submodule update --init --recursive)
+endif
 
 # Version string baked into the binary. Derived from git so a tag is the
 # single source of truth (no hand-edited #define to drift). Falls back to

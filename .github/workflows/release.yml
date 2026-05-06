@@ -49,6 +49,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: bridge
+          # On manual runs, build the requested tag (not the default branch),
+          # so the embedded BRIDGE_VERSION matches the release tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           submodules: recursive
           # Full history so `git describe --tags` resolves the version.
           fetch-depth: 0
