@@ -1190,7 +1190,8 @@ int main(int argc, char **argv) {
     if (port_s) {
         int p = atoi(port_s);
         if (p > 0 && p <= 65535) port = (uint16_t)p;
-    } else if (strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0) {
+    } else if (strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0
+            || strcmp(host, "::1") == 0       || strcmp(host, "[::1]") == 0) {
         port = 4000; // dev default: bun listens directly (no nginx)
     }
 

@@ -27,13 +27,26 @@ static const char *USAGE_WHOAMI = "whoami";
 
 // ── Noise one-shot RPC helper (reuses transport code from login.h) ──────────
 
-// Resolve backend Noise addr + pubkey: CLI overrides > env > defaults.
+// True if host is a local/dev address (uses dev-port defaults).
+static int is_local_host(const char *h) {
+    return h && (strcmp(h, "localhost") == 0
+              || strcmp(h, "127.0.0.1") == 0
+              || strcmp(h, "::1")       == 0
+              || strcmp(h, "[::1]")     == 0);
+}
+
+// Resolve backend Noise addr + pubkey: CLI > env > saved login backendHost > defaults.
 // `host`/`port_s`/`pub_hex` may be NULL; addr is built into `addr_buf`.
 static void enroll_backend(const char *host, const char *port_s, const char *pub_hex,
                            char *addr_buf, size_t addr_cap,
                            const char **addr, const char **pub) {
     const char *env_addr = getenv("NOISE_BACKEND_ADDR");
-    if (host || port_s) {
+    // Saved host from prior `login` (may be empty for prod).
+    login_credentials_t saved;
+    (void)login_load_credentials(&saved);
+    const char *saved_host = saved.backend_host[0] ? saved.backend_host : NULL;
+
+    if (host || port_s || saved_host) {
         const char *h = host;
         const char *p = port_s;
         // If only one of host/port given, fill the other from env_addr (if parseable) or defaults.
@@ -45,10 +58,8 @@ static void enroll_backend(const char *host, const char *port_s, const char *pub
                 snprintf(env_port, sizeof(env_port), "%s", colon + 1);
             }
         }
-        if (!h) h = env_host[0] ? env_host : "api.todofor.ai";
-        if (!p) p = env_port[0] ? env_port
-                  : (strcmp(h, "localhost") == 0 || strcmp(h, "127.0.0.1") == 0) ? "14100" // dev: bun direct
-                  : "4100";
+        if (!h) h = env_host[0] ? env_host : (saved_host ? saved_host : "api.todofor.ai");
+        if (!p) p = env_port[0] ? env_port : is_local_host(h) ? "14100" : "4100";
         snprintf(addr_buf, addr_cap, "%s:%s", h, p);
         *addr = addr_buf;
     } else {
