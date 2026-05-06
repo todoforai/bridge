@@ -16,7 +16,7 @@
 #define _DEFAULT_SOURCE
 
 #include "tools.h"
-#include "mongoose.h"   // mg_base64_decode
+#include "json.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -253,16 +253,7 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
 }
 #endif
 
-// Append `fmt` (mg_snprintf-style) at *used; advance *used. -1 on overflow.
-static int j_append(char *out, size_t cap, size_t *used, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    size_t avail = cap > *used ? cap - *used : 0;
-    size_t n = mg_vsnprintf(out + *used, avail, fmt, &ap);
-    va_end(ap);
-    if (n >= avail) return -1;
-    *used += n;
-    return 0;
-}
+
 
 // Decode one catalog line: "<key>\t<b64_versionCmd>\t<b64_statusCmd>".
 // Returns 1 on success, 0 if the line is malformed/oversized.
@@ -284,11 +275,11 @@ static int parse_entry(const char *line, size_t line_len,
 
     size_t dl;
     if (vl > 0 && vl < vcmd_cap * 2) {
-        dl = mg_base64_decode(t1 + 1, vl, vcmd, vcmd_cap);
+        dl = b64_decode(t1 + 1, vl, vcmd, vcmd_cap - 1);
         if (dl > 0 && dl < vcmd_cap) { vcmd[dl] = '\0'; *have_v = 1; }
     }
     if (sl > 0 && sl < scmd_cap * 2) {
-        dl = mg_base64_decode(t2 + 1, sl, scmd, scmd_cap);
+        dl = b64_decode(t2 + 1, sl, scmd, scmd_cap - 1);
         if (dl > 0 && dl < scmd_cap) { scmd[dl] = '\0'; *have_s = 1; }
     }
     return 1;
@@ -318,23 +309,33 @@ static void probe_run(probe_t *p) {
 // Append one probe's JSON object to `out`. Returns 0 ok, -1 overflow.
 static int probe_append_json(const probe_t *p, int first,
                              char *out, size_t out_cap, size_t *used) {
-    if (j_append(out, out_cap, used, "%s%m:{%m:%s",
-                 first ? "" : ",",
-                 MG_ESC(p->key),
-                 MG_ESC("installed"), p->installed ? "true" : "false") < 0) return -1;
+    if (!first && json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
+    if (json_emit_str(out, out_cap, used, p->key, -1) < 0) return -1;
+    if (json_emit_raw(out, out_cap, used, ":{", 2) < 0) return -1;
+    if (json_emit_str(out, out_cap, used, "installed", -1) < 0) return -1;
+    if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
+    const char *bv = p->installed ? "true" : "false";
+    if (json_emit_raw(out, out_cap, used, bv, strlen(bv)) < 0) return -1;
     if (p->installed && p->have_v && p->v_exit == 0 && p->version_out[0] != '\0') {
-        if (j_append(out, out_cap, used, ",%m:%m",
-                     MG_ESC("version"), MG_ESC(p->version_out)) < 0) return -1;
+        if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
+        if (json_emit_str(out, out_cap, used, "version", -1) < 0) return -1;
+        if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
+        if (json_emit_str(out, out_cap, used, p->version_out, -1) < 0) return -1;
     }
     if (p->installed && p->have_s) {
-        if (j_append(out, out_cap, used, ",%m:%s",
-                     MG_ESC("authenticated"), p->authed ? "true" : "false") < 0) return -1;
+        if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
+        if (json_emit_str(out, out_cap, used, "authenticated", -1) < 0) return -1;
+        if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
+        const char *ba = p->authed ? "true" : "false";
+        if (json_emit_raw(out, out_cap, used, ba, strlen(ba)) < 0) return -1;
         if (p->status_out[0] != '\0') {
-            if (j_append(out, out_cap, used, ",%m:%m",
-                         MG_ESC("statusOutput"), MG_ESC(p->status_out)) < 0) return -1;
+            if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
+            if (json_emit_str(out, out_cap, used, "statusOutput", -1) < 0) return -1;
+            if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
+            if (json_emit_str(out, out_cap, used, p->status_out, -1) < 0) return -1;
         }
     }
-    if (j_append(out, out_cap, used, "}") < 0) return -1;
+    if (json_emit_raw(out, out_cap, used, "}", 1) < 0) return -1;
     return 0;
 }
 
@@ -418,9 +419,15 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
 
     // Assemble JSON in catalog order.
     size_t used = 0;
-    if (j_append(out, out_cap, &used, "{%m:%m,%m:{",
-                 MG_ESC("type"), MG_ESC("installed_tools"),
-                 MG_ESC("data")) < 0) { free(probes); return -1; }
+    int hdr_ok =
+        json_emit_raw(out, out_cap, &used, "{", 1) == 0 &&
+        json_emit_str(out, out_cap, &used, "type", -1) == 0 &&
+        json_emit_raw(out, out_cap, &used, ":", 1) == 0 &&
+        json_emit_str(out, out_cap, &used, "installed_tools", -1) == 0 &&
+        json_emit_raw(out, out_cap, &used, ",", 1) == 0 &&
+        json_emit_str(out, out_cap, &used, "data", -1) == 0 &&
+        json_emit_raw(out, out_cap, &used, ":{", 2) == 0;
+    if (!hdr_ok) { free(probes); return -1; }
 
     for (int i = 0; i < n; i++) {
         probe_t *p = &probes[i];
@@ -434,7 +441,7 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
     }
 
     free(probes);
-    if (j_append(out, out_cap, &used, "}}") < 0) return -1;
+    if (json_emit_raw(out, out_cap, &used, "}}", 2) < 0) return -1;
     if (used >= out_cap) return -1;
     out[used] = '\0';
     return (int)used;

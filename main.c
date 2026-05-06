@@ -336,7 +336,14 @@ static session_t *free_slot(edge_t *e) {
 
 static int send_json(edge_t *e, const char *s, size_t n) {
     if (!e->ws || !e->noise.handshake_done) return -1;
-    return noise_ws_send(&e->noise, e->ws, (const uint8_t *)s, n);
+    if (getenv("BRIDGE_DEBUG_WIRE")) {
+        fprintf(stderr, "→ send (%zu) %.*s\n", n, (int)(n > 512 ? 512 : n), s);
+    }
+    int rc = noise_ws_send(&e->noise, e->ws, (const uint8_t *)s, n);
+    if (rc != 0 && getenv("BRIDGE_DEBUG_WIRE")) {
+        fprintf(stderr, "  ✗ noise_ws_send failed rc=%d\n", rc);
+    }
+    return rc;
 }
 
 #define MG_ESC_N(s, n) mg_print_esc, (int)(n), (char *)(s)
@@ -1107,6 +1114,9 @@ static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
             // Identity is deferred — see edge_t.identity_sent / auth_sent_ms.
             e->auth_sent_ms = monotonic_ms();
             return;
+        }
+        if (getenv("BRIDGE_DEBUG_WIRE")) {
+            fprintf(stderr, "← recv (%ld) %.*s\n", n, (int)(n > 512 ? 512 : n), (const char *)e->msg_buf);
         }
         handle_command(e, (const char *)e->msg_buf, (size_t)n);
     }

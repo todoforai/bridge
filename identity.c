@@ -20,7 +20,7 @@
 #  include <unistd.h>
 #endif
 
-#include "mongoose.h"
+#include "json.h"
 
 // Read first matching `KEY=value` line from a small text file. Strips surrounding
 // quotes. Returns 0 on found, -1 otherwise. Caller-owned `out` is NUL-terminated.
@@ -205,8 +205,9 @@ void bridge_identity_gather(bridge_identity_t *id) {
     }
 #endif
 
-    // Sanitize all fields: replace control bytes with space. mg_print_esc
-    // only escapes \b\f\n\r\t\\\"; raw 0x00–0x1f would produce invalid JSON.
+    // Sanitize all fields: replace control bytes with space — keeps the
+    // resulting JSON identifiers ASCII-clean even if a hostname/distro field
+    // accidentally contains a stray byte.
     char *fields[] = { id->os, id->arch, id->hostname, id->kernel, id->distro,
                        id->distro_version, id->device_type, id->user,
                        id->shell, id->home, id->cwd };
@@ -221,30 +222,43 @@ int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     bridge_identity_t id;
     bridge_identity_gather(&id);
 
-    // mg_snprintf %m + MG_ESC handles JSON escaping for free.
-    // Two near-identical formats — only the outer wrapper differs.
-    #define IDENTITY_FIELDS \
-        MG_ESC("edge_version"),   MG_ESC(BRIDGE_VERSION), \
-        MG_ESC("os"),             MG_ESC(id.os), \
-        MG_ESC("arch"),           MG_ESC(id.arch), \
-        MG_ESC("hostname"),       MG_ESC(id.hostname), \
-        MG_ESC("kernel"),         MG_ESC(id.kernel), \
-        MG_ESC("distro"),         MG_ESC(id.distro), \
-        MG_ESC("distro_version"), MG_ESC(id.distro_version), \
-        MG_ESC("deviceType"),     MG_ESC(id.device_type), \
-        MG_ESC("user"),           MG_ESC(id.user), \
-        MG_ESC("shell"),          MG_ESC(id.shell), \
-        MG_ESC("home"),           MG_ESC(id.home), \
-        MG_ESC("cwd"),            MG_ESC(id.cwd)
-    #define INNER "{%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m}"
+    size_t u = 0;
+    if (!top_level) {
+        if (json_emit_raw(out, out_cap, &u, "{", 1) < 0) return -1;
+        if (json_emit_str(out, out_cap, &u, "type", -1) < 0) return -1;
+        if (json_emit_raw(out, out_cap, &u, ":", 1) < 0) return -1;
+        if (json_emit_str(out, out_cap, &u, "identity", -1) < 0) return -1;
+        if (json_emit_raw(out, out_cap, &u, ",", 1) < 0) return -1;
+        if (json_emit_str(out, out_cap, &u, "data", -1) < 0) return -1;
+        if (json_emit_raw(out, out_cap, &u, ":", 1) < 0) return -1;
+    }
 
-    size_t n = top_level
-        ? mg_snprintf(out, out_cap, INNER, IDENTITY_FIELDS)
-        : mg_snprintf(out, out_cap, "{%m:%m,%m:" INNER "}",
-                      MG_ESC("type"), MG_ESC("identity"), MG_ESC("data"),
-                      IDENTITY_FIELDS);
+    #define KV(k, v) do { \
+        if (json_emit_raw(out, out_cap, &u, sep, 1) < 0) return -1; \
+        if (json_emit_str(out, out_cap, &u, (k), -1) < 0) return -1; \
+        if (json_emit_raw(out, out_cap, &u, ":", 1) < 0) return -1; \
+        if (json_emit_str(out, out_cap, &u, (v), -1) < 0) return -1; \
+        sep = ","; \
+    } while (0)
 
-    #undef INNER
-    #undef IDENTITY_FIELDS
-    return (n > 0 && n < out_cap) ? (int)n : -1;
+    const char *sep = "{";
+    KV("edge_version",   BRIDGE_VERSION);
+    KV("os",             id.os);
+    KV("arch",           id.arch);
+    KV("hostname",       id.hostname);
+    KV("kernel",         id.kernel);
+    KV("distro",         id.distro);
+    KV("distro_version", id.distro_version);
+    KV("deviceType",     id.device_type);
+    KV("user",           id.user);
+    KV("shell",          id.shell);
+    KV("home",           id.home);
+    KV("cwd",            id.cwd);
+    if (json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
+
+    if (!top_level && json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
+    if (u + 1 >= out_cap) return -1;
+    out[u] = '\0';
+    #undef KV
+    return (int)u;
 }
