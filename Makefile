@@ -1,11 +1,21 @@
 CC      ?= cc
+
+# Locate todoforai-c-core: prefer vendored submodule, else sibling checkout.
+CORE := $(if $(wildcard vendor/todoforai-c-core/noise),vendor/todoforai-c-core,../todoforai-c-core)
+
+# Version string baked into the binary. Derived from git so a tag is the
+# single source of truth (no hand-edited #define to drift). Falls back to
+# "dev" outside a git checkout (e.g. tarball builds).
+BRIDGE_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 CFLAGS  ?= -Os -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wno-unused-function \
            -ffunction-sections -fdata-sections -fomit-frame-pointer \
            -DMG_TLS=MG_TLS_NONE -DMG_ENABLE_PACKED_FS=0 -DMG_ENABLE_FILE=0 \
            -DMG_ENABLE_MQTT=0 -DMG_ENABLE_SSI=0 -DMG_ENABLE_DIRECTORY_LISTING=0 \
            -DMG_ENABLE_LOG=0 -DMG_ENABLE_CUSTOM_RANDOM=1 \
-           -I../todoforai-c-core/noise -I../todoforai-c-core/cli \
-           -I../todoforai-c-core/login -I../todoforai-c-core/vendor/mongoose
+           -DBRIDGE_VERSION=\"$(BRIDGE_VERSION)\" \
+           -I$(CORE)/noise -I$(CORE)/cli \
+           -I$(CORE)/login -I$(CORE)/vendor/mongoose
 LDFLAGS ?= -Wl,--gc-sections
 LIBS    ?= -lutil
 
@@ -15,7 +25,6 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-CORE = ../todoforai-c-core
 COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c \
        $(CORE)/vendor/mongoose/mongoose.c

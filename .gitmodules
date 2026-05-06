@@ -1,0 +1,3 @@
+[submodule "vendor/todoforai-c-core"]
+	path = vendor/todoforai-c-core
+	url = https://github.com/todoforai/todoforai-c-core

@@ -3,7 +3,11 @@
 
 #include <stddef.h>
 
-#define BRIDGE_VERSION "1.2.3"
+// BRIDGE_VERSION is injected by the Makefile via -D from `git describe`.
+// Fallback for tooling/IDE indexers that don't set it.
+#ifndef BRIDGE_VERSION
+#define BRIDGE_VERSION "dev"
+#endif
 
 // Build identity JSON into out. Returns length written, or -1 on overflow.
 // `top_level`: when non-zero, emit just the inner data object (for embedding
