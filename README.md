@@ -53,8 +53,9 @@ Server side: `backend/src/api/ws/handlers/BridgeHandler.ts`.
 | `identity.c` / `.h`   | Host identity gathering (`uname`, `pwd`, cwd)       |
 | `tools.c` / `.h`      | Probe installed CLI tools, emit `installed_tools`   |
 | `update.c` / `.h`     | Self-update: startup swap of staged `<exe>.new`     |
+| `ws.c` / `ws.h`       | RFC 6455 WebSocket client (sync connect, poll loop) |
+| `json.c` / `json.h`   | Minimal JSON parser/writer + base64                 |
 | `noise/`              | Vendored `noise.c` + `monocypher` (BLAKE2b)         |
-| `mongoose/`           | Vendored `mongoose` (WS, JSON, base64, printf)      |
 
 ## Build
 

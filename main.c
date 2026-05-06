@@ -25,6 +25,7 @@
 #define _GNU_SOURCE          // memmem (Linux glibc); harmless on musl/Darwin
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -35,7 +36,9 @@
 #include <time.h>
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
+#  include <winsock2.h>   // WSAPoll, struct pollfd, POLL* — must precede windows.h
 #  include <windows.h>
+#  define poll WSAPoll
 // Portable byte-substring search: glibc has memmem; mingw/MSVCRT does not.
 static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
     if (nl == 0) return (void *)h;
@@ -48,25 +51,21 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 }
 #  define memmem(h, hl, n, nl) memmem_compat((h), (hl), (n), (nl))
 #else
+#  include <poll.h>
 #  include <unistd.h>
 #endif
 
 #include "args.h"      // ketopt + cli_usage helpers
 #include "identity.h"  // BRIDGE_VERSION
-#include "mongoose.h"
+#include "json.h"
 #include "noise.h"     // noise_random
 #include "noise_ws.h"
+#include "ws.h"
 #include "pty.h"
 #include "subcmd.h"
 #include "tools.h"
 #include "update.h"
 #include "login.h"
-
-// Custom RNG for mongoose (MG_ENABLE_CUSTOM_RANDOM=1) — reuse our Noise RNG so
-// we don't pull mongoose's per-arch random implementations into the binary.
-bool mg_random(void *buf, size_t len) {
-    return noise_random((uint8_t *)buf, len) == 0;
-}
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 
@@ -153,8 +152,7 @@ typedef struct {
 #define IDLE_TIMEOUT_MS (30 * 60 * 1000)
 
 typedef struct {
-    struct mg_mgr mgr;
-    struct mg_connection *ws;
+    ws_t ws;
     noise_ws_t noise;
     const char *device_id;
     const char *device_secret;
@@ -162,7 +160,7 @@ typedef struct {
     int rc;
     // Auth → identity sequencing. Backend's pre-auth handler awaits
     // validateDevice() asynchronously; if both frames land in one TCP segment
-    // (mongoose coalesces them), the second hits the handler with
+    // (TCP-coalesced into one segment), the second hits the handler with
     // authenticated=false and is rejected as "expected auth". Defer identity
     // until the auth round-trip has had time to settle on the backend.
     int identity_sent;
@@ -244,53 +242,6 @@ static size_t gen_sentinel(char *out, size_t cap) {
 }
 
 
-static int json_path(char *out, size_t cap, const char *key) {
-    int n = snprintf(out, cap, "$.%s", key);
-    return n > 0 && (size_t)n < cap;
-}
-
-static int json_str(const char *data, size_t data_len,
-                    const char *key, const char **out, size_t *out_len) {
-    char path[64];
-    if (!json_path(path, sizeof(path), key)) return 0;
-    struct mg_str tok = mg_json_get_tok(mg_str_n(data, data_len), path);
-    if (!tok.buf || tok.len < 2 || tok.buf[0] != '"') return 0;
-    *out = tok.buf + 1;
-    *out_len = tok.len - 2;
-    return 1;
-}
-
-static int json_str_decoded(const char *data, size_t data_len,
-                            const char *key, char *out, size_t out_cap,
-                            size_t *out_len) {
-    char path[64];
-    if (!json_path(path, sizeof(path), key)) return 0;
-    size_t n = mg_json_unescape(mg_str_n(data, data_len), path, out, out_cap);
-    if (n == 0) return 0;
-    *out_len = n;
-    return 1;
-}
-
-static int json_bool(const char *data, size_t data_len,
-                     const char *key, int *out) {
-    char path[64];
-    bool b = false;
-    if (!json_path(path, sizeof(path), key)) return 0;
-    if (!mg_json_get_bool(mg_str_n(data, data_len), path, &b)) return 0;
-    *out = b ? 1 : 0;
-    return 1;
-}
-
-static int json_int(const char *data, size_t data_len,
-                    const char *key, long *out) {
-    char path[64];
-    double d = 0;
-    if (!json_path(path, sizeof(path), key)) return 0;
-    if (!mg_json_get_num(mg_str_n(data, data_len), path, &d)) return 0;
-    *out = (long)d;
-    return 1;
-}
-
 static int is_valid_uuid(const char *s, size_t len) {
     if (len != 36) return 0;
     for (size_t i = 0; i < 36; i++) {
@@ -335,120 +286,82 @@ static session_t *free_slot(edge_t *e) {
 }
 
 static int send_json(edge_t *e, const char *s, size_t n) {
-    if (!e->ws || !e->noise.handshake_done) return -1;
-    if (getenv("BRIDGE_DEBUG_WIRE")) {
+    if (e->ws.closed || !e->noise.handshake_done) return -1;
+    if (getenv("BRIDGE_DEBUG_WIRE"))
         fprintf(stderr, "→ send (%zu) %.*s\n", n, (int)(n > 512 ? 512 : n), s);
-    }
-    int rc = noise_ws_send(&e->noise, e->ws, (const uint8_t *)s, n);
-    if (rc != 0 && getenv("BRIDGE_DEBUG_WIRE")) {
-        fprintf(stderr, "  ✗ noise_ws_send failed rc=%d\n", rc);
-    }
-    return rc;
+    return noise_ws_send(&e->noise, &e->ws, (const uint8_t *)s, n);
 }
 
-#define MG_ESC_N(s, n) mg_print_esc, (int)(n), (char *)(s)
+static int jfield_str(char *buf, size_t cap, size_t *u, const char *key, const char *val, long len, int comma) {
+    if (comma && json_emit_raw(buf, cap, u, ",", 1) < 0) return -1;
+    return json_emit_str(buf, cap, u, key, -1) < 0 || json_emit_raw(buf, cap, u, ":", 1) < 0 || json_emit_str(buf, cap, u, val, len) < 0 ? -1 : 0;
+}
+
+static int jfield_raw(char *buf, size_t cap, size_t *u, const char *key, const char *val, int comma) {
+    if (comma && json_emit_raw(buf, cap, u, ",", 1) < 0) return -1;
+    return json_emit_str(buf, cap, u, key, -1) < 0 || json_emit_raw(buf, cap, u, ":", 1) < 0 || json_emit_raw(buf, cap, u, val, strlen(val)) < 0 ? -1 : 0;
+}
+
+static int emit_todo_id(char *buf, size_t cap, size_t *u, const session_t *s) {
+    return s->todo_id_len > 0 ? jfield_str(buf, cap, u, "todoId", s->todo_id, (long)s->todo_id_len, 1) : 0;
+}
 
 static int send_error(edge_t *e,
                       const char *sid, size_t sid_len,
                       const char *bid, size_t bid_len,
                       const char *code, const char *message) {
-    char buf[1024];
-    int n;
-    if (sid && bid) {
-        n = (int)mg_snprintf(buf, sizeof(buf),
-            "{%m:%m,%m:%m,%m:%m,%m:%m,%m:%m}",
-            MG_ESC("type"), MG_ESC("error"),
-            MG_ESC("sessionId"), MG_ESC_N(sid, sid_len),
-            MG_ESC("blockId"), MG_ESC_N(bid, bid_len),
-            MG_ESC("code"), MG_ESC(code),
-            MG_ESC("message"), MG_ESC(message));
-    } else if (sid) {
-        n = (int)mg_snprintf(buf, sizeof(buf),
-            "{%m:%m,%m:%m,%m:%m,%m:%m}",
-            MG_ESC("type"), MG_ESC("error"),
-            MG_ESC("sessionId"), MG_ESC_N(sid, sid_len),
-            MG_ESC("code"), MG_ESC(code),
-            MG_ESC("message"), MG_ESC(message));
-    } else {
-        n = (int)mg_snprintf(buf, sizeof(buf),
-            "{%m:%m,%m:%m,%m:%m}",
-            MG_ESC("type"), MG_ESC("error"),
-            MG_ESC("code"), MG_ESC(code),
-            MG_ESC("message"), MG_ESC(message));
-    }
-    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    char buf[1024]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "error", -1, 0) < 0 ||
+        (sid && jfield_str(buf, sizeof buf, &u, "sessionId", sid, (long)sid_len, 1) < 0) ||
+        (bid && jfield_str(buf, sizeof buf, &u, "blockId", bid, (long)bid_len, 1) < 0) ||
+        jfield_str(buf, sizeof buf, &u, "code", code, -1, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "message", message, -1, 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return -1;
+    send_json(e, buf, u);
     fprintf(stderr, "error %s: %s\n", code, message);
     return 0;
 }
 
 // Reply to an INPUT/SIGNAL request that failed. Same as send_error but
 // also echoes `requestId` so the backend can settle the right pending call.
-// `rid` is is_valid_id-validated upstream and safe to interpolate raw.
 static int send_req_error(edge_t *e,
                           const char *sid, size_t sid_len,
                           const char *rid, size_t rid_len,
                           const char *code, const char *message) {
-    char buf[1024];
-    int n;
-    if (sid) {
-        n = (int)mg_snprintf(buf, sizeof(buf),
-            "{%m:%m,%m:%m,%m:%m,%m:%m,%m:%m}",
-            MG_ESC("type"), MG_ESC("error"),
-            MG_ESC("sessionId"), MG_ESC_N(sid, sid_len),
-            MG_ESC("requestId"), MG_ESC_N(rid, rid_len),
-            MG_ESC("code"), MG_ESC(code),
-            MG_ESC("message"), MG_ESC(message));
-    } else {
-        n = (int)mg_snprintf(buf, sizeof(buf),
-            "{%m:%m,%m:%m,%m:%m,%m:%m}",
-            MG_ESC("type"), MG_ESC("error"),
-            MG_ESC("requestId"), MG_ESC_N(rid, rid_len),
-            MG_ESC("code"), MG_ESC(code),
-            MG_ESC("message"), MG_ESC(message));
-    }
-    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    char buf[1024]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "error", -1, 0) < 0 ||
+        (sid && jfield_str(buf, sizeof buf, &u, "sessionId", sid, (long)sid_len, 1) < 0) ||
+        jfield_str(buf, sizeof buf, &u, "requestId", rid, (long)rid_len, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "code", code, -1, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "message", message, -1, 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return -1;
+    send_json(e, buf, u);
     fprintf(stderr, "error %s: %s\n", code, message);
     return 0;
 }
 
 static int send_ack(edge_t *e, const char *rid, size_t rid_len) {
-    char buf[128];
-    int n = (int)mg_snprintf(buf, sizeof(buf),
-        "{%m:%m,%m:%m}",
-        MG_ESC("type"), MG_ESC("ack"),
-        MG_ESC("requestId"), MG_ESC_N(rid, rid_len));
-    if (n > 0 && (size_t)n < sizeof(buf)) return send_json(e, buf, (size_t)n);
-    return -1;
+    char buf[128]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "ack", -1, 0) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "requestId", rid, (long)rid_len, 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return -1;
+    return send_json(e, buf, u);
 }
 
-// Optional `,"todoId":"..."` fragment if the session has an echo label.
-// `todo_id` charset is is_valid_id-validated, safe to interpolate raw.
-#define TODO_FRAG_FMT "%s%s%s"
-#define TODO_FRAG_ARGS(s) \
-    (s)->todo_id_len > 0 ? ",\"todoId\":\"" : "", \
-    (s)->todo_id_len > 0 ? (s)->todo_id      : "", \
-    (s)->todo_id_len > 0 ? "\""              : ""
-
 static void send_exit(edge_t *e, session_t *s, int code) {
-    char buf[384];
-    int n;
-    if (s->run_block_id_len > 0) {
-        n = (int)mg_snprintf(buf, sizeof(buf),
-            "{%m:%m,%m:%m" TODO_FRAG_FMT ",%m:%m,%m:%d}",
-            MG_ESC("type"), MG_ESC("exit"),
-            MG_ESC("sessionId"), MG_ESC(s->session_id),
-            TODO_FRAG_ARGS(s),
-            MG_ESC("blockId"), MG_ESC(s->run_block_id),
-            MG_ESC("code"), code);
-    } else {
-        n = (int)mg_snprintf(buf, sizeof(buf),
-            "{%m:%m,%m:%m" TODO_FRAG_FMT ",%m:%d}",
-            MG_ESC("type"), MG_ESC("exit"),
-            MG_ESC("sessionId"), MG_ESC(s->session_id),
-            TODO_FRAG_ARGS(s),
-            MG_ESC("code"), code);
-    }
-    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    char buf[384]; size_t u = 0;
+    char code_buf[32]; snprintf(code_buf, sizeof code_buf, "%d", code);
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "exit", -1, 0) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
+        emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
+        (s->run_block_id_len > 0 && jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0) ||
+        jfield_raw(buf, sizeof buf, &u, "code", code_buf, 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    send_json(e, buf, u);
     fprintf(stderr, "PTY exited: %s code=%d\n", s->session_id, code);
 }
 
@@ -457,61 +370,49 @@ static void send_exit(edge_t *e, session_t *s, int code) {
 static void send_output_bytes(edge_t *e, session_t *s,
                               const uint8_t *data, size_t len) {
     if (len == 0) return;
-    size_t bn = mg_base64_encode(data, len, e->b64_buf, sizeof(e->b64_buf));
+    size_t bn = b64_encode(data, len, e->b64_buf, sizeof(e->b64_buf));
     if (bn == 0) return;
     size_t cap = bn + 256;
     char *msg = malloc(cap);
     if (!msg) return;
-    int mn;
-    if (s->state == SESS_RUNNING && s->run_block_id_len > 0) {
-        mn = (int)mg_snprintf(msg, cap,
-            "{%m:%m,%m:%m" TODO_FRAG_FMT ",%m:%m,%m:%m}",
-            MG_ESC("type"), MG_ESC("output"),
-            MG_ESC("sessionId"), MG_ESC(s->session_id),
-            TODO_FRAG_ARGS(s),
-            MG_ESC("blockId"), MG_ESC(s->run_block_id),
-            MG_ESC("data"), MG_ESC_N(e->b64_buf, bn));
-    } else {
-        mn = (int)mg_snprintf(msg, cap,
-            "{%m:%m,%m:%m" TODO_FRAG_FMT ",%m:%m}",
-            MG_ESC("type"), MG_ESC("output"),
-            MG_ESC("sessionId"), MG_ESC(s->session_id),
-            TODO_FRAG_ARGS(s),
-            MG_ESC("data"), MG_ESC_N(e->b64_buf, bn));
-    }
-    if (mn > 0 && (size_t)mn < cap) send_json(e, msg, (size_t)mn);
+    size_t u = 0;
+    if (json_emit_raw(msg, cap, &u, "{", 1) == 0 &&
+        jfield_str(msg, cap, &u, "type", "output", -1, 0) == 0 &&
+        jfield_str(msg, cap, &u, "sessionId", s->session_id, -1, 1) == 0 &&
+        emit_todo_id(msg, cap, &u, s) == 0 &&
+        (!(s->state == SESS_RUNNING && s->run_block_id_len > 0) || jfield_str(msg, cap, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) == 0) &&
+        jfield_str(msg, cap, &u, "data", e->b64_buf, (long)bn, 1) == 0 &&
+        json_emit_raw(msg, cap, &u, "}", 1) == 0) send_json(e, msg, u);
     free(msg);
 }
 
 static void send_run_started(edge_t *e, session_t *s, int created) {
-    char buf[384];
-    int n = (int)mg_snprintf(buf, sizeof(buf),
-        "{%m:%m,%m:%m" TODO_FRAG_FMT ",%m:%m,%m:%s}",
-        MG_ESC("type"), MG_ESC("run_started"),
-        MG_ESC("sessionId"), MG_ESC(s->session_id),
-        TODO_FRAG_ARGS(s),
-        MG_ESC("blockId"), MG_ESC(s->run_block_id),
-        MG_ESC("created"), created ? "true" : "false");
-    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    char buf[384]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "run_started", -1, 0) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
+        emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "created", created ? "true" : "false", 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    send_json(e, buf, u);
 }
 
 // exit_code < 0 ⇒ emit `null`. alive=false means shell died during the step.
 static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
                            int alive, int timed_out) {
-    char buf[512];
-    char rc[24];
-    if (has_code) mg_snprintf(rc, sizeof(rc), "%d", exit_code);
-    else          mg_snprintf(rc, sizeof(rc), "null");
-    int n = (int)mg_snprintf(buf, sizeof(buf),
-        "{%m:%m,%m:%m" TODO_FRAG_FMT ",%m:%m,%m:%s,%m:%s,%m:%s}",
-        MG_ESC("type"), MG_ESC("step_done"),
-        MG_ESC("sessionId"), MG_ESC(s->session_id),
-        TODO_FRAG_ARGS(s),
-        MG_ESC("blockId"), MG_ESC(s->run_block_id),
-        MG_ESC("exitCode"), rc,
-        MG_ESC("alive"), alive ? "true" : "false",
-        MG_ESC("timedOut"), timed_out ? "true" : "false");
-    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    char buf[512]; size_t u = 0;
+    char rc[24]; snprintf(rc, sizeof rc, has_code ? "%d" : "null", exit_code);
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "step_done", -1, 0) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
+        emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "exitCode", rc, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "alive", alive ? "true" : "false", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "timedOut", timed_out ? "true" : "false", 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    send_json(e, buf, u);
 }
 
 // Bridge → server: "command is blocked waiting for stdin". The PTY stays
@@ -520,15 +421,15 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
 // sending INPUT on the same sessionId.
 // `passwordPrompt` is true when the slave has ECHO disabled (sudo/getpass/ssh).
 static void send_step_paused(edge_t *e, session_t *s, int password_prompt) {
-    char buf[512];
-    int n = (int)mg_snprintf(buf, sizeof(buf),
-        "{%m:%m,%m:%m" TODO_FRAG_FMT ",%m:%m,%m:%s}",
-        MG_ESC("type"), MG_ESC("step_paused"),
-        MG_ESC("sessionId"), MG_ESC(s->session_id),
-        TODO_FRAG_ARGS(s),
-        MG_ESC("blockId"), MG_ESC(s->run_block_id),
-        MG_ESC("passwordPrompt"), password_prompt ? "true" : "false");
-    if (n > 0 && (size_t)n < sizeof(buf)) send_json(e, buf, (size_t)n);
+    char buf[512]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "step_paused", -1, 0) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
+        emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "passwordPrompt", password_prompt ? "true" : "false", 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    send_json(e, buf, u);
 }
 
 // Reset per-step state. Subsequent PTY bytes (e.g. trailing async output)
@@ -667,10 +568,10 @@ static void forward_pty_output(edge_t *e, session_t *s) {
 
 static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
     const char *type = NULL; size_t type_len = 0;
-    if (!json_str(msg, msg_len, "type", &type, &type_len)) return 0;
+    if (!json_get_str(msg, msg_len, "type", &type, &type_len)) return 0;
 
     const char *bid = NULL; size_t bid_len = 0;
-    int has_bid = json_str(msg, msg_len, "blockId", &bid, &bid_len);
+    int has_bid = json_get_str(msg, msg_len, "blockId", &bid, &bid_len);
     if (has_bid && !is_valid_id(bid, bid_len))
         return send_error(e, NULL, 0, NULL, 0, "INVALID_BLOCK_ID",
                           "blockId must be 1-64 chars of [A-Za-z0-9_.-]");
@@ -681,7 +582,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
         // Required fields: sessionId ("new" or UUID), blockId, cmdB64.
         const char *sid = NULL; size_t sid_len = 0;
-        if (!json_str(msg, msg_len, "sessionId", &sid, &sid_len))
+        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
             return send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "run requires sessionId");
         if (!has_bid || bid_len == 0)
             return send_error(e, NULL, 0, NULL, 0, "MISSING_BLOCK_ID", "run requires blockId");
@@ -689,11 +590,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // `cmd` is base64-encoded shell text. Avoids JSON-escape ambiguity in
         // our minimal parser (no \" / \uXXXX support) and keeps binary-safe.
         const char *cmd_b64 = NULL; size_t cmd_b64_len = 0;
-        if (!json_str(msg, msg_len, "cmdB64", &cmd_b64, &cmd_b64_len))
+        if (!json_get_str(msg, msg_len, "cmdB64", &cmd_b64, &cmd_b64_len))
             return send_error(e, NULL, 0, bid, bid_len, "MISSING_CMD", "run requires cmdB64");
         char *cmd = malloc(cmd_b64_len + 4);
         if (!cmd) return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory");
-        size_t cmd_len = mg_base64_decode(cmd_b64, cmd_b64_len, cmd, cmd_b64_len + 4);
+        size_t cmd_len = b64_decode(cmd_b64, cmd_b64_len, cmd, cmd_b64_len + 4);
         if (cmd_len == 0 && cmd_b64_len > 0) {
             free(cmd);
             return send_error(e, NULL, 0, bid, bid_len, "INVALID_BASE64", "cmdB64 is not valid base64");
@@ -708,7 +609,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (!s) { free(cmd); return send_error(e, NULL, 0, bid, bid_len, "MAX_SESSIONS", "max 16 concurrent sessions"); }
             // Paths can legitimately contain JSON-escaped bytes; decode properly.
             char cwd_buf[1024]; cwd_buf[0] = '\0'; size_t cwd_len = 0;
-            int has_cwd = json_str_decoded(msg, msg_len, "cwd", cwd_buf, sizeof(cwd_buf), &cwd_len);
+            int has_cwd = json_get_str_decoded(msg, msg_len, "cwd", cwd_buf, sizeof(cwd_buf), &cwd_len);
             if (has_cwd) {
                 // Validate up front so a bad path surfaces as ERROR before we
                 // spawn a doomed PTY (otherwise chdir silently fails in child).
@@ -748,7 +649,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // blockId) so it's safe to interpolate raw with %s. Absent ⇒ keep the
         // existing value; explicit "" ⇒ clear.
         const char *utid = NULL; size_t utid_len = 0;
-        if (json_str(msg, msg_len, "todoId", &utid, &utid_len)) {
+        if (json_get_str(msg, msg_len, "todoId", &utid, &utid_len)) {
             if (utid_len > 0 && !is_valid_id(utid, utid_len)) {
                 free(cmd); RUN_FAIL_CLEANUP();
                 return send_error(e, NULL, 0, bid, bid_len, "INVALID_TODO_ID",
@@ -767,7 +668,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
         s->sentinel_len = gen_sentinel(s->sentinel, sizeof(s->sentinel));
         long timeout_ms_raw = 0;
-        json_int(msg, msg_len, "timeoutMs", &timeout_ms_raw);
+        json_get_long(msg, msg_len, "timeoutMs", &timeout_ms_raw);
         int64_t timeout_ms = (int64_t)timeout_ms_raw;
         // Cap to ~1 year so monotonic_ms() + timeout can't overflow int64_t.
         if (timeout_ms > 365LL * 24 * 60 * 60 * 1000) timeout_ms = 365LL * 24 * 60 * 60 * 1000;
@@ -815,11 +716,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Optional `requestId` is echoed via ACK on success or ERROR on failure
         // so the caller can correlate (e.g. "session already died").
         const char *rid = NULL; size_t rid_len = 0;
-        int has_rid = json_str(msg, msg_len, "requestId", &rid, &rid_len)
+        int has_rid = json_get_str(msg, msg_len, "requestId", &rid, &rid_len)
                       && rid_len > 0 && is_valid_id(rid, rid_len);
 
         const char *sid = NULL; size_t sid_len = 0;
-        if (!json_str(msg, msg_len, "sessionId", &sid, &sid_len))
+        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
             return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "MISSING_SESSION_ID", "input requires sessionId")
                            : send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "input requires sessionId");
         if (!is_valid_uuid(sid, sid_len))
@@ -831,7 +732,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                            : send_error(e, sid, sid_len, NULL, 0, "SESSION_NOT_FOUND", "no session for sessionId");
 
         const char *b64 = NULL; size_t b64_len = 0;
-        if (!json_str(msg, msg_len, "data", &b64, &b64_len))
+        if (!json_get_str(msg, msg_len, "data", &b64, &b64_len))
             return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "MISSING_DATA", "input requires data")
                            : send_error(e, sid, sid_len, NULL, 0, "MISSING_DATA", "input requires data");
         if (b64_len / 4 * 3 > BUF_SIZE)
@@ -839,7 +740,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                            : send_error(e, sid, sid_len, NULL, 0, "INPUT_TOO_LARGE", "input exceeds 4096 bytes");
 
         char decoded[BUF_SIZE + 4];
-        size_t dec_len = mg_base64_decode(b64, b64_len, decoded, sizeof(decoded));
+        size_t dec_len = b64_decode(b64, b64_len, decoded, sizeof(decoded));
         if (dec_len == 0 && b64_len > 0)
             return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "INVALID_BASE64", "data is not valid base64")
                            : send_error(e, sid, sid_len, NULL, 0, "INVALID_BASE64", "data is not valid base64");
@@ -863,11 +764,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // down the session. The wrapper's sentinel still fires, so the
         // in-flight RUN resolves naturally via STEP_DONE.
         const char *rid = NULL; size_t rid_len = 0;
-        int has_rid = json_str(msg, msg_len, "requestId", &rid, &rid_len)
+        int has_rid = json_get_str(msg, msg_len, "requestId", &rid, &rid_len)
                       && rid_len > 0 && is_valid_id(rid, rid_len);
 
         const char *sid = NULL; size_t sid_len = 0;
-        if (!json_str(msg, msg_len, "sessionId", &sid, &sid_len))
+        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
             return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "MISSING_SESSION_ID", "signal requires sessionId")
                            : send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "signal requires sessionId");
         if (!is_valid_uuid(sid, sid_len))
@@ -887,7 +788,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // the session down (caller's choice).
         enum { SIG_INT_VIA_TTY, SIG_TERM_VIA_KILL, SIG_KILL_VIA_KILL } mode = SIG_INT_VIA_TTY;
         const char *sname = NULL; size_t sname_len = 0;
-        if (json_str(msg, msg_len, "signal", &sname, &sname_len)) {
+        if (json_get_str(msg, msg_len, "signal", &sname, &sname_len)) {
             if (sname_len == 6 && memcmp(sname, "SIGINT", 6) == 0)       mode = SIG_INT_VIA_TTY;
             else if (sname_len == 7 && memcmp(sname, "SIGTERM", 7) == 0) mode = SIG_TERM_VIA_KILL;
             else if (sname_len == 7 && memcmp(sname, "SIGKILL", 7) == 0) mode = SIG_KILL_VIA_KILL;
@@ -909,7 +810,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
     } else if (IS("close")) {
         const char *sid = NULL; size_t sid_len = 0;
-        if (!json_str(msg, msg_len, "sessionId", &sid, &sid_len))
+        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
             return send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "close requires sessionId");
         if (!is_valid_uuid(sid, sid_len))
             return send_error(e, NULL, 0, NULL, 0, "INVALID_SESSION_ID", "sessionId must be a UUID");
@@ -917,7 +818,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (!s)
             return send_error(e, sid, sid_len, NULL, 0, "SESSION_NOT_FOUND", "no session for sessionId");
         int force = 0;
-        json_bool(msg, msg_len, "force", &force);
+        json_get_bool(msg, msg_len, "force", &force);
         if (force) {
             bridge_pty_signal(&s->pty, /*SIGKILL=*/9);
         } else {
@@ -928,7 +829,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
     } else if (IS("tool_catalog")) {
         // Server pushed the shell-command catalog; scan and reply.
         const char *entries = NULL; size_t entries_len = 0;
-        if (!json_str(msg, msg_len, "entries", &entries, &entries_len)) return 0;
+        if (!json_get_str(msg, msg_len, "entries", &entries, &entries_len)) return 0;
 
         // Unescape JSON \t, \n, \\, \" in place (we own a decoded copy).
         char *buf = malloc(entries_len + 1);
@@ -1056,103 +957,108 @@ static void service_sessions(edge_t *e) {
     }
 }
 
-static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
-    edge_t *e = c->fn_data;
-    if (ev == MG_EV_ERROR) {
-        fail(e, "%s", ev_data ? (const char *)ev_data : "mongoose connection error");
+static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
+    edge_t *e = ctx;
+    if (op != WS_OP_BINARY) return;
+    long n = noise_ws_recv(&e->noise, data, len, e->msg_buf, sizeof(e->msg_buf));
+    if (n < 0) {
+        fail(e, e->noise.handshake_done
+                ? "noise decrypt failed (corrupt frame, replay, or out-of-order)"
+                : "noise handshake failed (wrong --server-pubkey or incompatible build)");
+        return;
     }
-    else if (ev == MG_EV_CLOSE)   {
-        e->ws = NULL;
-        // Any close is unexpected — the bridge is a long-running daemon and
-        // never closes the socket itself. Surface it so the user sees *why*
-        // instead of silently returning to the prompt. fail() is a no-op if
-        // a more specific reason was already recorded.
-        fail(e, e->identity_sent
-                ? "peer closed connection (server died or network dropped)"
-                : "peer closed connection before authentication");
+    if (n == 0) {
+        // Handshake just completed → send auth. Identity is deferred (see edge_t).
+        char auth[1024]; size_t u = 0;
+        if (json_emit_raw(auth, sizeof auth, &u, "{", 1) < 0 ||
+            jfield_str(auth, sizeof auth, &u, "type", "auth", -1, 0) < 0 ||
+            jfield_str(auth, sizeof auth, &u, "deviceId", e->device_id, -1, 1) < 0 ||
+            jfield_str(auth, sizeof auth, &u, "secret", e->device_secret, -1, 1) < 0 ||
+            json_emit_raw(auth, sizeof auth, &u, "}", 1) < 0) { fail(e, "failed to build auth frame"); return; }
+        if (send_json(e, auth, u) != 0) { fail(e, "failed to send auth frame"); return; }
+        e->auth_sent_ms = monotonic_ms();
+        return;
     }
-    else if (ev == MG_EV_WS_CTL) {
-        struct mg_ws_message *wm = ev_data;
-        if (wm->flags & 8) {  // close opcode
-            e->got_close_frame = 1;
-            if (wm->data.len >= 2)
-                e->close_code = ((uint8_t)wm->data.buf[0] << 8) | (uint8_t)wm->data.buf[1];
-            if (wm->data.len > 2) {
-                size_t n = wm->data.len - 2;
-                if (n >= sizeof e->close_reason) n = sizeof e->close_reason - 1;
-                memcpy(e->close_reason, wm->data.buf + 2, n);
-                e->close_reason[n] = 0;
-            }
-        }
-    }
-    else if (ev == MG_EV_WS_OPEN) {
-        if (noise_ws_start(&e->noise, c) != 0) fail(e, "failed to start noise handshake");
-    }
-    else if (ev == MG_EV_WS_MSG) {
-        struct mg_ws_message *wm = ev_data;
-        long n = noise_ws_recv(&e->noise,
-                               (uint8_t *)wm->data.buf, wm->data.len,
-                               e->msg_buf, sizeof(e->msg_buf));
-        if (n < 0) {
-            fail(e, e->noise.handshake_done
-                    ? "noise decrypt failed (corrupt frame, replay, or out-of-order)"
-                    : "noise handshake failed (wrong --server-pubkey or incompatible build)");
-            return;
-        }
-        if (n == 0) {
-            // Handshake just completed → send auth + identity once.
-            char auth[1024];
-            int an = mg_snprintf(auth, sizeof(auth),
-                "{%m:%m,%m:%m,%m:%m}",
-                MG_ESC("type"),     MG_ESC("auth"),
-                MG_ESC("deviceId"), MG_ESC(e->device_id),
-                MG_ESC("secret"),   MG_ESC(e->device_secret));
-            if (send_json(e, auth, (size_t)an) != 0) {
-                fail(e, "failed to send auth frame");
-                return;
-            }
-            // Identity is deferred — see edge_t.identity_sent / auth_sent_ms.
-            e->auth_sent_ms = monotonic_ms();
-            return;
-        }
-        if (getenv("BRIDGE_DEBUG_WIRE")) {
-            fprintf(stderr, "← recv (%ld) %.*s\n", n, (int)(n > 512 ? 512 : n), (const char *)e->msg_buf);
-        }
-        handle_command(e, (const char *)e->msg_buf, (size_t)n);
-    }
-    else if (ev == MG_EV_POLL) {
-        if (e->noise.handshake_done && !e->identity_sent &&
-            e->auth_sent_ms != 0 && monotonic_ms() - e->auth_sent_ms >= 100) {
-            char id[1024];
-            int il = bridge_identity_json(id, sizeof(id), 0);
-            if (il <= 0 || send_json(e, id, (size_t)il) != 0) {
-                fail(e, "failed to send identity frame");
-                return;
-            }
-            e->identity_sent = 1;
-            fprintf(stderr, "✓ Authenticated\n");
-        }
-        service_sessions(e);
-    }
+    if (getenv("BRIDGE_DEBUG_WIRE"))
+        fprintf(stderr, "← recv (%ld) %.*s\n", n, (int)(n > 512 ? 512 : n), (const char *)e->msg_buf);
+    handle_command(e, (const char *)e->msg_buf, (size_t)n);
 }
 
 static int run(edge_t *e, const char *device_id, const char *device_secret,
-               const char *url, const uint8_t pubkey[32]) {
+               const char *host, uint16_t port, const char *path,
+               const uint8_t pubkey[32]) {
     e->device_id = device_id;
     e->device_secret = device_secret;
     if (noise_ws_init(&e->noise, pubkey) != 0) {
         fail(e, "failed to initialize noise (bad server pubkey?)");
         return -1;
     }
-    mg_mgr_init(&e->mgr);
-    e->ws = mg_ws_connect(&e->mgr, url, on_ws_event, e, NULL);
-    if (!e->ws) {
-        fail(e, "failed to start websocket connection (bad URL?)");
-        mg_mgr_free(&e->mgr);
+    // ws rx capacity: plaintext MAX_MSG + Noise auth tag (16) + WS header slack.
+    if (ws_connect(&e->ws, host, port, path, MAX_MSG + NOISE_TAG_LEN + 16, 10000) != 0) {
+        fail(e, "%s", e->ws.err);
         return -1;
     }
-    while (!e->done) mg_mgr_poll(&e->mgr, 50);
-    mg_mgr_free(&e->mgr);
+    if (noise_ws_start(&e->noise, &e->ws) != 0) {
+        fail(e, "failed to start noise handshake");
+        ws_close(&e->ws);
+        return -1;
+    }
+
+    while (!e->done) {
+        struct pollfd pfd = { .fd = e->ws.fd, .events = POLLIN | (ws_want_write(&e->ws) ? POLLOUT : 0) };
+        int pr = poll(&pfd, 1, 50);
+#ifdef _WIN32
+        if (pr < 0) { fail(e, "poll failed (WSA %d)", WSAGetLastError()); break; }
+#else
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            fail(e, "poll failed (errno %d)", errno);
+            break;
+        }
+#endif
+        if (pr > 0) {
+            if (pfd.revents & (POLLERR | POLLNVAL)) {
+                fail(e, "socket error (revents=0x%x)", pfd.revents);
+                break;
+            }
+            if (pfd.revents & (POLLIN | POLLHUP)) {
+                int rc = ws_io_in(&e->ws, on_ws_msg, e);
+                // Surface CLOSE frame metadata regardless of rc — a clean
+                // server-initiated close arrives via ws_io_in returning 0
+                // with ws.closed=1; transport errors return -1.
+                if (e->ws.have_close) {
+                    e->got_close_frame = 1;
+                    e->close_code = e->ws.close_code;
+                    snprintf(e->close_reason, sizeof e->close_reason, "%s", e->ws.close_reason);
+                }
+                if (rc < 0 || e->ws.closed) {
+                    fail(e, "%s", e->ws.err[0] ? e->ws.err
+                                : (e->identity_sent ? "peer closed connection (server died or network dropped)"
+                                                    : "peer closed connection before authentication"));
+                    // Best-effort flush of our queued CLOSE reply before we tear down.
+                    if (ws_want_write(&e->ws)) (void)ws_io_out(&e->ws);
+                    break;
+                }
+            }
+            if (pfd.revents & POLLOUT) {
+                if (ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
+            }
+        }
+        // Deferred identity send — gives the backend's async validateDevice()
+        // time to settle before the second frame lands on the post-auth handler.
+        if (e->noise.handshake_done && !e->identity_sent &&
+            e->auth_sent_ms != 0 && monotonic_ms() - e->auth_sent_ms >= 100) {
+            char id[1024];
+            int il = bridge_identity_json(id, sizeof id, 0);
+            if (il <= 0 || send_json(e, id, (size_t)il) != 0) { fail(e, "failed to send identity frame"); break; }
+            e->identity_sent = 1;
+            fprintf(stderr, "✓ Authenticated\n");
+        }
+        service_sessions(e);
+        // Drain any send queue produced by service_sessions / handle_command.
+        if (ws_want_write(&e->ws) && ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
+    }
+    ws_close(&e->ws);
     noise_ws_wipe(&e->noise);
     return e->rc;
 }
@@ -1253,9 +1159,8 @@ int main(int argc, char **argv) {
     edge_t *e = calloc(1, sizeof(*e));
     if (!e) return 1;
 
-    char url[256];
-    mg_snprintf(url, sizeof(url), "ws://%s:%u%s", host, (unsigned)port, DEFAULT_PATH);
-    int rc = run(e, saved_creds.device_id, saved_creds.device_secret, url, server_pubkey);
+    int rc = run(e, saved_creds.device_id, saved_creds.device_secret,
+                 host, port, DEFAULT_PATH, server_pubkey);
 
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);

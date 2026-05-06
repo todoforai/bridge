@@ -16,12 +16,8 @@ BRIDGE_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || ec
 
 CFLAGS  ?= -Os -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wno-unused-function \
            -ffunction-sections -fdata-sections -fomit-frame-pointer \
-           -DMG_TLS=MG_TLS_NONE -DMG_ENABLE_PACKED_FS=0 -DMG_ENABLE_FILE=0 \
-           -DMG_ENABLE_MQTT=0 -DMG_ENABLE_SSI=0 -DMG_ENABLE_DIRECTORY_LISTING=0 \
-           -DMG_ENABLE_LOG=0 -DMG_ENABLE_CUSTOM_RANDOM=1 \
            -DBRIDGE_VERSION=\"$(BRIDGE_VERSION)\" \
-           -I$(CORE)/noise -I$(CORE)/cli \
-           -I$(CORE)/login -I$(CORE)/vendor/mongoose
+           -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 LDFLAGS ?= -Wl,--gc-sections
 LIBS    ?= -lutil -lpthread
 
@@ -31,15 +27,13 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c \
-       $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c \
-       $(CORE)/vendor/mongoose/mongoose.c
+COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c \
+       $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h json.h \
+HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h json.h ws.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
-       $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h \
-       $(CORE)/vendor/mongoose/mongoose.h
+       $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
 .PHONY: all clean dev
 
@@ -88,8 +82,8 @@ release-darwin-arm64: | build
 	clang -target arm64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/todoforai-bridge-darwin-arm64 $(SRCS)
 	strip build/todoforai-bridge-darwin-arm64 2>/dev/null || true
 
-# Windows: ConPTY backend (pty_win.c) + winsock; mongoose auto-selects its
-# Win32 arch via _WIN32. zig cc bundles a recent mingw-w64.
+# Windows: ConPTY backend (pty_win.c) + winsock (ws.c uses WSAPoll). zig cc
+# bundles a recent mingw-w64.
 # _WIN32_WINNT=0x0A00 unlocks CreatePseudoConsole (Win10 1809+).
 release-windows-x64: | build
 	zig cc -target x86_64-windows-gnu \

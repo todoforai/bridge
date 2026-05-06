@@ -241,9 +241,8 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
         out[--used] = '\0';
     }
 
-    // Sanitize: replace control bytes (incl. ANSI ESC) with space. mg_print_esc
-    // only escapes \b\f\n\r\t\\\" — raw 0x00–0x1f would otherwise produce
-    // invalid JSON when embedded as a string value.
+    // Sanitize: replace control bytes (incl. ANSI ESC) with space — keeps the
+    // value JSON-safe even if json_emit_str's own escape table grows later.
     for (size_t i = 0; i < used; i++) {
         if ((unsigned char)out[i] < 0x20) out[i] = ' ';
     }

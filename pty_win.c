@@ -219,7 +219,7 @@ int bridge_pty_close(bridge_pty_t *p) {
 
 int bridge_pty_pollfd(const bridge_pty_t *p) {
     (void)p;
-    return -1;  // Not meaningful on Windows; main loop drives via mongoose.
+    return -1;  // Not meaningful on Windows; main loop drives via poll().
 }
 
 // ── Auto-pause detection ────────────────────────────────────────────────────

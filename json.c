@@ -2,8 +2,6 @@
 #include "json.h"
 
 #include <ctype.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -107,8 +105,8 @@ static const char *skip_value(const char *p, const char *e) {
     return NULL;
 }
 
-int json_find(const char *buf, size_t len, const char *key,
-              json_type_t *type, const char **vp, size_t *vlen) {
+static int json_find(const char *buf, size_t len, const char *key,
+                     json_type_t *type, const char **vp, size_t *vlen) {
     if (!buf || len == 0) return 0;
     const char *p = buf, *e = buf + len;
     p = skip_ws(p, e);
@@ -199,7 +197,7 @@ int json_get_long(const char *buf, size_t len, const char *key, long *out) {
     return 1;
 }
 
-long json_unescape(const char *src, size_t src_len, char *dst, size_t dst_cap) {
+static long json_unescape(const char *src, size_t src_len, char *dst, size_t dst_cap) {
     if (dst_cap == 0) return -1;
     size_t w = 0;
     for (size_t i = 0; i < src_len; i++) {
@@ -310,16 +308,6 @@ int json_emit_str(char *out, size_t cap, size_t *used, const char *s, long s_len
     }
     if (*used + 1 >= cap) return -1;
     out[(*used)++] = '"';
-    return 0;
-}
-
-int json_emit_fmt(char *out, size_t cap, size_t *used, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    size_t avail = cap > *used ? cap - *used : 0;
-    int n = vsnprintf(out + *used, avail, fmt, ap);
-    va_end(ap);
-    if (n < 0 || (size_t)n >= avail) return -1;
-    *used += (size_t)n;
     return 0;
 }
 
