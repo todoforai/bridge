@@ -1,11 +1,13 @@
 // bridge_scan_tools: run each catalog entry's versionCmd + statusCmd via
 // `sh -c`, collect {installed, version, statusOutput, authenticated}, emit a
-// single `installed_tools` JSON message. Sequential; per-command timeout.
+// single `installed_tools` JSON message. Per-command timeout.
 //
 // Simplicity rules:
 //   - shell does the heavy lifting (every cmd is already `sh -c`-ready)
 //   - each cmd runs with a wall-clock deadline via fork + waitpid + kill
-//   - no parallelism, no threads — runs once at connect, ~30 tools × ~300ms
+//   - POSIX: pthread pool of PARALLEL_WORKERS drains a shared job queue
+//     (fork-from-thread is safe; child only calls async-signal-safe libc).
+//     Windows path stays serial.
 //   - "installed" = versionCmd exited 0 with non-empty stdout,
 //                   OR (no versionCmd AND statusCmd exited 0)
 //   - "authenticated" = statusCmd exited 0 (absent statusCmd ⇒ true)
@@ -29,10 +31,13 @@
 #else
 #  include <fcntl.h>
 #  include <poll.h>
+#  include <pthread.h>
 #  include <signal.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
 #endif
+
+#define PARALLEL_WORKERS 16
 
 #define VERSION_TIMEOUT_MS 5000
 #define STATUS_TIMEOUT_MS  10000
@@ -289,70 +294,146 @@ static int parse_entry(const char *line, size_t line_len,
     return 1;
 }
 
-// Run versionCmd + statusCmd for a single entry and append its JSON object
-// (`,"key":{...}` or `"key":{...}` if `first`) to `out`. Returns 0 ok, -1 overflow.
-static int probe_and_append(const char *key,
-                            const char *vcmd, int have_v,
-                            const char *scmd, int have_s,
-                            int first, char *out, size_t out_cap, size_t *used) {
-    char version_out[VERSION_CAP + 1] = {0};
-    char status_out[OUT_CAP + 1] = {0};
-    int v_exit = -1, s_exit = -1;
-    if (have_v) v_exit = run_shell(vcmd, VERSION_TIMEOUT_MS, version_out, sizeof(version_out));
-    if (have_s) s_exit = run_shell(scmd, STATUS_TIMEOUT_MS,  status_out,  sizeof(status_out));
+// One catalog entry: input cmds + post-probe results.
+typedef struct {
+    char key[64];
+    char vcmd[512], scmd[512];
+    int  have_v, have_s;
+    char version_out[VERSION_CAP + 1];
+    char status_out[OUT_CAP + 1];
+    int  v_exit, s_exit;
+    int  installed, authed;
+} probe_t;
 
-    int installed = (have_v && v_exit == 0 && version_out[0] != '\0') ||
-                    (!have_v && have_s && s_exit == 0);
-    int authed = have_s ? (s_exit == 0) : installed;
+// Run versionCmd + statusCmd for one entry. Pure: no shared state.
+static void probe_run(probe_t *p) {
+    p->v_exit = p->s_exit = -1;
+    if (p->have_v) p->v_exit = run_shell(p->vcmd, VERSION_TIMEOUT_MS, p->version_out, sizeof(p->version_out));
+    if (p->have_s) p->s_exit = run_shell(p->scmd, STATUS_TIMEOUT_MS,  p->status_out,  sizeof(p->status_out));
+    p->installed = (p->have_v && p->v_exit == 0 && p->version_out[0] != '\0') ||
+                   (!p->have_v && p->have_s && p->s_exit == 0);
+    p->authed = p->have_s ? (p->s_exit == 0) : p->installed;
+}
 
+// Append one probe's JSON object to `out`. Returns 0 ok, -1 overflow.
+static int probe_append_json(const probe_t *p, int first,
+                             char *out, size_t out_cap, size_t *used) {
     if (j_append(out, out_cap, used, "%s%m:{%m:%s",
                  first ? "" : ",",
-                 MG_ESC(key),
-                 MG_ESC("installed"), installed ? "true" : "false") < 0) return -1;
-    if (installed && have_v && v_exit == 0 && version_out[0] != '\0') {
-        if (strlen(version_out) > VERSION_CAP) version_out[VERSION_CAP] = '\0';
+                 MG_ESC(p->key),
+                 MG_ESC("installed"), p->installed ? "true" : "false") < 0) return -1;
+    if (p->installed && p->have_v && p->v_exit == 0 && p->version_out[0] != '\0') {
         if (j_append(out, out_cap, used, ",%m:%m",
-                     MG_ESC("version"), MG_ESC(version_out)) < 0) return -1;
+                     MG_ESC("version"), MG_ESC(p->version_out)) < 0) return -1;
     }
-    if (installed && have_s) {
+    if (p->installed && p->have_s) {
         if (j_append(out, out_cap, used, ",%m:%s",
-                     MG_ESC("authenticated"), authed ? "true" : "false") < 0) return -1;
-        if (status_out[0] != '\0') {
+                     MG_ESC("authenticated"), p->authed ? "true" : "false") < 0) return -1;
+        if (p->status_out[0] != '\0') {
             if (j_append(out, out_cap, used, ",%m:%m",
-                         MG_ESC("statusOutput"), MG_ESC(status_out)) < 0) return -1;
+                         MG_ESC("statusOutput"), MG_ESC(p->status_out)) < 0) return -1;
         }
     }
     if (j_append(out, out_cap, used, "}") < 0) return -1;
     return 0;
 }
 
-int bridge_scan_tools(const char *entries, size_t entries_len,
-                      char *out, size_t out_cap) {
-    size_t used = 0;
-    if (j_append(out, out_cap, &used, "{%m:%m,%m:{",
-                 MG_ESC("type"), MG_ESC("installed_tools"),
-                 MG_ESC("data")) < 0) return -1;
+#ifndef _WIN32
+// Shared job queue: workers pop the next index until exhausted.
+typedef struct {
+    probe_t *probes;
+    int      n;
+    int      next;
+    pthread_mutex_t mu;
+} job_pool_t;
 
-    int first = 1;
+static void *worker_main(void *arg) {
+    job_pool_t *jp = arg;
+    for (;;) {
+        pthread_mutex_lock(&jp->mu);
+        int i = jp->next < jp->n ? jp->next++ : -1;
+        pthread_mutex_unlock(&jp->mu);
+        if (i < 0) return NULL;
+        probe_run(&jp->probes[i]);
+    }
+}
+#endif
+
+// Parse all catalog lines into a heap-allocated probe_t[]. *out_n receives count.
+// Returns NULL on alloc failure. Skips malformed lines.
+static probe_t *parse_catalog(const char *entries, size_t entries_len, int *out_n) {
+    // Upper bound: number of newlines + 1.
+    int cap = 1;
+    for (size_t i = 0; i < entries_len; i++) if (entries[i] == '\n') cap++;
+    probe_t *probes = calloc((size_t)cap, sizeof(*probes));
+    if (!probes) { *out_n = 0; return NULL; }
+
+    int n = 0;
     const char *p = entries, *end = entries + entries_len;
-    char key[64], vcmd[512], scmd[512];
-
-    while (p < end) {
+    while (p < end && n < cap) {
         const char *line_end = memchr(p, '\n', (size_t)(end - p));
         if (!line_end) line_end = end;
-
-        int have_v, have_s;
+        probe_t *e = &probes[n];
         if (parse_entry(p, (size_t)(line_end - p),
-                        key, sizeof(key),
-                        vcmd, sizeof(vcmd), &have_v,
-                        scmd, sizeof(scmd), &have_s)) {
-            if (probe_and_append(key, vcmd, have_v, scmd, have_s,
-                                 first, out, out_cap, &used) < 0) return -1;
-            first = 0;
+                        e->key, sizeof(e->key),
+                        e->vcmd, sizeof(e->vcmd), &e->have_v,
+                        e->scmd, sizeof(e->scmd), &e->have_s)) {
+            n++;
         }
         p = line_end + 1;
     }
+    *out_n = n;
+    return probes;
+}
 
+int bridge_scan_tools(const char *entries, size_t entries_len,
+                      char *out, size_t out_cap,
+                      bridge_scan_stats_t *stats) {
+    if (stats) { stats->installed = stats->authenticated = 0; }
+
+    int n = 0;
+    probe_t *probes = parse_catalog(entries, entries_len, &n);
+    if (!probes) return -1;
+
+#ifdef _WIN32
+    for (int i = 0; i < n; i++) probe_run(&probes[i]);
+#else
+    int nworkers = n < PARALLEL_WORKERS ? n : PARALLEL_WORKERS;
+    if (nworkers <= 1) {
+        for (int i = 0; i < n; i++) probe_run(&probes[i]);
+    } else {
+        job_pool_t jp = { .probes = probes, .n = n, .next = 0 };
+        pthread_mutex_init(&jp.mu, NULL);
+        pthread_t tids[PARALLEL_WORKERS];
+        int started = 0;
+        for (int i = 0; i < nworkers; i++) {
+            if (pthread_create(&tids[i], NULL, worker_main, &jp) == 0) started++;
+        }
+        // If thread creation partially failed, drain remainder on this thread.
+        if (started < nworkers) worker_main(&jp);
+        for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
+        pthread_mutex_destroy(&jp.mu);
+    }
+#endif
+
+    // Assemble JSON in catalog order.
+    size_t used = 0;
+    if (j_append(out, out_cap, &used, "{%m:%m,%m:{",
+                 MG_ESC("type"), MG_ESC("installed_tools"),
+                 MG_ESC("data")) < 0) { free(probes); return -1; }
+
+    for (int i = 0; i < n; i++) {
+        probe_t *p = &probes[i];
+        if (stats) {
+            if (p->installed)              stats->installed++;
+            if (p->installed && p->authed) stats->authenticated++;
+        }
+        if (probe_append_json(p, i == 0, out, out_cap, &used) < 0) {
+            free(probes); return -1;
+        }
+    }
+
+    free(probes);
     if (j_append(out, out_cap, &used, "}}") < 0) return -1;
     if (used >= out_cap) return -1;
     out[used] = '\0';

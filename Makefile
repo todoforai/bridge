@@ -23,7 +23,7 @@ CFLAGS  ?= -Os -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wno-unused-function
            -I$(CORE)/noise -I$(CORE)/cli \
            -I$(CORE)/login -I$(CORE)/vendor/mongoose
 LDFLAGS ?= -Wl,--gc-sections
-LIBS    ?= -lutil
+LIBS    ?= -lutil -lpthread
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
@@ -41,7 +41,7 @@ HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h \
        $(CORE)/vendor/mongoose/mongoose.h
 
-.PHONY: all clean
+.PHONY: all clean dev
 
 # Dev build: dynamic glibc (~113 KiB). Smaller than release (~161 KiB) only
 # because libc isn't embedded. For release-equivalent static musl, use
@@ -107,6 +107,11 @@ release-windows-x64: | build
 test-run: | build
 	$(CC) -O0 -g -Wall -Wextra -o build/test-run test_run.c pty_posix.c -lutil
 	./build/test-run
+
+# Local dev: build + drop into ~/.todoforai/bin/ (on PATH) + print version.
+dev: build/todoforai-bridge
+	install -m755 $< $(HOME)/.todoforai/bin/todoforai-bridge
+	@$(HOME)/.todoforai/bin/todoforai-bridge --version
 
 clean:
 	rm -rf build
