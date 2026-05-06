@@ -42,8 +42,15 @@ jobs:
             os: ubuntu-latest
             make: release-windows-x64
             ext: .exe
+            # Windows is cross-compiled with zig + flaky GH-Actions zig downloads
+            # have stalled this job for 20+ minutes in the past. Don't let it
+            # hold up Linux/macOS releases; rerun the workflow to add the .exe
+            # afterwards if it fails.
+            optional: true
 
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional == true }}
+    timeout-minutes: 10
     steps:
       - name: Checkout bridge
         uses: actions/checkout@v4
@@ -59,6 +66,7 @@ jobs:
       - name: Install zig (linux + windows targets)
         if: startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'windows-')
         uses: mlugg/setup-zig@v2
+        timeout-minutes: 4
         with:
           version: 0.13.0
 
