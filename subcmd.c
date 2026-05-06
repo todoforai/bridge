@@ -97,7 +97,8 @@ static int noise_oneshot(const char *backend_addr, const char *backend_pub,
             "  - Server identity changed — check backend logs for\n"
             "    '[noise] Server public key: <hex>' and pass it via\n"
             "    --server-pubkey <hex> (or NOISE_BACKEND_PUBLIC_KEY).\n"
-            "  - The port may not be a Noise endpoint (wrong port?).\n",
+            "  - --port should be the Noise-TCP RPC port (14100 dev, 4100 prod),\n"
+            "    NOT the HTTP/WS bridge port (4000 dev, 80/443 prod).\n",
             backend_addr);
         return -1;
     }
