@@ -1182,6 +1182,7 @@ int main(int argc, char **argv) {
     }
 
     if (!host) host = getenv("BRIDGE_HOST");
+    if (!host && saved_creds.backend_host[0]) host = saved_creds.backend_host;
     if (!host) host = DEFAULT_HOST;
 
     if (!port_s) port_s = getenv("BRIDGE_PORT");
