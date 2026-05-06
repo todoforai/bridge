@@ -69,7 +69,7 @@ bool mg_random(void *buf, size_t len) {
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 
-#define DEFAULT_HOST         "api.todofor.ai"
+#define DEFAULT_HOST         LOGIN_DEFAULT_BACKEND_HOST
 // Plain HTTP port — bridge has no TLS client; Noise provides end-to-end crypto.
 #define DEFAULT_PORT         80
 #define DEFAULT_PATH         "/ws/v2/bridge"

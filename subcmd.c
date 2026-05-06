@@ -58,12 +58,12 @@ static void enroll_backend(const char *host, const char *port_s, const char *pub
                 snprintf(env_port, sizeof(env_port), "%s", colon + 1);
             }
         }
-        if (!h) h = env_host[0] ? env_host : (saved_host ? saved_host : "api.todofor.ai");
-        if (!p) p = env_port[0] ? env_port : is_local_host(h) ? "14100" : "4100";
+        if (!h) h = env_host[0] ? env_host : (saved_host ? saved_host : LOGIN_DEFAULT_BACKEND_HOST);
+        if (!p) p = env_port[0] ? env_port : is_local_host(h) ? "14100" : LOGIN_DEFAULT_NOISE_PORT;
         snprintf(addr_buf, addr_cap, "%s:%s", h, p);
         *addr = addr_buf;
     } else {
-        *addr = env_addr ? env_addr : "api.todofor.ai:4100";
+        *addr = env_addr ? env_addr : LOGIN_DEFAULT_BACKEND_HOST ":" LOGIN_DEFAULT_NOISE_PORT;
     }
     *pub = pub_hex ? pub_hex : getenv("NOISE_BACKEND_PUBLIC_KEY");
     if (!*pub) *pub = "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a";
