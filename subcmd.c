@@ -46,7 +46,9 @@ static void enroll_backend(const char *host, const char *port_s, const char *pub
             }
         }
         if (!h) h = env_host[0] ? env_host : "api.todofor.ai";
-        if (!p) p = env_port[0] ? env_port : "4100";
+        if (!p) p = env_port[0] ? env_port
+                  : (strcmp(h, "localhost") == 0 || strcmp(h, "127.0.0.1") == 0) ? "14100" // dev: bun direct
+                  : "4100";
         snprintf(addr_buf, addr_cap, "%s:%s", h, p);
         *addr = addr_buf;
     } else {
