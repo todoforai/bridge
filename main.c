@@ -1052,7 +1052,7 @@ static void service_sessions(edge_t *e) {
 static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
     edge_t *e = c->fn_data;
     if (ev == MG_EV_ERROR) {
-        fail(e, "%s", (const char *)ev_data);
+        fail(e, "%s", ev_data ? (const char *)ev_data : "mongoose connection error");
     }
     else if (ev == MG_EV_CLOSE)   {
         e->ws = NULL;
@@ -1078,7 +1078,9 @@ static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
             }
         }
     }
-    else if (ev == MG_EV_WS_OPEN) { noise_ws_start(&e->noise, c); }
+    else if (ev == MG_EV_WS_OPEN) {
+        if (noise_ws_start(&e->noise, c) != 0) fail(e, "failed to start noise handshake");
+    }
     else if (ev == MG_EV_WS_MSG) {
         struct mg_ws_message *wm = ev_data;
         long n = noise_ws_recv(&e->noise,
@@ -1098,7 +1100,10 @@ static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
                 MG_ESC("type"),     MG_ESC("auth"),
                 MG_ESC("deviceId"), MG_ESC(e->device_id),
                 MG_ESC("secret"),   MG_ESC(e->device_secret));
-            send_json(e, auth, (size_t)an);
+            if (send_json(e, auth, (size_t)an) != 0) {
+                fail(e, "failed to send auth frame");
+                return;
+            }
             // Identity is deferred — see edge_t.identity_sent / auth_sent_ms.
             e->auth_sent_ms = monotonic_ms();
             return;
@@ -1110,7 +1115,10 @@ static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
             e->auth_sent_ms != 0 && monotonic_ms() - e->auth_sent_ms >= 100) {
             char id[1024];
             int il = bridge_identity_json(id, sizeof(id), 0);
-            if (il > 0) send_json(e, id, (size_t)il);
+            if (il <= 0 || send_json(e, id, (size_t)il) != 0) {
+                fail(e, "failed to send identity frame");
+                return;
+            }
             e->identity_sent = 1;
             fprintf(stderr, "✓ Authenticated\n");
         }
@@ -1122,10 +1130,17 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                const char *url, const uint8_t pubkey[32]) {
     e->device_id = device_id;
     e->device_secret = device_secret;
-    if (noise_ws_init(&e->noise, pubkey) != 0) return -1;
+    if (noise_ws_init(&e->noise, pubkey) != 0) {
+        fail(e, "failed to initialize noise (bad server pubkey?)");
+        return -1;
+    }
     mg_mgr_init(&e->mgr);
     e->ws = mg_ws_connect(&e->mgr, url, on_ws_event, e, NULL);
-    if (!e->ws) { mg_mgr_free(&e->mgr); return -1; }
+    if (!e->ws) {
+        fail(e, "failed to start websocket connection (bad URL?)");
+        mg_mgr_free(&e->mgr);
+        return -1;
+    }
     while (!e->done) mg_mgr_poll(&e->mgr, 50);
     mg_mgr_free(&e->mgr);
     noise_ws_wipe(&e->noise);
@@ -1237,69 +1252,28 @@ int main(int argc, char **argv) {
     }
 
     if (rc != 0) {
+        // Server-sent close frames carry the most specific reason — prefer them.
+        // Otherwise fall back to err_msg, which fail() guarantees is populated.
         if (e->got_close_frame) {
+            const char *reason = e->close_reason[0] ? e->close_reason : "(no reason)";
+            const char *hint = "";
             switch (e->close_code) {
-                case 4401:
-                    fprintf(stderr,
-                        "Authentication failed: %s.\n"
-                        "Your device credentials were rejected. Re-run `todoforai-bridge login` "
-                        "(the device may have been removed or the secret rotated).\n",
-                        e->close_reason[0] ? e->close_reason : "invalid device credentials");
-                    break;
-                case 4408:
-                    fprintf(stderr,
-                        "Authentication timed out: %s.\n"
-                        "The server didn't receive auth in time — check your network/firewall.\n",
-                        e->close_reason[0] ? e->close_reason : "auth timeout");
-                    break;
-                case 4001:
-                    fprintf(stderr,
-                        "Handshake failed: %s.\n"
-                        "Wrong server pubkey, incompatible build, or server-side error. "
-                        "Try `todoforai-bridge --version` and ensure you're up to date.\n",
-                        e->close_reason[0] ? e->close_reason : "handshake failed");
-                    break;
-                case 4003:
-                    fprintf(stderr, "Protocol error: %s.\n",
-                        e->close_reason[0] ? e->close_reason : "binary frames only");
-                    break;
-                default:
-                    fprintf(stderr, "Disconnected by server (code=%u%s%s).\n",
-                        e->close_code,
-                        e->close_reason[0] ? ", reason=" : "",
-                        e->close_reason);
+                case 4401: hint = "\nRe-run `todoforai-bridge login` (device removed or secret rotated)."; break;
+                case 4408: hint = "\nServer didn't receive auth in time — check network/firewall."; break;
+                case 4001: hint = "\nWrong --server-pubkey or incompatible build. Try `todoforai-bridge --version`."; break;
+                case 4003: break;  // protocol error, reason is self-explanatory
+                default:   break;
             }
-        } else if (e->err_msg[0]) {
-            fprintf(stderr, "Connection failed: %s.\n", e->err_msg);
-            if (!e->noise.handshake_done) {
-                // Either we couldn't open the socket / DNS failed, or the peer
-                // accepted TCP but isn't speaking Noise-over-WS on this port.
-                int dns_or_refused = strstr(e->err_msg, "resolve") || strstr(e->err_msg, "DNS")
-                                  || strstr(e->err_msg, "refused") || strstr(e->err_msg, "socket");
-                if (dns_or_refused)
-                    fprintf(stderr, "Check your network and that --host/--port are reachable.\n");
-                else
-                    fprintf(stderr,
-                        "  - --port should be the HTTP/WS port (4000 dev, 80/443 prod),\n"
-                        "    NOT the Noise-TCP RPC port used by `login`/`enroll` (14100/4100).\n"
-                        "  - Or the device may have been removed — re-run `todoforai-bridge login`.\n");
-            }
-        } else if (!e->noise.handshake_done) {
-            fprintf(stderr,
-                "Disconnected before Noise handshake completed.\n"
-                "Likely a network/TLS issue or wrong --server-pubkey.\n");
-        } else if (!e->identity_sent) {
-            fprintf(stderr,
-                "Disconnected during authentication — credentials likely rejected.\n"
-                "Re-run `todoforai-bridge login`.\n");
+            fprintf(stderr, "Disconnected by server (code=%u): %s.%s\n",
+                    e->close_code, reason, hint);
         } else {
-            // Unreachable in normal operation: rc != 0 means something set it,
-            // and every path that does also records a close frame or err_msg.
-            // If you see this, it's a bug — please report with the line below.
-            fprintf(stderr,
-                "Disconnected with no diagnostic (BUG: %s:%d, rc=%d). "
-                "Please report at https://github.com/todoforai\n",
-                __FILE__, __LINE__, rc);
+            fprintf(stderr, "Connection failed: %s.\n",
+                    e->err_msg[0] ? e->err_msg : "(no diagnostic — please report)");
+            // Connect-time failures: hint at common misconfig.
+            if (!e->noise.handshake_done)
+                fprintf(stderr,
+                    "  --port is the HTTP/WS port (4000 dev, 80/443 prod), NOT the Noise-TCP\n"
+                    "  port (14100/4100) used by `login`/`enroll`. Or re-run `todoforai-bridge login`.\n");
         }
     }
     free(e);
