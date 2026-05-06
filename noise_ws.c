@@ -6,7 +6,6 @@
 
 int noise_ws_init(noise_ws_t *n, const uint8_t server_pubkey[32]) {
     memset(n, 0, sizeof(*n));
-    memcpy(n->server_pubkey, server_pubkey, 32);
     return noise_handshake_init(&n->hs, server_pubkey);
 }
 

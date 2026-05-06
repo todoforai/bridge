@@ -15,7 +15,6 @@ typedef struct {
     int               handshake_done;   // 1 after split
     noise_handshake_t hs;
     noise_transport_t transport;
-    uint8_t           server_pubkey[32];
 } noise_ws_t;
 
 int noise_ws_init(noise_ws_t *n, const uint8_t server_pubkey[32]);
