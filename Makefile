@@ -42,7 +42,16 @@ HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h json.h ws
 # `make static` or `make release-linux-x64`.
 all: build/todoforai-bridge
 
-build/todoforai-bridge: $(SRCS) $(HDRS) | build
+# Stamp the resolved version into a file; rewrite (and bump mtime) only when
+# it changes. Make depends on this so a HEAD bump triggers a rebuild even
+# though no .c/.h changed (BRIDGE_VERSION is baked in at compile time).
+# Recursive `$(shell)` trick: re-evaluate every make invocation, but only
+# touch the file when content differs.
+_VERSION_CHECK := $(shell mkdir -p build; \
+    echo "$(BRIDGE_VERSION)" | cmp -s - build/.version-stamp 2>/dev/null \
+    || echo "$(BRIDGE_VERSION)" > build/.version-stamp)
+
+build/todoforai-bridge: $(SRCS) $(HDRS) build/.version-stamp | build
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(LIBS)
 	strip $@ 2>/dev/null || true
 
