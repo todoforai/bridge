@@ -937,12 +937,14 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
         char *out = malloc(MAX_MSG);
         if (!out) { free(buf); return 0; }
-        int n = bridge_scan_tools(buf, w, out, MAX_MSG);
+        bridge_scan_stats_t stats;
+        int n = bridge_scan_tools(buf, w, out, MAX_MSG, &stats);
         if (n > 0) {
             send_json(e, out, (size_t)n);
-            fprintf(stderr, "Scanned tools, %d bytes reported\n", n);
+            fprintf(stderr, "✓ Probed CLI tools: %d installed, %d authenticated\n",
+                    stats.installed, stats.authenticated);
         } else {
-            fprintf(stderr, "Tool scan failed (overflow or empty)\n");
+            fprintf(stderr, "CLI tool probe failed (overflow or empty)\n");
         }
         free(out);
         free(buf);
@@ -1096,7 +1098,7 @@ static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
             int il = bridge_identity_json(id, sizeof(id), 0);
             if (il > 0) send_json(e, id, (size_t)il);
             e->identity_sent = 1;
-            fprintf(stderr, "Identified\n");
+            fprintf(stderr, "✓ Authenticated\n");
         }
         service_sessions(e);
     }
@@ -1204,7 +1206,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(stderr, "Connecting to %s:%u (noise) as device %s...\n", host, (unsigned)port, saved_creds.device_id);
+    // Show 8-char device id prefix so the trailing "..." reads as "connecting…"
+    // rather than "id truncated". Full id is in ~/.config/todoforai/credentials.json.
+    fprintf(stderr, "Connecting to %s:%u (device: %.8s…) ...\n",
+            host, (unsigned)port, saved_creds.device_id);
 
     edge_t *e = calloc(1, sizeof(*e));
     if (!e) return 1;
