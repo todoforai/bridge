@@ -44,6 +44,14 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     pid_t pid = forkpty(&master_fd, NULL, &t, NULL);
     if (pid < 0) return -1;
 
+    // Non-blocking master: bridge_pty_read() returns 0 on EAGAIN so the
+    // event loop can drain other sessions / WS frames without parking on
+    // a quiet PTY. Set in parent only — child execs the shell.
+    if (pid > 0) {
+        int fl = fcntl(master_fd, F_GETFL, 0);
+        if (fl >= 0) (void)fcntl(master_fd, F_SETFL, fl | O_NONBLOCK);
+    }
+
     if (pid == 0) {
         if (cwd && *cwd) {
             // Caller validates cwd up-front; failure here is unexpected.

@@ -636,6 +636,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s = find_session(e, sid, sid_len);
             if (!s) { free(cmd); return send_error(e, sid, sid_len, bid, bid_len, "SESSION_NOT_FOUND", "no session for sessionId"); }
             if (s->state == SESS_RUNNING) { free(cmd); return send_error(e, sid, sid_len, bid, bid_len, "SESSION_BUSY", "session already running a step"); }
+            fprintf(stderr, "PTY resumed %s (run, state=%d)\n", s->session_id, s->state);
         }
 
         // Helper: on a fatal error after the new session was spawned, free
