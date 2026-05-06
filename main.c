@@ -25,6 +25,7 @@
 #define _GNU_SOURCE          // memmem (Linux glibc); harmless on musl/Darwin
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -85,13 +86,10 @@ bool mg_random(void *buf, size_t len) {
 #define BLOCK_ID_CAP         64
 #define MAX_MSG              (64 * 1024)
 
-// Server's Noise static public key (X25519, 32 bytes hex = 64 chars).
-// Overridable via BRIDGE_SERVER_PUBKEY env or --server-pubkey flag.
-// Same key used by sandbox-manager / browser-manager CLIs on port 4100 —
-// backend uses NOISE_LOCAL_PRIVATE_KEY for both the TCP RPC server and the
-// bridge WS handler.
-#define DEFAULT_SERVER_PUBKEY_HEX \
-    "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a"
+// Server's Noise static public key — shared with sandbox/browser CLIs via
+// LOGIN_DEFAULT_BACKEND_PUBKEY. Overridable via NOISE_BACKEND_PUBKEY env
+// or --server-pubkey flag.
+#define DEFAULT_SERVER_PUBKEY_HEX LOGIN_DEFAULT_BACKEND_PUBKEY
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
@@ -184,6 +182,19 @@ typedef struct {
 } edge_t;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+// Record a fatal reason and tear down. Safe to call multiple times — first
+// caller wins so the root cause survives the cascade of CLOSE/ERROR events.
+static void fail(edge_t *e, const char *fmt, ...) {
+    if (!e->err_msg[0]) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(e->err_msg, sizeof e->err_msg, fmt, ap);
+        va_end(ap);
+    }
+    e->rc = 1;
+    e->done = 1;
+}
 
 static int64_t monotonic_ms(void) {
 #ifdef _WIN32
@@ -1041,19 +1052,17 @@ static void service_sessions(edge_t *e) {
 static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
     edge_t *e = c->fn_data;
     if (ev == MG_EV_ERROR) {
-        snprintf(e->err_msg, sizeof e->err_msg, "%s", (const char *)ev_data);
-        e->rc = 1; e->done = 1;
+        fail(e, "%s", (const char *)ev_data);
     }
     else if (ev == MG_EV_CLOSE)   {
-        e->ws = NULL; e->done = 1;
-        // If we never reached "identified", treat as failure so main() prints
-        // actionable diagnostics instead of exiting silently with code 0.
-        if (!e->identity_sent) {
-            if (!e->got_close_frame && !e->err_msg[0])
-                snprintf(e->err_msg, sizeof e->err_msg,
-                         "peer closed connection before authentication");
-            e->rc = 1;
-        }
+        e->ws = NULL;
+        // Any close is unexpected — the bridge is a long-running daemon and
+        // never closes the socket itself. Surface it so the user sees *why*
+        // instead of silently returning to the prompt. fail() is a no-op if
+        // a more specific reason was already recorded.
+        fail(e, e->identity_sent
+                ? "peer closed connection (server died or network dropped)"
+                : "peer closed connection before authentication");
     }
     else if (ev == MG_EV_WS_CTL) {
         struct mg_ws_message *wm = ev_data;
@@ -1075,7 +1084,12 @@ static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
         long n = noise_ws_recv(&e->noise,
                                (uint8_t *)wm->data.buf, wm->data.len,
                                e->msg_buf, sizeof(e->msg_buf));
-        if (n < 0) { e->rc = 1; e->done = 1; return; }
+        if (n < 0) {
+            fail(e, e->noise.handshake_done
+                    ? "noise decrypt failed (corrupt frame, replay, or out-of-order)"
+                    : "noise handshake failed (wrong --server-pubkey or incompatible build)");
+            return;
+        }
         if (n == 0) {
             // Handshake just completed → send auth + identity once.
             char auth[1024];
@@ -1183,11 +1197,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!host) host = getenv("BRIDGE_HOST");
+    if (!host) host = getenv("NOISE_BACKEND_HOST");
     if (!host && saved_creds.backend_host[0]) host = saved_creds.backend_host;
     if (!host) host = DEFAULT_HOST;
 
-    if (!port_s) port_s = getenv("BRIDGE_PORT");
+    if (!port_s) port_s = getenv("BRIDGE_PORT"); // bridge HTTP/WS port (not Noise)
     uint16_t port = DEFAULT_PORT;
     if (port_s) {
         int p = atoi(port_s);
@@ -1197,7 +1211,7 @@ int main(int argc, char **argv) {
         port = 4000; // dev default: bun listens directly (no nginx)
     }
 
-    if (!pubkey_hex) pubkey_hex = getenv("BRIDGE_SERVER_PUBKEY");
+    if (!pubkey_hex) pubkey_hex = getenv("NOISE_BACKEND_PUBKEY");
     if (!pubkey_hex) pubkey_hex = DEFAULT_SERVER_PUBKEY_HEX;
 
     uint8_t server_pubkey[32];

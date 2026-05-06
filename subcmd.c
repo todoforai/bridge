@@ -35,38 +35,27 @@ static int is_local_host(const char *h) {
               || strcmp(h, "[::1]")     == 0);
 }
 
-// Resolve backend Noise addr + pubkey: CLI > env > saved login backendHost > defaults.
-// `host`/`port_s`/`pub_hex` may be NULL; addr is built into `addr_buf`.
+// Resolve backend Noise addr + pubkey.
+// Precedence: CLI flag > env (NOISE_BACKEND_HOST / _PORT / _PUBKEY) > saved
+// login backendHost > prod defaults. `host`/`port_s`/`pub_hex` may be NULL.
 static void enroll_backend(const char *host, const char *port_s, const char *pub_hex,
                            char *addr_buf, size_t addr_cap,
                            const char **addr, const char **pub) {
-    const char *env_addr = getenv("NOISE_BACKEND_ADDR");
+    if (!host)   host   = getenv("NOISE_BACKEND_HOST");
+    if (!port_s) port_s = getenv("NOISE_BACKEND_PORT");
+
     // Saved host from prior `login` (may be empty for prod).
     login_credentials_t saved;
     (void)login_load_credentials(&saved);
-    const char *saved_host = saved.backend_host[0] ? saved.backend_host : NULL;
+    if (!host && saved.backend_host[0]) host = saved.backend_host;
 
-    if (host || port_s || saved_host) {
-        const char *h = host;
-        const char *p = port_s;
-        // If only one of host/port given, fill the other from env_addr (if parseable) or defaults.
-        char env_host[256] = {0}, env_port[16] = {0};
-        if (env_addr) {
-            const char *colon = strrchr(env_addr, ':');
-            if (colon && (size_t)(colon - env_addr) < sizeof(env_host)) {
-                memcpy(env_host, env_addr, (size_t)(colon - env_addr));
-                snprintf(env_port, sizeof(env_port), "%s", colon + 1);
-            }
-        }
-        if (!h) h = env_host[0] ? env_host : (saved_host ? saved_host : LOGIN_DEFAULT_BACKEND_HOST);
-        if (!p) p = env_port[0] ? env_port : is_local_host(h) ? "14100" : LOGIN_DEFAULT_NOISE_PORT;
-        snprintf(addr_buf, addr_cap, "%s:%s", h, p);
-        *addr = addr_buf;
-    } else {
-        *addr = env_addr ? env_addr : LOGIN_DEFAULT_BACKEND_HOST ":" LOGIN_DEFAULT_NOISE_PORT;
-    }
-    *pub = pub_hex ? pub_hex : getenv("NOISE_BACKEND_PUBLIC_KEY");
-    if (!*pub) *pub = "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a";
+    if (!host) host = LOGIN_DEFAULT_BACKEND_HOST;
+    if (!port_s) port_s = is_local_host(host) ? "14100" : LOGIN_DEFAULT_NOISE_PORT;
+    snprintf(addr_buf, addr_cap, "%s:%s", host, port_s);
+    *addr = addr_buf;
+
+    *pub = pub_hex ? pub_hex : getenv("NOISE_BACKEND_PUBKEY");
+    if (!*pub) *pub = LOGIN_DEFAULT_BACKEND_PUBKEY;
 }
 
 // Connect, handshake, send one encrypted JSON request, return decrypted reply.

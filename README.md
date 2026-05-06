@@ -103,13 +103,12 @@ make release-windows-x64
 CLI flags take precedence; env vars are fallbacks for non-interactive
 deployments (sandbox init, systemd units, CI).
 
-| Variable                   | Used by         | Equivalent flag    | Purpose                                                |
-|----------------------------|-----------------|--------------------|--------------------------------------------------------|
-| `BRIDGE_HOST`              | run             | `--host`           | Backend host for the persistent WS                     |
-| `BRIDGE_PORT`              | run             | `--port`           | Backend port for the persistent WS                     |
-| `BRIDGE_SERVER_PUBKEY`     | run             | `--server-pubkey`  | Noise static pubkey (32 bytes, hex)                    |
-| `NOISE_BACKEND_ADDR`       | login / enroll  | `--host` / `--port`| Noise TCP RPC endpoint (`host:port`)                   |
-| `NOISE_BACKEND_PUBLIC_KEY` | login / enroll  | `--server-pubkey`  | Noise pubkey for the RPC endpoint                      |
+| Variable               | Used by              | Equivalent flag   | Purpose                                            |
+|------------------------|----------------------|-------------------|----------------------------------------------------|
+| `NOISE_BACKEND_HOST`   | run, login, enroll   | `--host`          | Backend hostname (default `api.todofor.ai`)        |
+| `NOISE_BACKEND_PORT`   | login, enroll        | `--port`          | Noise TCP RPC port (default `4100`, dev `14100`)   |
+| `NOISE_BACKEND_PUBKEY` | run, login, enroll   | `--server-pubkey` | Backend Noise static pubkey (32 bytes, hex)        |
+| `BRIDGE_PORT`          | run                  | `--port`          | Bridge HTTP/WS port (default `80`, dev `4000`)     |
 
 The server's Noise static public key (32 bytes, X25519, hex-encoded)
 must match what the backend advertises at startup. Default is baked into
