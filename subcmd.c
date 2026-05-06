@@ -58,26 +58,49 @@ static void enroll_backend(const char *host, const char *port_s, const char *pub
 
 // Connect, handshake, send one encrypted JSON request, return decrypted reply.
 // Returns response length (>= 0) or -1 on error. Writes NUL-terminated JSON
-// into resp_buf (truncated to resp_cap-1 if needed).
+// into resp_buf (truncated to resp_cap-1 if needed). Prints actionable
+// diagnostics to stderr on TCP / handshake failures.
 static int noise_oneshot(const char *backend_addr, const char *backend_pub,
                          const char *req, size_t req_len,
                          char *resp_buf, size_t resp_cap) {
     login_sock_init();
 
     uint8_t remote_pub[32];
-    if (login_hex_decode(remote_pub, 32, backend_pub) < 0) return -1;
+    if (login_hex_decode(remote_pub, 32, backend_pub) < 0) {
+        fprintf(stderr, "error: invalid backend public key (need 64 hex chars)\n");
+        return -1;
+    }
 
     char host[256], port_str[16];
     const char *colon = strrchr(backend_addr, ':');
-    if (!colon) return -1;
+    if (!colon) { fprintf(stderr, "error: invalid backend address (missing port): %s\n", backend_addr); return -1; }
     size_t hlen = (size_t)(colon - backend_addr);
-    if (hlen >= sizeof(host)) return -1;
+    if (hlen >= sizeof(host)) { fprintf(stderr, "error: host too long\n"); return -1; }
     memcpy(host, backend_addr, hlen);
     host[hlen] = '\0';
     snprintf(port_str, sizeof(port_str), "%s", colon + 1);
 
     login_session_t session;
-    if (login_noise_connect(&session, host, port_str, remote_pub) < 0) return -1;
+    int conn_rc = login_noise_connect(&session, host, port_str, remote_pub);
+    if (conn_rc == -1) {
+        fprintf(stderr,
+            "error: cannot reach %s (TCP connect failed).\n"
+            "  - Is the backend running and listening on this host:port?\n"
+            "  - Check firewall / network. Try: nc -zv %s %s\n",
+            backend_addr, host, port_str);
+        return -1;
+    }
+    if (conn_rc < 0) {
+        fprintf(stderr,
+            "error: connected to %s but Noise handshake failed.\n"
+            "  - Wrong --server-pubkey for this server (most common cause).\n"
+            "  - Server identity changed — check backend logs for\n"
+            "    '[noise] Server public key: <hex>' and pass it via\n"
+            "    --server-pubkey <hex> (or NOISE_BACKEND_PUBLIC_KEY).\n"
+            "  - The port may not be a Noise endpoint (wrong port?).\n",
+            backend_addr);
+        return -1;
+    }
 
     uint8_t *dec = NULL;
     int dec_len = login_noise_rpc(session.fd, &session.transport, req, req_len, &dec);

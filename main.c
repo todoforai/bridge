@@ -1042,7 +1042,17 @@ static void on_ws_event(struct mg_connection *c, int ev, void *ev_data) {
         snprintf(e->err_msg, sizeof e->err_msg, "%s", (const char *)ev_data);
         e->rc = 1; e->done = 1;
     }
-    else if (ev == MG_EV_CLOSE)   { e->ws = NULL; e->done = 1; }
+    else if (ev == MG_EV_CLOSE)   {
+        e->ws = NULL; e->done = 1;
+        // If we never reached "identified", treat as failure so main() prints
+        // actionable diagnostics instead of exiting silently with code 0.
+        if (!e->identity_sent) {
+            if (!e->got_close_frame && !e->err_msg[0])
+                snprintf(e->err_msg, sizeof e->err_msg,
+                         "peer closed connection before authentication");
+            e->rc = 1;
+        }
+    }
     else if (ev == MG_EV_WS_CTL) {
         struct mg_ws_message *wm = ev_data;
         if (wm->flags & 8) {  // close opcode
@@ -1126,7 +1136,10 @@ int main(int argc, char **argv) {
     // Subcommand dispatch (must come before option parsing so `bridge login -h`
     // shows the login-specific usage).
     if (argc >= 2 && strcmp(argv[1], "login") == 0) {
-        return cmd_login(argc - 1, argv + 1);
+        int rc = cmd_login(argc - 1, argv + 1);
+        if (rc != 0) return rc;
+        // Fall through into the daemon: user is now logged in, no need to re-run.
+        argc = 1;
     }
     if (argc >= 2 && strcmp(argv[1], "enroll") == 0) {
         return cmd_enroll(argc - 1, argv + 1);
@@ -1199,7 +1212,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
     }
-    free(e);
 
     if (rc != 0) {
         if (e->got_close_frame) {
@@ -1235,12 +1247,20 @@ int main(int argc, char **argv) {
                         e->close_reason);
             }
         } else if (e->err_msg[0]) {
-            // Transport-level failure before/without a WS close frame.
-            int dns_or_conn = strstr(e->err_msg, "resolve") || strstr(e->err_msg, "connect")
-                           || strstr(e->err_msg, "DNS")     || strstr(e->err_msg, "refused");
             fprintf(stderr, "Connection failed: %s.\n", e->err_msg);
-            if (dns_or_conn)
-                fprintf(stderr, "Check your network and that --host/--port are reachable.\n");
+            if (!e->noise.handshake_done) {
+                // Either we couldn't open the socket / DNS failed, or the peer
+                // accepted TCP but isn't speaking Noise-over-WS on this port.
+                int dns_or_refused = strstr(e->err_msg, "resolve") || strstr(e->err_msg, "DNS")
+                                  || strstr(e->err_msg, "refused") || strstr(e->err_msg, "socket");
+                if (dns_or_refused)
+                    fprintf(stderr, "Check your network and that --host/--port are reachable.\n");
+                else
+                    fprintf(stderr,
+                        "  - --port should be the HTTP/WS port (4000 dev, 80/443 prod),\n"
+                        "    NOT the Noise-TCP RPC port used by `login`/`enroll` (14100/4100).\n"
+                        "  - Or the device may have been removed — re-run `todoforai-bridge login`.\n");
+            }
         } else if (!e->noise.handshake_done) {
             fprintf(stderr,
                 "Disconnected before Noise handshake completed.\n"
@@ -1259,5 +1279,6 @@ int main(int argc, char **argv) {
                 __FILE__, __LINE__, rc);
         }
     }
+    free(e);
     return rc == 0 ? 0 : 1;
 }
