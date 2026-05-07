@@ -28,11 +28,19 @@ static const char *USAGE_WHOAMI = "whoami";
 // ── Noise one-shot RPC helper (reuses transport code from login.h) ──────────
 
 // True if host is a local/dev address (uses dev-port defaults).
+// Matches localhost, IPv6 loopback, and any RFC1918 private range — covers
+// every dev/sandbox setup (10.x sandbox gateway, 172.16/12 docker, 192.168.x LAN).
 static int is_local_host(const char *h) {
-    return h && (strcmp(h, "localhost") == 0
-              || strcmp(h, "127.0.0.1") == 0
-              || strcmp(h, "::1")       == 0
-              || strcmp(h, "[::1]")     == 0);
+    if (!h) return 0;
+    if (strcmp(h, "localhost") == 0 || strcmp(h, "::1") == 0 || strcmp(h, "[::1]") == 0) return 1;
+    if (strncmp(h, "127.", 4) == 0)     return 1;          // 127.0.0.0/8
+    if (strncmp(h, "10.", 3)  == 0)     return 1;          // 10.0.0.0/8
+    if (strncmp(h, "192.168.", 8) == 0) return 1;          // 192.168.0.0/16
+    if (strncmp(h, "172.", 4) == 0) {                      // 172.16.0.0/12
+        int o2 = atoi(h + 4);
+        if (o2 >= 16 && o2 <= 31) return 1;
+    }
+    return 0;
 }
 
 // Resolve backend Noise addr + pubkey.
@@ -50,7 +58,10 @@ static void enroll_backend(const char *host, const char *port_s, const char *pub
     if (!host && saved.backend_host[0]) host = saved.backend_host;
 
     if (!host) host = LOGIN_DEFAULT_BACKEND_HOST;
-    if (!port_s) port_s = is_local_host(host) ? "14100" : LOGIN_DEFAULT_NOISE_PORT;
+    if (!port_s) {
+        port_s = is_local_host(host) ? "14100" : LOGIN_DEFAULT_NOISE_PORT;
+        fprintf(stderr, "[bridge] no port specified for host=%s, defaulting to %s (set NOISE_BACKEND_PORT or --port to override)\n", host, port_s);
+    }
     snprintf(addr_buf, addr_cap, "%s:%s", host, port_s);
     *addr = addr_buf;
 
