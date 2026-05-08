@@ -120,8 +120,11 @@ Ok "installed $Where$Hint"
 # `todoforai-bridge` auto-launches login on first run (interactive or via
 # --token), then runs the agent in the same process.
 $nextCmd = $Cmd
-if ($Token) { $nextCmd = "$nextCmd login --token $Token" }
-if ($Name)  { $nextCmd = "$nextCmd --device-name $Name" }
+if ($Token -or $Name) {
+    $nextCmd = "$nextCmd login"
+    if ($Token) { $nextCmd = "$nextCmd --token $Token" }
+    if ($Name)  { $nextCmd = "$nextCmd --device-name $Name" }
+}
 Write-Host ""
 Write-Host "  Start the bridge:"
 Write-Host ""

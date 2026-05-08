@@ -152,8 +152,11 @@ ok "installed $WHERE$HINT"
 # --token), then runs the agent in the same process. So the installer just
 # tells the user the one command to start.
 next_cmd="$CMD"
-[ -n "$TOKEN" ]       && next_cmd="$next_cmd login --token $TOKEN"
-[ -n "$DEVICE_NAME" ] && next_cmd="$next_cmd --device-name $DEVICE_NAME"
+if [ -n "$TOKEN" ] || [ -n "$DEVICE_NAME" ]; then
+    next_cmd="$next_cmd login"
+    [ -n "$TOKEN" ]       && next_cmd="$next_cmd --token $TOKEN"
+    [ -n "$DEVICE_NAME" ] && next_cmd="$next_cmd --device-name $DEVICE_NAME"
+fi
 printf '\n  \033[1mStart the bridge:\033[0m\n\n' >&2
 printf '      \033[1;36m$\033[0m \033[1;32m%s\033[0m\n\n' "$next_cmd" >&2
 
