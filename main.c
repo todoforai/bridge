@@ -1110,6 +1110,7 @@ int main(int argc, char **argv) {
     // shows the login-specific usage).
     if (argc >= 2 && strcmp(argv[1], "login") == 0) {
         int rc = cmd_login(argc - 1, argv + 1);
+        if (rc == 2) return 0;   // help printed → done, don't start daemon
         if (rc != 0) return rc;
         // Fall through into the daemon: user is now logged in, no need to re-run.
         argc = 1;
