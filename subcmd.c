@@ -276,6 +276,7 @@ int cmd_login(int argc, char **argv) {
 // ── enroll subcommand ───────────────────────────────────────────────────────
 
 int cmd_enroll(int argc, char **argv) {
+    static const char *USAGE = "enroll";
     long ttl_sec = 300;
     const char *host    = NULL;
     const char *port_s  = NULL;
@@ -291,12 +292,12 @@ int cmd_enroll(int argc, char **argv) {
     ketopt_t opt = KETOPT_INIT;
     int c;
     while ((c = ketopt(&opt, argc, argv, 1, "hT:H:p:k:", longopts)) >= 0) {
-        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_ENROLL); return 0; }
+        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
         else if (c == 'T') ttl_sec = atol(opt.arg);
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pub_hex = opt.arg;
-        else cli_parse_error("todoforai-bridge", USAGE_ENROLL, argc, argv, &opt, c);
+        else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
 
     // Must have device creds on disk — only a logged-in bridge can mint.
@@ -348,12 +349,13 @@ int cmd_enroll(int argc, char **argv) {
 // ── whoami subcommand ───────────────────────────────────────────────────────
 
 int cmd_whoami(int argc, char **argv) {
+    static const char *USAGE = "whoami";
     ko_longopt_t longopts[] = {{ "help", ko_no_argument, 'h' }, { 0, 0, 0 }};
     ketopt_t opt = KETOPT_INIT;
     int c;
     while ((c = ketopt(&opt, argc, argv, 1, "h", longopts)) >= 0) {
-        if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_WHOAMI); return 0; }
-        cli_parse_error("todoforai-bridge", USAGE_WHOAMI, argc, argv, &opt, c);
+        if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
+        cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
     return login_print_whoami("todoforai-bridge");
 }
@@ -361,12 +363,13 @@ int cmd_whoami(int argc, char **argv) {
 // ── logout ──────────────────────────────────────────────────────────────────
 
 int cmd_logout(int argc, char **argv) {
+    static const char *USAGE = "logout";
     ko_longopt_t longopts[] = {{ "help", ko_no_argument, 'h' }, { 0, 0, 0 }};
     ketopt_t opt = KETOPT_INIT;
     int c;
     while ((c = ketopt(&opt, argc, argv, 1, "h", longopts)) >= 0) {
-        if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_LOGOUT); return 0; }
-        cli_parse_error("todoforai-bridge", USAGE_LOGOUT, argc, argv, &opt, c);
+        if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
+        cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) {
@@ -391,12 +394,11 @@ void print_help(void) {
     printf("todoforai-bridge " BRIDGE_VERSION " — TODO for AI bridge\n\n"
            "Usage: todoforai-bridge [command] [options]\n\n"
            "  (no args)            run the bridge (logs in on first run)\n"
-           "  login [--token T]    log in this device  [--device-name NAME]\n"
+           "  login                log in this device  [--token T] [--device-name NAME]\n"
            "  logout               remove credentials\n"
-           "  whoami               show current user/device\n\n"
-           "Advanced:\n"
-           "  enroll               print a token to provision another device\n"
-           "  version, --help\n\n"
+           "  whoami               show current user/device\n"
+           "  enroll               print a token to provision another device\n\n"
+           "  -h, --help           show this help\n"
+           "  -v, --version        print version\n\n"
            "Docs: https://docs.todofor.ai\n");
-    (void)USAGE_LOGIN; (void)USAGE_LOGOUT; (void)USAGE_ENROLL; (void)USAGE_WHOAMI;
 }
