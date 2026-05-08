@@ -379,19 +379,14 @@ int cmd_logout(int argc, char **argv) {
 
 void print_help(void) {
     printf("todoforai-bridge " BRIDGE_VERSION " — TODO for AI bridge\n\n"
-           "Usage:\n"
-           "  todoforai-bridge\n"
-           "      Run the bridge. Auto-launches login on first run.\n"
-           "  todoforai-bridge %s\n"
-           "      Authenticate this device, then run the agent. --token redeems\n"
-           "      a one-time enrollment token (non-interactive).\n"
-           "  todoforai-bridge %s\n"
-           "      Remove saved device credentials.\n"
-           "  todoforai-bridge %s\n"
-           "      Print a one-time enrollment token for provisioning another device.\n"
-           "  todoforai-bridge %s\n"
-           "      Show the logged-in user and device.\n"
-           "  todoforai-bridge version | --version | -v\n"
-           "  todoforai-bridge --help  | -h\n",
-           USAGE_LOGIN, USAGE_LOGOUT, USAGE_ENROLL, USAGE_WHOAMI);
+           "Usage: todoforai-bridge [command] [options]\n\n"
+           "  (no args)            run the bridge (logs in on first run)\n"
+           "  login [--token T]    log in this device  [--device-name NAME]\n"
+           "  logout               remove credentials\n"
+           "  whoami               show current user/device\n\n"
+           "Advanced:\n"
+           "  enroll               print a token to provision another device\n"
+           "  version, --help\n\n"
+           "Docs: https://docs.todofor.ai\n");
+    (void)USAGE_LOGIN; (void)USAGE_LOGOUT; (void)USAGE_ENROLL; (void)USAGE_WHOAMI;
 }
