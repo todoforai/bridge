@@ -1125,11 +1125,21 @@ int main(int argc, char **argv) {
     memset(&saved_creds, 0, sizeof(saved_creds));
     (void)login_load_credentials(&saved_creds);
 
+    // No creds yet → run the login flow inline. The user just typed
+    // `todoforai-bridge`, so do the obvious thing instead of asking them
+    // to re-run with `login`. After successful login we fall through and
+    // start the daemon. Sandbox/systemd setups always pre-provision via
+    // `login --token`, so they never hit this path.
     if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
-        fprintf(stderr,
-            "\033[33mNo device credentials found.\033[0m\n"
-            "Run \033[1mtodoforai-bridge login\033[0m to authorize this device, then try again.\n");
-        return 1;
+        fprintf(stderr, "No device credentials found. Starting login...\n\n");
+        char *login_argv[] = { (char *)"login", NULL };
+        int rc = cmd_login(1, login_argv);
+        if (rc != 0) return rc;
+        if (login_load_credentials(&saved_creds) < 0
+            || !saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
+            fprintf(stderr, "error: login completed but no credentials saved.\n");
+            return 1;
+        }
     }
 
     if (!host) host = getenv("NOISE_BACKEND_HOST");
