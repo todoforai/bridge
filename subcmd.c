@@ -21,9 +21,13 @@
 
 // ── Usage strings ────────────────────────────────────────────────────────────
 
-const char *USAGE_MAIN          = "[--host HOST] [--port PORT] [--server-pubkey HEX]";
-static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--force] [--host HOST] [--port PORT] [--server-pubkey HEX]";
-static const char *USAGE_ENROLL = "enroll [--ttl SECONDS] [--device-name NAME] [--quiet] [--host HOST] [--port PORT] [--server-pubkey HEX]";
+// NOTE: --host / --port / --server-pubkey are developmental flags (override
+// backend address + Noise static pubkey). --ttl overrides enroll token TTL
+// (default 300s). All still parsed below, but intentionally omitted from help
+// to keep the public surface minimal.
+const char *USAGE_MAIN          = "";
+static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--force]";
+static const char *USAGE_ENROLL = "enroll [--device-name NAME]";
 static const char *USAGE_WHOAMI = "whoami";
 static const char *USAGE_LOGOUT = "logout";
 
@@ -271,7 +275,6 @@ int cmd_login(int argc, char **argv) {
 int cmd_enroll(int argc, char **argv) {
     long ttl_sec = 300;
     const char *device_name = NULL;
-    int quiet = 0;
     const char *host    = NULL;
     const char *port_s  = NULL;
     const char *pub_hex = NULL;
@@ -279,7 +282,6 @@ int cmd_enroll(int argc, char **argv) {
         { "help",          ko_no_argument,       'h' },
         { "ttl",           ko_required_argument, 'T' },
         { "device-name",   ko_required_argument, 'n' },
-        { "quiet",         ko_no_argument,       'q' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "server-pubkey", ko_required_argument, 'k' },
@@ -287,11 +289,10 @@ int cmd_enroll(int argc, char **argv) {
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hT:n:qH:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hT:n:H:p:k:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_ENROLL); return 0; }
         else if (c == 'T') ttl_sec = atol(opt.arg);
         else if (c == 'n') device_name = opt.arg;
-        else if (c == 'q') quiet = 1;
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pub_hex = opt.arg;
@@ -337,18 +338,13 @@ int cmd_enroll(int argc, char **argv) {
     json_find_string(resp, "expiresIn", expires, sizeof(expires));
     if (!token[0]) { fprintf(stderr, "error: no token in response: %s\n", resp); return 1; }
 
-    if (quiet) {
-        // Script-friendly: just the token on stdout.
-        printf("%s\n", token);
-    } else {
-        fprintf(stderr, "\033[1m\xf0\x9f\x94\x91 Enrollment token (expires in %s s):\033[0m\n", expires[0] ? expires : "?");
-        printf("%s\n", token);
-        fprintf(stderr, "\n\033[2mRun on the new host:\033[0m\n");
-        fprintf(stderr, "  todoforai-bridge login --token %s%s%s\n",
-                token,
-                device_name ? " --device-name " : "",
-                device_name ? device_name : "");
-    }
+    fprintf(stderr, "\033[1m\xf0\x9f\x94\x91 Enrollment token (expires in %s s):\033[0m\n", expires[0] ? expires : "?");
+    printf("%s\n", token);
+    fprintf(stderr, "\n\033[2mRun on the new host:\033[0m\n");
+    fprintf(stderr, "  todoforai-bridge login --token %s%s%s\n",
+            token,
+            device_name ? " --device-name " : "",
+            device_name ? device_name : "");
     return 0;
 }
 
@@ -397,7 +393,7 @@ int cmd_logout(int argc, char **argv) {
 void print_help(void) {
     printf("todoforai-bridge " BRIDGE_VERSION " — TODOforAI edge agent\n\n"
            "Usage:\n"
-           "  todoforai-bridge %s\n"
+           "  todoforai-bridge\n"
            "      Run the edge agent (default).\n"
            "  todoforai-bridge %s\n"
            "      Interactive device login; use --token to skip the browser prompt.\n"
@@ -410,5 +406,5 @@ void print_help(void) {
            "      Show the logged-in user and device.\n"
            "  todoforai-bridge version | --version | -v\n"
            "  todoforai-bridge --help  | -h\n",
-           USAGE_MAIN, USAGE_LOGIN, USAGE_LOGOUT, USAGE_ENROLL, USAGE_WHOAMI);
+           USAGE_LOGIN, USAGE_LOGOUT, USAGE_ENROLL, USAGE_WHOAMI);
 }
