@@ -21,10 +21,10 @@ TODOforAI Bridge installer.
 
   curl -fsSL https://todofor.ai/bridge | sh
   curl -fsSL https://todofor.ai/bridge | sh -s -- --token ENROLL_TOKEN
-  curl -fsSL https://todofor.ai/bridge | sh -s -- --token TOK --name host-02
+  curl -fsSL https://todofor.ai/bridge | sh -s -- --name host-02
 
 Options:
-  --token TOKEN     redeem an enrollment token (non-interactive login)
+  --token TOKEN     enrollment token (printed in the suggested start command)
   --name NAME       device name to register under
   --prefix DIR      install dir (default: $HOME/.todoforai/bin)
   --tag TAG         specific release tag (default: latest)
@@ -147,27 +147,15 @@ case ":$PATH:" in
 esac
 ok "installed $WHERE$HINT"
 
-# ── login ───────────────────────────────────────────────────────────────────
-if [ -n "$TOKEN" ]; then
-    info "redeeming enrollment token"
-    if [ -n "$DEVICE_NAME" ]; then
-        "$BRIDGE" login --token "$TOKEN" --device-name "$DEVICE_NAME"
-    else
-        "$BRIDGE" login --token "$TOKEN"
-    fi
-    ok "enrolled"
-else
-    printf '\n  \033[1mOne more step\033[0m — sign in to connect your device:\n\n' >&2
-    printf '      \033[1;36m$\033[0m \033[1;32m%s login\033[0m\n\n' "$CMD" >&2
-    if [ -e /dev/tty ]; then
-        printf '  Run it now? [Y/n] ' >&2
-        read -r ans </dev/tty || ans=n
-        case "$ans" in
-            ''|y|Y|yes|YES) printf '\n' >&2; "$BRIDGE" login </dev/tty ;;
-            *) printf '\n  No problem — run it later when ready.\n\n' >&2 ;;
-        esac
-    fi
-fi
+# ── next step ───────────────────────────────────────────────────────────────
+# `todoforai-bridge` auto-launches login on first run (interactive or via
+# --token), then runs the agent in the same process. So the installer just
+# tells the user the one command to start.
+next_cmd="$CMD"
+[ -n "$TOKEN" ]       && next_cmd="$next_cmd login --token $TOKEN"
+[ -n "$DEVICE_NAME" ] && next_cmd="$next_cmd --device-name $DEVICE_NAME"
+printf '\n  \033[1mStart the bridge:\033[0m\n\n' >&2
+printf '      \033[1;36m$\033[0m \033[1;32m%s\033[0m\n\n' "$next_cmd" >&2
 
 # ── supervisor setup ────────────────────────────────────────────────────────
 install_systemd_user() {

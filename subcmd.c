@@ -26,8 +26,8 @@
 // (default 300s). All still parsed below, but intentionally omitted from help
 // to keep the public surface minimal.
 const char *USAGE_MAIN          = "";
-static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--force]";
-static const char *USAGE_ENROLL = "enroll [--device-name NAME]";
+static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN]";
+static const char *USAGE_ENROLL = "enroll";
 static const char *USAGE_WHOAMI = "whoami";
 static const char *USAGE_LOGOUT = "logout";
 
@@ -214,12 +214,10 @@ int cmd_login(int argc, char **argv) {
     const char *host        = NULL;
     const char *port_s      = NULL;
     const char *pub_hex     = NULL;
-    int force               = 0;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "device-name",   ko_required_argument, 'n' },
         { "token",         ko_required_argument, 't' },
-        { "force",         ko_no_argument,       'f' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "server-pubkey", ko_required_argument, 'k' },
@@ -227,43 +225,38 @@ int cmd_login(int argc, char **argv) {
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:fH:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:k:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_LOGIN); return 0; }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
-        else if (c == 'f') force = 1;
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pub_hex = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE_LOGIN, argc, argv, &opt, c);
     }
 
-    // Reuse existing credentials unless --force. Skips both interactive flow
-    // and token redeem so re-running `login` after enroll is a safe no-op.
-    if (!force) {
-        login_credentials_t existing;
-        memset(&existing, 0, sizeof(existing));
-        if (login_load_credentials(&existing) == 0
-            && existing.device_id[0] && existing.device_secret[0]) {
-            const char *who = existing.user_email[0] ? existing.user_email
-                            : existing.user_name[0]  ? existing.user_name
-                            : "(unknown user)";
-            fprintf(stderr,
-                "\033[33mAlready logged in as %s (device %s). Reusing existing credentials.\033[0m\n"
-                "Pass --force to overwrite, or run `todoforai-bridge logout` first.\n",
-                who, existing.device_id);
-            return 0;
-        }
+    // Already logged in? Reuse existing creds — to switch user/device run logout first.
+    login_credentials_t existing;
+    memset(&existing, 0, sizeof(existing));
+    if (login_load_credentials(&existing) == 0
+        && existing.device_id[0] && existing.device_secret[0]) {
+        const char *who = existing.user_email[0] ? existing.user_email
+                        : existing.user_name[0]  ? existing.user_name
+                        : "(unknown user)";
+        fprintf(stderr,
+            "\033[33mAlready logged in as %s (device %s). Reusing existing credentials.\033[0m\n"
+            "Run `todoforai-bridge logout` first to switch user/device.\n",
+            who, existing.device_id);
+        return 0;
     }
 
-    // Non-interactive path: redeem an enrollment token minted by another bridge
-    // (or by the backend via `cli.enroll.mint` / REST). No browser, no polling.
-    // Token is the only capability needed; redeemer self-identifies via the
-    // identity payload (uname, /etc/os-release, sandbox marker).
+    // Token path: non-interactive enrollment via short-lived token (sandbox
+    // /init, scripted installs). Interactive path: device-code flow + browser.
+    // Both fall through to the daemon in main(), so `bridge login [...]`
+    // behaves identically to `bridge` after creds are obtained.
     if (token && *token) {
         return redeem_enroll_token(token, host, port_s, pub_hex) == 0 ? 0 : 1;
     }
-
     const char *addr, *pub;
     char addr_buf[280];
     enroll_backend(host, port_s, pub_hex, addr_buf, sizeof(addr_buf), &addr, &pub);
@@ -274,14 +267,12 @@ int cmd_login(int argc, char **argv) {
 
 int cmd_enroll(int argc, char **argv) {
     long ttl_sec = 300;
-    const char *device_name = NULL;
     const char *host    = NULL;
     const char *port_s  = NULL;
     const char *pub_hex = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "ttl",           ko_required_argument, 'T' },
-        { "device-name",   ko_required_argument, 'n' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "server-pubkey", ko_required_argument, 'k' },
@@ -289,10 +280,9 @@ int cmd_enroll(int argc, char **argv) {
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hT:n:H:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hT:H:p:k:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_ENROLL); return 0; }
         else if (c == 'T') ttl_sec = atol(opt.arg);
-        else if (c == 'n') device_name = opt.arg;
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pub_hex = opt.arg;
@@ -341,10 +331,7 @@ int cmd_enroll(int argc, char **argv) {
     fprintf(stderr, "\033[1m\xf0\x9f\x94\x91 Enrollment token (expires in %s s):\033[0m\n", expires[0] ? expires : "?");
     printf("%s\n", token);
     fprintf(stderr, "\n\033[2mRun on the new host:\033[0m\n");
-    fprintf(stderr, "  todoforai-bridge login --token %s%s%s\n",
-            token,
-            device_name ? " --device-name " : "",
-            device_name ? device_name : "");
+    fprintf(stderr, "  todoforai-bridge login --token %s\n", token);
     return 0;
 }
 
@@ -391,13 +378,13 @@ int cmd_logout(int argc, char **argv) {
 // ── help ────────────────────────────────────────────────────────────────────
 
 void print_help(void) {
-    printf("todoforai-bridge " BRIDGE_VERSION " — TODOforAI edge agent\n\n"
+    printf("todoforai-bridge " BRIDGE_VERSION " — TODO for AI bridge\n\n"
            "Usage:\n"
            "  todoforai-bridge\n"
-           "      Run the edge agent (default).\n"
+           "      Run the bridge. Auto-launches login on first run.\n"
            "  todoforai-bridge %s\n"
-           "      Interactive device login; use --token to skip the browser prompt.\n"
-           "      Reuses existing credentials unless --force is passed.\n"
+           "      Authenticate this device, then run the agent. --token redeems\n"
+           "      a one-time enrollment token (non-interactive).\n"
            "  todoforai-bridge %s\n"
            "      Remove saved device credentials.\n"
            "  todoforai-bridge %s\n"

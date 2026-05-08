@@ -3,7 +3,7 @@
 #
 #   irm https://todofor.ai/bridge.ps1 | iex
 #   iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token ENROLL_TOKEN"
-#   iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token TOK -Name host-02"
+#   iex "& { $(irm https://todofor.ai/bridge.ps1) } -Name host-02"
 
 [CmdletBinding()]
 param(
@@ -32,10 +32,10 @@ TODOforAI Bridge installer (Windows).
 
   irm https://todofor.ai/bridge.ps1 | iex
   iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token ENROLL_TOKEN"
-  iex "& { $(irm https://todofor.ai/bridge.ps1) } -Token TOK -Name host-02"
+  iex "& { $(irm https://todofor.ai/bridge.ps1) } -Name host-02"
 
 Options:
-  -Token TOKEN     redeem an enrollment token (non-interactive login)
+  -Token TOKEN     enrollment token (printed in the suggested start command)
   -Name NAME       device name to register under
   -Prefix DIR      install dir (default: %USERPROFILE%\.todoforai\bin)
   -Tag TAG         specific release tag (default: latest)
@@ -116,33 +116,18 @@ if ($pathParts -contains $Prefix) {
 }
 Ok "installed $Where$Hint"
 
-# ── login ───────────────────────────────────────────────────────────────────
-if ($Token) {
-    Info "redeeming enrollment token"
-    if ($Name) {
-        & $Bridge login --token $Token --device-name $Name
-    } else {
-        & $Bridge login --token $Token
-    }
-    if ($LASTEXITCODE -ne 0) { Die "enrollment failed" }
-    Ok "enrolled"
-} else {
-    Write-Host ""
-    Write-Host "  One more step — sign in to connect your device:"
-    Write-Host ""
-    Write-Host "      $ " -NoNewline -ForegroundColor Cyan
-    Write-Host "$Cmd login" -ForegroundColor Green
-    Write-Host ""
-    $ans = Read-Host "  Run it now? [Y/n]"
-    if ($ans -eq '' -or $ans -match '^[Yy]') {
-        Write-Host ""
-        & $Bridge login
-    } else {
-        Write-Host ""
-        Write-Host "  No problem — run it later when ready."
-        Write-Host ""
-    }
-}
+# ── next step ───────────────────────────────────────────────────────────────
+# `todoforai-bridge` auto-launches login on first run (interactive or via
+# --token), then runs the agent in the same process.
+$nextCmd = $Cmd
+if ($Token) { $nextCmd = "$nextCmd login --token $Token" }
+if ($Name)  { $nextCmd = "$nextCmd --device-name $Name" }
+Write-Host ""
+Write-Host "  Start the bridge:"
+Write-Host ""
+Write-Host "      $ " -NoNewline -ForegroundColor Cyan
+Write-Host $nextCmd -ForegroundColor Green
+Write-Host ""
 
 # ── supervisor setup (Scheduled Task at logon) ──────────────────────────────
 if ($Service) {
