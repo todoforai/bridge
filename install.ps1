@@ -127,7 +127,21 @@ if ($Token) {
     if ($LASTEXITCODE -ne 0) { Die "enrollment failed" }
     Ok "enrolled"
 } else {
-    Write-Host "→ next: $Cmd login" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  One more step — sign in to connect your device:"
+    Write-Host ""
+    Write-Host "      $ " -NoNewline -ForegroundColor Cyan
+    Write-Host "$Cmd login" -ForegroundColor Green
+    Write-Host ""
+    $ans = Read-Host "  Run it now? [Y/n]"
+    if ($ans -eq '' -or $ans -match '^[Yy]') {
+        Write-Host ""
+        & $Bridge login
+    } else {
+        Write-Host ""
+        Write-Host "  No problem — run it later when ready."
+        Write-Host ""
+    }
 }
 
 # ── supervisor setup (Scheduled Task at logon) ──────────────────────────────

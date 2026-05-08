@@ -157,7 +157,16 @@ if [ -n "$TOKEN" ]; then
     fi
     ok "enrolled"
 else
-    printf '\033[36m→\033[0m next: %s login\n' "$CMD" >&2
+    printf '\n  \033[1mOne more step\033[0m — sign in to connect your device:\n\n' >&2
+    printf '      \033[1;36m$\033[0m \033[1;32m%s login\033[0m\n\n' "$CMD" >&2
+    if [ -e /dev/tty ]; then
+        printf '  Run it now? [Y/n] ' >&2
+        read -r ans </dev/tty || ans=n
+        case "$ans" in
+            ''|y|Y|yes|YES) printf '\n' >&2; "$BRIDGE" login </dev/tty ;;
+            *) printf '\n  No problem — run it later when ready.\n\n' >&2 ;;
+        esac
+    fi
 fi
 
 # ── supervisor setup ────────────────────────────────────────────────────────
