@@ -25,11 +25,7 @@
 // backend address + Noise static pubkey). --ttl overrides enroll token TTL
 // (default 300s). All still parsed below, but intentionally omitted from help
 // to keep the public surface minimal.
-const char *USAGE_MAIN          = "";
-static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN]";
-static const char *USAGE_ENROLL = "enroll";
-static const char *USAGE_WHOAMI = "whoami";
-static const char *USAGE_LOGOUT = "logout";
+const char *USAGE_MAIN = "";
 
 // ── Noise one-shot RPC helper (reuses transport code from login.h) ──────────
 
@@ -157,8 +153,9 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
 // Redeem an enrollment token for fresh device credentials and save them.
 // The redeemer self-describes via identity gathered from the host (uname,
 // /etc/os-release, sandbox marker, …). Backend derives `deviceType` from
-// `identity.deviceType` and stores the rest as device metadata.
-static int redeem_enroll_token(const char *token,
+// `identity.deviceType` and stores the rest as device metadata. An optional
+// `deviceName` overrides the hostname-derived default.
+static int redeem_enroll_token(const char *token, const char *device_name,
                                const char *host, const char *port_s, const char *pub_hex) {
     const char *addr, *pub;
     char addr_buf[280];
@@ -172,11 +169,20 @@ static int redeem_enroll_token(const char *token,
     int ilen = bridge_identity_json(identity, sizeof(identity), 1);
     if (ilen < 0) { fprintf(stderr, "error: failed to gather identity\n"); return -1; }
 
+    char name_field[300] = "";
+    if (device_name && *device_name) {
+        char name_esc[256];
+        if (json_escape_buf(name_esc, sizeof(name_esc), device_name) != 0) {
+            fprintf(stderr, "error: device name too long\n"); return -1;
+        }
+        snprintf(name_field, sizeof(name_field), ",\"deviceName\":\"%s\"", name_esc);
+    }
+
     char req[2048];
     int n = snprintf(req, sizeof(req),
         "{\"id\":\"%s\",\"type\":\"cli.enroll.redeem\","
-        "\"payload\":{\"token\":\"%s\",\"identity\":%s}}",
-        id_hex, token, identity);
+        "\"payload\":{\"token\":\"%s\"%s,\"identity\":%s}}",
+        id_hex, token, name_field, identity);
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: payload too long\n"); return -1; }
 
     char resp[LOGIN_CONFIG_MAX];
@@ -209,6 +215,7 @@ static int redeem_enroll_token(const char *token,
 // ── login subcommand ────────────────────────────────────────────────────────
 
 int cmd_login(int argc, char **argv) {
+    static const char *USAGE = "login [--device-name NAME] [--token TOKEN]";
     const char *device_name = NULL;
     const char *token       = NULL;
     const char *host        = NULL;
@@ -226,13 +233,16 @@ int cmd_login(int argc, char **argv) {
     ketopt_t opt = KETOPT_INIT;
     int c;
     while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:k:", longopts)) >= 0) {
-        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_LOGIN); return 0; }
+        // exit() rather than `return 0`: main() falls through into the daemon
+        // after a successful cmd_login (so first-run + auto-login share a process),
+        // but `login -h` is a help request, not a login.
+        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); exit(0); }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pub_hex = opt.arg;
-        else cli_parse_error("todoforai-bridge", USAGE_LOGIN, argc, argv, &opt, c);
+        else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
 
     // Already logged in? Reuse existing creds — to switch user/device run logout first.
@@ -255,7 +265,7 @@ int cmd_login(int argc, char **argv) {
     // Both fall through to the daemon in main(), so `bridge login [...]`
     // behaves identically to `bridge` after creds are obtained.
     if (token && *token) {
-        return redeem_enroll_token(token, host, port_s, pub_hex) == 0 ? 0 : 1;
+        return redeem_enroll_token(token, device_name, host, port_s, pub_hex) == 0 ? 0 : 1;
     }
     const char *addr, *pub;
     char addr_buf[280];
