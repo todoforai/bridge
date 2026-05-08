@@ -6,6 +6,7 @@
 
 #include "subcmd.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -21,9 +22,10 @@
 // ── Usage strings ────────────────────────────────────────────────────────────
 
 const char *USAGE_MAIN          = "[--host HOST] [--port PORT] [--server-pubkey HEX]";
-static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--host HOST] [--port PORT] [--server-pubkey HEX]";
+static const char *USAGE_LOGIN  = "login [--device-name NAME] [--token TOKEN] [--force] [--host HOST] [--port PORT] [--server-pubkey HEX]";
 static const char *USAGE_ENROLL = "enroll [--ttl SECONDS] [--device-name NAME] [--quiet] [--host HOST] [--port PORT] [--server-pubkey HEX]";
 static const char *USAGE_WHOAMI = "whoami";
+static const char *USAGE_LOGOUT = "logout";
 
 // ── Noise one-shot RPC helper (reuses transport code from login.h) ──────────
 
@@ -208,10 +210,12 @@ int cmd_login(int argc, char **argv) {
     const char *host        = NULL;
     const char *port_s      = NULL;
     const char *pub_hex     = NULL;
+    int force               = 0;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "device-name",   ko_required_argument, 'n' },
         { "token",         ko_required_argument, 't' },
+        { "force",         ko_no_argument,       'f' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "server-pubkey", ko_required_argument, 'k' },
@@ -219,17 +223,34 @@ int cmd_login(int argc, char **argv) {
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:fH:p:k:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_LOGIN); return 0; }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
+        else if (c == 'f') force = 1;
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'k') pub_hex = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE_LOGIN, argc, argv, &opt, c);
     }
 
-
+    // Reuse existing credentials unless --force. Skips both interactive flow
+    // and token redeem so re-running `login` after enroll is a safe no-op.
+    if (!force) {
+        login_credentials_t existing;
+        memset(&existing, 0, sizeof(existing));
+        if (login_load_credentials(&existing) == 0
+            && existing.device_id[0] && existing.device_secret[0]) {
+            const char *who = existing.user_email[0] ? existing.user_email
+                            : existing.user_name[0]  ? existing.user_name
+                            : "(unknown user)";
+            fprintf(stderr,
+                "\033[33mAlready logged in as %s (device %s). Reusing existing credentials.\033[0m\n"
+                "Pass --force to overwrite, or run `todoforai-bridge logout` first.\n",
+                who, existing.device_id);
+            return 0;
+        }
+    }
 
     // Non-interactive path: redeem an enrollment token minted by another bridge
     // (or by the backend via `cli.enroll.mint` / REST). No browser, no polling.
@@ -344,6 +365,33 @@ int cmd_whoami(int argc, char **argv) {
     return login_print_whoami("todoforai-bridge");
 }
 
+// ── logout ──────────────────────────────────────────────────────────────────
+
+int cmd_logout(int argc, char **argv) {
+    ko_longopt_t longopts[] = {{ "help", ko_no_argument, 'h' }, { 0, 0, 0 }};
+    ketopt_t opt = KETOPT_INIT;
+    int c;
+    while ((c = ketopt(&opt, argc, argv, 1, "h", longopts)) >= 0) {
+        if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE_LOGOUT); return 0; }
+        cli_parse_error("todoforai-bridge", USAGE_LOGOUT, argc, argv, &opt, c);
+    }
+    char path[1024];
+    if (login_config_path(path, sizeof(path)) < 0) {
+        fprintf(stderr, "error: failed to resolve config path\n");
+        return 1;
+    }
+    if (remove(path) != 0) {
+        if (errno == ENOENT) {
+            fprintf(stderr, "Not logged in (no credentials at %s).\n", path);
+            return 0;
+        }
+        fprintf(stderr, "error: failed to remove %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "\033[32m\xe2\x9c\x85 Logged out. Removed %s\033[0m\n", path);
+    return 0;
+}
+
 // ── help ────────────────────────────────────────────────────────────────────
 
 void print_help(void) {
@@ -353,11 +401,14 @@ void print_help(void) {
            "      Run the edge agent (default).\n"
            "  todoforai-bridge %s\n"
            "      Interactive device login; use --token to skip the browser prompt.\n"
+           "      Reuses existing credentials unless --force is passed.\n"
+           "  todoforai-bridge %s\n"
+           "      Remove saved device credentials.\n"
            "  todoforai-bridge %s\n"
            "      Print a one-time enrollment token for provisioning another device.\n"
            "  todoforai-bridge %s\n"
            "      Show the logged-in user and device.\n"
            "  todoforai-bridge version | --version | -v\n"
            "  todoforai-bridge --help  | -h\n",
-           USAGE_MAIN, USAGE_LOGIN, USAGE_ENROLL, USAGE_WHOAMI);
+           USAGE_MAIN, USAGE_LOGIN, USAGE_LOGOUT, USAGE_ENROLL, USAGE_WHOAMI);
 }

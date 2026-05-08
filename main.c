@@ -1088,6 +1088,9 @@ int main(int argc, char **argv) {
         // Fall through into the daemon: user is now logged in, no need to re-run.
         argc = 1;
     }
+    if (argc >= 2 && strcmp(argv[1], "logout") == 0) {
+        return cmd_logout(argc - 1, argv + 1);
+    }
     if (argc >= 2 && strcmp(argv[1], "enroll") == 0) {
         return cmd_enroll(argc - 1, argv + 1);
     }
@@ -1123,8 +1126,9 @@ int main(int argc, char **argv) {
     (void)login_load_credentials(&saved_creds);
 
     if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
-        fprintf(stderr, "No device credentials found. Run `todoforai-bridge login [--device-name NAME]` first.\n\n");
-        print_help();
+        fprintf(stderr,
+            "\033[33mNo device credentials found.\033[0m\n"
+            "Run \033[1mtodoforai-bridge login\033[0m to authorize this device, then try again.\n");
         return 1;
     }
 
