@@ -233,10 +233,9 @@ int cmd_login(int argc, char **argv) {
     ketopt_t opt = KETOPT_INIT;
     int c;
     while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:k:", longopts)) >= 0) {
-        // Return 2 (not 0): main() falls through into the daemon on cmd_login
-        // success, but `login -h` is a help request, not a login. The 2 lets
-        // main() short-circuit; see main.c login dispatch.
-        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 2; }
+        // Help request → return CMD_RC_HELP so main() can distinguish "help
+        // printed, exit cleanly" from "login succeeded, fall through to daemon".
+        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return CMD_RC_HELP; }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
         else if (c == 'H') host = opt.arg;
