@@ -139,12 +139,25 @@ typedef struct {
     // (input arrived → process leaves n_tty_read) is detected implicitly.
     int64_t last_pause_poll_ms;
     int     pause_consec_ticks;
+    // Monotonic ms stamp set AFTER bridge_pty_write_all returns (RUN cmd or
+    // INPUT). Bridge is single-threaded, so the probe can't run during the
+    // write — only the trailing ldisc drain (≤4KB) is a false-pause window.
+    // Probe waits INPUT_GRACE_MS past this stamp before it may fire.
+    int64_t last_input_ms;
 } session_t;
 
 // Pause poll cadence + confirmation. 2 ticks at 250 ms ⇒ ~250-500 ms latency
 // to detect a real prompt; FP rate ~1-2% (vs. ~30-60% for output-quiescence).
 #define PAUSE_POLL_MS        250
 #define PAUSE_CONFIRM_TICKS  2
+// Grace period AFTER bridge_pty_write_all returns before pause detection may
+// fire. The bridge is single-threaded so the probe can't run during the
+// write itself; the only false-pause window is the trailing line-discipline
+// drain (≤ Linux n_tty buffer ~4KB, drains at >>1MB/s → tens of ms in
+// practice). Sized generously to cover slow VMs while staying well below
+// PAUSE_POLL_MS+PAUSE_CONFIRM_TICKS, so latency for genuine prompts is
+// unaffected (still ~500ms after the wrapped command's last byte).
+#define INPUT_GRACE_MS       500
 
 // 30 min — see Phase 3 step 6. Picked to outlive a typical agent step but
 // reclaim slots when an agent crashes / forgets to CLOSE.
@@ -707,6 +720,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             RUN_FAIL_CLEANUP();
             return 0;
         }
+        // Stamp AFTER write_all returns: the bridge is single-threaded so the
+        // probe couldn't have run during the write — only post-write ldisc
+        // drain (≤4KB) needs the grace window.
+        s->last_input_ms = monotonic_ms();
         free(wrapped);
         #undef RUN_FAIL_CLEANUP
 
@@ -751,6 +768,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                            : 0;
         }
         s->last_active_ms = monotonic_ms();
+        // Stamp AFTER write_all (see RUN handler comment above).
+        s->last_input_ms = s->last_active_ms;
         // Input consumes the prompt: process leaves n_tty_read on the next
         // tick anyway, but reset the counter eagerly to avoid a stale tick
         // re-confirming on the same blocked-read.
@@ -924,6 +943,13 @@ static void service_sessions(edge_t *e) {
         if (!s->active || s->state != SESS_RUNNING) continue;
         if (now - s->last_pause_poll_ms < PAUSE_POLL_MS) continue;
         s->last_pause_poll_ms = now;
+
+        // Grace window after our last write to the PTY: large single-line
+        // inputs (e.g. multi-MB doc_write base64) take seconds to drain
+        // through line discipline, during which the slave shell legitimately
+        // sits in read(/dev/pts/*) — but waiting for *us*, not for user
+        // stdin. Skip the probe entirely for INPUT_GRACE_MS after each write.
+        if (now - s->last_input_ms < INPUT_GRACE_MS) { s->pause_consec_ticks = 0; continue; }
 
         long fg = 0; int pwd = 0;
         int blocked = bridge_pty_probe_blocked(&s->pty, /*echo_baseline=*/0, &fg, &pwd);
