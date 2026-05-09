@@ -1159,8 +1159,10 @@ int main(int argc, char **argv) {
     // `login --token`, so they never hit this path.
     if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
         fprintf(stderr, "No device credentials found. Starting login...\n\n");
-        char *login_argv[] = { (char *)"login", NULL };
-        int rc = cmd_login(1, login_argv);
+        // Forward --host / --server-pubkey so login targets the same backend.
+        // --port is intentionally not forwarded: it's BRIDGE_PORT (HTTP/WS) here
+        // vs NOISE_BACKEND_PORT for login — different transports.
+        int rc = bridge_login_run(NULL, NULL, host, NULL, pubkey_hex);
         if (rc != 0) return rc;
         if (login_load_credentials(&saved_creds) < 0
             || !saved_creds.device_id[0] || !saved_creds.device_secret[0]) {

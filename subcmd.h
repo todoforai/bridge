@@ -12,6 +12,10 @@ extern const char *USAGE_MAIN;
 enum { CMD_RC_HELP = 2 };
 
 int  cmd_login(int argc, char **argv);
+// Run the login flow with already-resolved overrides (no argv parsing).
+// device_name/token/host/port_s/pub_hex may be NULL.
+int  bridge_login_run(const char *device_name, const char *token,
+                      const char *host, const char *port_s, const char *pub_hex);
 int  cmd_logout(int argc, char **argv);
 int  cmd_enroll(int argc, char **argv);
 int  cmd_whoami(int argc, char **argv);

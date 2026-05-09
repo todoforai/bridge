@@ -214,6 +214,36 @@ static int redeem_enroll_token(const char *token, const char *device_name,
 
 // ── login subcommand ────────────────────────────────────────────────────────
 
+int bridge_login_run(const char *device_name, const char *token,
+                     const char *host, const char *port_s, const char *pub_hex) {
+    // Already logged in? Reuse existing creds — to switch user/device run logout first.
+    login_credentials_t existing;
+    memset(&existing, 0, sizeof(existing));
+    if (login_load_credentials(&existing) == 0
+        && existing.device_id[0] && existing.device_secret[0]) {
+        const char *who = existing.user_email[0] ? existing.user_email
+                        : existing.user_name[0]  ? existing.user_name
+                        : "(unknown user)";
+        fprintf(stderr,
+            "\033[33mAlready logged in as %s (device %s). Reusing existing credentials.\033[0m\n"
+            "Run `todoforai-bridge logout` first to switch user/device.\n",
+            who, existing.device_id);
+        return 0;
+    }
+
+    // Token path: non-interactive enrollment via short-lived token (sandbox
+    // /init, scripted installs). Interactive path: device-code flow + browser.
+    // Both fall through to the daemon in main(), so `bridge login [...]`
+    // behaves identically to `bridge` after creds are obtained.
+    if (token && *token) {
+        return redeem_enroll_token(token, device_name, host, port_s, pub_hex) == 0 ? 0 : 1;
+    }
+    const char *addr, *pub;
+    char addr_buf[280];
+    enroll_backend(host, port_s, pub_hex, addr_buf, sizeof(addr_buf), &addr, &pub);
+    return login_device_flow(addr, pub, "bridge", device_name) == 0 ? 0 : 1;
+}
+
 int cmd_login(int argc, char **argv) {
     static const char *USAGE = "login [--device-name NAME] [--token TOKEN]";
     const char *device_name = NULL;
@@ -243,33 +273,7 @@ int cmd_login(int argc, char **argv) {
         else if (c == 'k') pub_hex = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
-
-    // Already logged in? Reuse existing creds — to switch user/device run logout first.
-    login_credentials_t existing;
-    memset(&existing, 0, sizeof(existing));
-    if (login_load_credentials(&existing) == 0
-        && existing.device_id[0] && existing.device_secret[0]) {
-        const char *who = existing.user_email[0] ? existing.user_email
-                        : existing.user_name[0]  ? existing.user_name
-                        : "(unknown user)";
-        fprintf(stderr,
-            "\033[33mAlready logged in as %s (device %s). Reusing existing credentials.\033[0m\n"
-            "Run `todoforai-bridge logout` first to switch user/device.\n",
-            who, existing.device_id);
-        return 0;
-    }
-
-    // Token path: non-interactive enrollment via short-lived token (sandbox
-    // /init, scripted installs). Interactive path: device-code flow + browser.
-    // Both fall through to the daemon in main(), so `bridge login [...]`
-    // behaves identically to `bridge` after creds are obtained.
-    if (token && *token) {
-        return redeem_enroll_token(token, device_name, host, port_s, pub_hex) == 0 ? 0 : 1;
-    }
-    const char *addr, *pub;
-    char addr_buf[280];
-    enroll_backend(host, port_s, pub_hex, addr_buf, sizeof(addr_buf), &addr, &pub);
-    return login_device_flow(addr, pub, "bridge", device_name) == 0 ? 0 : 1;
+    return bridge_login_run(device_name, token, host, port_s, pub_hex);
 }
 
 // ── enroll subcommand ───────────────────────────────────────────────────────
