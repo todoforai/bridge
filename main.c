@@ -4,15 +4,17 @@
 //   First encrypted msg (edge→server):
 //     {"type":"auth","deviceId":"dev_...","secret":"..."}
 //   Then v2 control messages (JSON). The bridge knows ONE identifier:
-//   `sessionId` (UUID it mints when a PTY is spawned via RUN with
-//   sessionId="new"). It has no notion of TODOs — that mapping lives in the
+//   `sessionId` (UUID it mints when a PTY is spawned via a RUN that omits
+//   `sessionId`). It has no notion of TODOs — that mapping lives in the
 //   backend. `blockId` rides on RUN frames as an RPC correlation key.
+//   A RUN without `sessionId` is one-shot: the PTY auto-closes on STEP_DONE
+//   (unless STEP_PAUSED upgraded it to a persistent session).
 //     → {"type":"identity","data":{...}}
-//     ← {"type":"run","sessionId":"new"|"uuid","blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
+//     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
 //     → {"type":"run_started","sessionId":"uuid","blockId":"...","created":bool}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
 //     → {"type":"step_paused","sessionId":"uuid","blockId":"...","passwordPrompt":bool}
-//     → {"type":"step_done","sessionId":"uuid","blockId":"...","exitCode":N|null,"alive":bool,"timedOut":bool}
+//     → {"type":"step_done","sessionId":"uuid","blockId":"...","exitCode":N|null,"timedOut":bool}
 //     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"..."}   // resumes paused RUN
 //     ← {"type":"signal","sessionId":"uuid","signal":"SIGINT|SIGTERM|SIGKILL","requestId":"..."}
 //     → {"type":"ack","requestId":"..."}                            // success reply for input/signal
@@ -109,10 +111,16 @@ typedef enum { SESS_IDLE = 0, SESS_RUNNING } sess_state_t;
 
 typedef struct {
     int active;
-    // PTY identity. UUID v4 minted by the bridge on RUN with sessionId="new".
-    // Authoritative routing key; the bridge looks up sessions by this.
+    // PTY identity. UUID v4 minted by the bridge whenever a RUN spawns a
+    // fresh PTY. Authoritative routing key; the bridge looks up sessions by
+    // this.
     char session_id[SESSION_ID_LEN + 1];
     bridge_pty_t pty;
+    // One-shot: the RUN that spawned this session omitted `sessionId`, so
+    // the bridge owns lifecycle and will close the PTY on STEP_DONE. Cleared
+    // if the run pauses (STEP_PAUSED) — at that point the agent has the
+    // minted sessionId and the session becomes persistent for resume.
+    int one_shot;
 
     // Opaque echo label set from RunMessage.todoId. Bridge never interprets
     // it — just stashes it on the session and echoes it on every related
@@ -429,30 +437,41 @@ static void send_output_bytes(edge_t *e, session_t *s,
     free(msg);
 }
 
+// Portable accessor for the shell's OS pid (the PTY child).
+#ifdef _WIN32
+#  define SHELL_PID(s) ((long)(s)->pty.pid)
+#else
+#  define SHELL_PID(s) ((long)(s)->pty.child_pid)
+#endif
+
 static void send_run_started(edge_t *e, session_t *s, int created) {
     char buf[384]; size_t u = 0;
+    char pid_buf[24]; snprintf(pid_buf, sizeof pid_buf, "%ld", SHELL_PID(s));
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
         jfield_str(buf, sizeof buf, &u, "type", "run_started", -1, 0) < 0 ||
         jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
         emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "shellPid", pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "created", created ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
 }
 
-// exit_code < 0 ⇒ emit `null`. alive=false means shell died during the step.
+// exit_code < 0 ⇒ emit `null`. When the shell died during the step, an EXIT
+// frame follows; backend doesn't need a separate `alive` flag on STEP_DONE.
 static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
-                           int alive, int timed_out) {
+                           int timed_out) {
     char buf[512]; size_t u = 0;
     char rc[24]; snprintf(rc, sizeof rc, has_code ? "%d" : "null", exit_code);
+    char pid_buf[24]; snprintf(pid_buf, sizeof pid_buf, "%ld", SHELL_PID(s));
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
         jfield_str(buf, sizeof buf, &u, "type", "step_done", -1, 0) < 0 ||
         jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
         emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "shellPid", pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "exitCode", rc, 1) < 0 ||
-        jfield_raw(buf, sizeof buf, &u, "alive", alive ? "true" : "false", 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "timedOut", timed_out ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
@@ -463,13 +482,17 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
 // with `paused:true` so the agent gets the prompt text and can resume by
 // sending INPUT on the same sessionId.
 // `passwordPrompt` is true when the slave has ECHO disabled (sudo/getpass/ssh).
-static void send_step_paused(edge_t *e, session_t *s, int password_prompt) {
+static void send_step_paused(edge_t *e, session_t *s, long fg_pid, int password_prompt) {
     char buf[512]; size_t u = 0;
+    char shell_pid_buf[24]; snprintf(shell_pid_buf, sizeof shell_pid_buf, "%ld", SHELL_PID(s));
+    char fg_pid_buf[24]; snprintf(fg_pid_buf, sizeof fg_pid_buf, "%ld", fg_pid);
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
         jfield_str(buf, sizeof buf, &u, "type", "step_paused", -1, 0) < 0 ||
         jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
         emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "shellPid", shell_pid_buf, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "fgPid", fg_pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "passwordPrompt", password_prompt ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
@@ -477,6 +500,11 @@ static void send_step_paused(edge_t *e, session_t *s, int password_prompt) {
 
 // Reset per-step state. Subsequent PTY bytes (e.g. trailing async output)
 // emit OUTPUT without a blockId — the backend routes them to the session.
+//
+// One-shot sessions (spawned by a RUN with no `sessionId`) are torn down
+// here: the agent never asked for a persistent session, so the slot is
+// reclaimed eagerly. If the run paused mid-step, `one_shot` was cleared on
+// STEP_PAUSED — the session has been "promoted" and survives this finish.
 static void run_finish(session_t *s) {
     s->state = SESS_IDLE;
     s->tail_len = 0;
@@ -488,6 +516,22 @@ static void run_finish(session_t *s) {
     // LRU: command just finished; refresh the activity stamp so this session
     // is the most-recently-used.
     s->last_active_ms = monotonic_ms();
+    if (s->one_shot) {
+        // The wrapped command finished but the shell is still alive — we
+        // own its lifecycle, so SIGKILL it synchronously and reclaim the
+        // slot. SIGKILL (not "exit\n") keeps bridge_pty_close's blocking
+        // waitpid bounded; same pattern as evict_lru_idle.
+        //
+        // No EXIT frame: the backend has already settled the agent's
+        // promise via STEP_DONE, and backend's EXIT handler is log-only —
+        // emitting "code=-9" after every successful one-shot would just be
+        // noise that looks like a failure.
+        fprintf(stderr, "PTY auto-close %s (one-shot done)\n", s->session_id);
+        bridge_pty_signal(&s->pty, /*SIGKILL=*/9);
+        bridge_pty_close(&s->pty);
+        s->active = 0;
+        s->one_shot = 0;
+    }
 }
 
 // Search tail_buf for sentinel start (returns offset, or -1 if absent).
@@ -604,7 +648,7 @@ static void forward_pty_output(edge_t *e, session_t *s) {
     if (pre > 0) send_output_bytes(e, s, s->tail_buf, pre);
 
     (void)line_end;  // bytes after the sentinel line are silently dropped (they shouldn't exist).
-    send_step_done(e, s, has_code, exit_code, /*alive=*/1, /*timedOut=*/0);
+    send_step_done(e, s, has_code, exit_code, /*timedOut=*/0);
     run_finish(s);
 }
 
@@ -624,10 +668,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
     if (IS("run")) {
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
-        // Required fields: sessionId ("new" or UUID), blockId, cmdB64.
+        // Required fields: blockId, cmdB64. `sessionId` is optional — when
+        // absent, the bridge spawns a one-shot PTY and auto-closes it on
+        // STEP_DONE (kept alive only if STEP_PAUSED fires first).
         const char *sid = NULL; size_t sid_len = 0;
-        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
-            return send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "run requires sessionId");
+        int has_sid = json_get_str(msg, msg_len, "sessionId", &sid, &sid_len) && sid_len > 0;
         if (!has_bid || bid_len == 0)
             return send_error(e, NULL, 0, NULL, 0, "MISSING_BLOCK_ID", "run requires blockId");
 
@@ -644,11 +689,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             return send_error(e, NULL, 0, bid, bid_len, "INVALID_BASE64", "cmdB64 is not valid base64");
         }
 
-        // Resolve / allocate session.
+        // Resolve / allocate session. Missing sessionId ⇒ spawn one-shot.
         session_t *s = NULL;
         int created = 0;
-        int is_new = (sid_len == 3 && memcmp(sid, "new", 3) == 0);
-        if (is_new) {
+        if (!has_sid) {
             s = free_slot(e);
             // Array full: evict the LRU idle session to make room. Only RUN
             // sessions (which have an in-flight step) are protected.
@@ -682,10 +726,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->todo_id_len = 0;
             s->todo_id[0] = '\0';
             s->last_active_ms = monotonic_ms();
+            s->one_shot = 1;
             created = 1;
-            fprintf(stderr, "PTY spawned %s (run)\n", s->session_id);
+            fprintf(stderr, "PTY spawned %s (run, one-shot)\n", s->session_id);
         } else {
-            if (!is_valid_uuid(sid, sid_len)) { free(cmd); return send_error(e, NULL, 0, bid, bid_len, "INVALID_SESSION_ID", "sessionId must be \"new\" or a UUID"); }
+            if (!is_valid_uuid(sid, sid_len)) { free(cmd); return send_error(e, NULL, 0, bid, bid_len, "INVALID_SESSION_ID", "sessionId must be a UUID"); }
             s = find_session(e, sid, sid_len);
             if (!s) { free(cmd); return send_error(e, sid, sid_len, bid, bid_len, "SESSION_NOT_FOUND", "no session for sessionId"); }
             if (s->state == SESS_RUNNING) { free(cmd); return send_error(e, sid, sid_len, bid, bid_len, "SESSION_BUSY", "session already running a step"); }
@@ -693,9 +738,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         }
 
         // Helper: on a fatal error after the new session was spawned, free
-        // the slot so it doesn't leak. No-op for resumed sessions.
+        // the slot so it doesn't leak. No-op for resumed sessions and for
+        // already-closed slots (e.g. run_finish() already tore down a
+        // one-shot on its way out).
         #define RUN_FAIL_CLEANUP() do { \
-            if (created) { bridge_pty_close(&s->pty); s->active = 0; s->state = SESS_IDLE; } \
+            if (created && s->active) { bridge_pty_close(&s->pty); s->active = 0; s->state = SESS_IDLE; } \
         } while (0)
 
         // Update opaque echo label from this RUN. Validated charset (same as
@@ -755,7 +802,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // STEP_DONE is the terminal response (RUN_STARTED was already sent);
             // a separate ERROR would race against the resolved promise. Log only.
             fprintf(stderr, "PTY_WRITE_FAILED for session %s\n", s->session_id);
-            send_step_done(e, s, /*has_code=*/0, 0, /*alive=*/0, /*timedOut=*/0);
+            send_step_done(e, s, /*has_code=*/0, 0, /*timedOut=*/0);
             run_finish(s);
             RUN_FAIL_CLEANUP();
             return 0;
@@ -816,74 +863,6 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->pause_consec_ticks = 0;
 
         if (has_rid) send_ack(e, rid, rid_len);
-
-    } else if (IS("signal")) {
-        // Send a Unix signal to the foreground process group of the session's
-        // PTY. Default SIGINT — cancels the running command without tearing
-        // down the session. The wrapper's sentinel still fires, so the
-        // in-flight RUN resolves naturally via STEP_DONE.
-        const char *rid = NULL; size_t rid_len = 0;
-        int has_rid = json_get_str(msg, msg_len, "requestId", &rid, &rid_len)
-                      && rid_len > 0 && is_valid_id(rid, rid_len);
-
-        const char *sid = NULL; size_t sid_len = 0;
-        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
-            return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "MISSING_SESSION_ID", "signal requires sessionId")
-                           : send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "signal requires sessionId");
-        if (!is_valid_uuid(sid, sid_len))
-            return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "INVALID_SESSION_ID", "sessionId must be a UUID")
-                           : send_error(e, NULL, 0, NULL, 0, "INVALID_SESSION_ID", "sessionId must be a UUID");
-        session_t *s = find_session(e, sid, sid_len);
-        if (!s)
-            return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "SESSION_NOT_FOUND", "no session for sessionId")
-                           : send_error(e, sid, sid_len, NULL, 0, "SESSION_NOT_FOUND", "no session for sessionId");
-
-        // Resolve signal name. Default SIGINT.
-        // For SIGINT we write Ctrl-C (\x03) to the PTY master — the kernel TTY
-        // line discipline delivers SIGINT to the foreground process group only,
-        // leaving the bash shell alive (so the wrapper's sentinel still fires
-        // and the in-flight RUN resolves via STEP_DONE).
-        // SIGTERM/SIGKILL go directly to the shell pid via kill() — these tear
-        // the session down (caller's choice).
-        enum { SIG_INT_VIA_TTY, SIG_TERM_VIA_KILL, SIG_KILL_VIA_KILL } mode = SIG_INT_VIA_TTY;
-        const char *sname = NULL; size_t sname_len = 0;
-        if (json_get_str(msg, msg_len, "signal", &sname, &sname_len)) {
-            if (sname_len == 6 && memcmp(sname, "SIGINT", 6) == 0)       mode = SIG_INT_VIA_TTY;
-            else if (sname_len == 7 && memcmp(sname, "SIGTERM", 7) == 0) mode = SIG_TERM_VIA_KILL;
-            else if (sname_len == 7 && memcmp(sname, "SIGKILL", 7) == 0) mode = SIG_KILL_VIA_KILL;
-            else return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "INVALID_SIGNAL", "signal must be SIGINT, SIGTERM or SIGKILL")
-                                : send_error(e, sid, sid_len, NULL, 0, "INVALID_SIGNAL", "signal must be SIGINT, SIGTERM or SIGKILL");
-        }
-
-        int ok;
-        if (mode == SIG_INT_VIA_TTY) {
-            ok = bridge_pty_write_all(&s->pty, "\x03", 1) == 0;
-        } else {
-            ok = bridge_pty_signal(&s->pty, mode == SIG_KILL_VIA_KILL ? 9 : 15) == 1;
-        }
-        if (!ok)
-            return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "SIGNAL_FAILED", "signal delivery failed; session may have died")
-                           : 0;
-
-        if (has_rid) send_ack(e, rid, rid_len);
-
-    } else if (IS("close")) {
-        const char *sid = NULL; size_t sid_len = 0;
-        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
-            return send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "close requires sessionId");
-        if (!is_valid_uuid(sid, sid_len))
-            return send_error(e, NULL, 0, NULL, 0, "INVALID_SESSION_ID", "sessionId must be a UUID");
-        session_t *s = find_session(e, sid, sid_len);
-        if (!s)
-            return send_error(e, sid, sid_len, NULL, 0, "SESSION_NOT_FOUND", "no session for sessionId");
-        int force = 0;
-        json_get_bool(msg, msg_len, "force", &force);
-        if (force) {
-            bridge_pty_signal(&s->pty, /*SIGKILL=*/9);
-        } else {
-            // Best-effort gentle close. EXIT will arrive via reap.
-            (void)bridge_pty_write_all(&s->pty, "exit\n", 5);
-        }
 
     } else if (IS("tool_catalog")) {
         // Server pushed the shell-command catalog; scan and reply.
@@ -954,7 +933,10 @@ static void service_sessions(edge_t *e) {
                     send_output_bytes(e, s, s->tail_buf, s->tail_len);
                     s->tail_len = 0;
                 }
-                send_step_done(e, s, /*has_code=*/1, code, /*alive=*/0, /*timedOut=*/0);
+                send_step_done(e, s, /*has_code=*/1, code, /*timedOut=*/0);
+                // Shell already exited — outer block owns the close. Clear
+                // one_shot so run_finish doesn't try to SIGKILL/close again.
+                s->one_shot = 0;
                 run_finish(s);
             }
             send_exit(e, s, code);
@@ -963,7 +945,10 @@ static void service_sessions(edge_t *e) {
         }
     }
 
-    // Per-step deadline. Don't kill the shell — just settle the RUN.
+    // Per-step deadline. Settle the RUN; for persistent sessions the shell
+    // is left alive (agent can retry on the same sessionId). One-shot
+    // sessions are torn down by run_finish() since the agent never owned
+    // the id and has no way to address them.
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
@@ -972,7 +957,7 @@ static void service_sessions(edge_t *e) {
             send_output_bytes(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
         }
-        send_step_done(e, s, /*has_code=*/0, 0, /*alive=*/1, /*timedOut=*/1);
+        send_step_done(e, s, /*has_code=*/0, 0, /*timedOut=*/1);
         run_finish(s);
     }
 
@@ -1002,7 +987,11 @@ static void service_sessions(edge_t *e) {
             send_output_bytes(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
         }
-        send_step_paused(e, s, pwd);
+        // Promote one-shot to persistent: the agent now has the minted
+        // sessionId and may resume by sending INPUT (or another RUN against
+        // this session). STEP_DONE must not tear the PTY down under it.
+        s->one_shot = 0;
+        send_step_paused(e, s, fg, pwd);
         fprintf(stderr, "RUN paused (waiting for stdin): %s fg=%ld pwd=%d\n",
                 s->run_block_id, fg, pwd);
     }
