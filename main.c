@@ -51,6 +51,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #  define memmem(h, hl, n, nl) memmem_compat((h), (hl), (n), (nl))
 #else
 #  include <poll.h>
+#  include <sys/resource.h>
 #  include <unistd.h>
 #endif
 
@@ -79,7 +80,11 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #define DEFAULT_SHELL        "/bin/sh"
 #endif
 #define BUF_SIZE             4096
-#define MAX_SESSIONS         16
+// Soft cap on concurrent PTYs. Overridable at runtime via BRIDGE_MAX_SESSIONS;
+// see `g_max_sessions` and `resolve_max_sessions()`. Each slot is ~4.5 KB in
+// the bridge plus one shell process + PTY pair in the kernel — the real
+// ceiling is the fd limit (see `bump_fd_limit()`), not RAM.
+#define DEFAULT_MAX_SESSIONS 256
 #define SESSION_ID_LEN       36
 #define BLOCK_ID_CAP         64
 #define MAX_MSG              (64 * 1024)
@@ -129,9 +134,9 @@ typedef struct {
     // could be the start of a sentinel split across read() chunks.
     uint8_t tail_buf[TAIL_CAP];
     size_t  tail_len;
-    // Idle-GC: monotonic ms of last activity (spawn / INPUT / OUTPUT / STEP_DONE).
-    // Sessions in SESS_IDLE that go quiet for IDLE_TIMEOUT_MS are SIGKILL'd to
-    // free the slot. SESS_RUNNING sessions are exempt — they have deadline_ms.
+    // Monotonic ms of last activity (spawn / INPUT / OUTPUT / STEP_DONE).
+    // Used as LRU key when evicting an idle session to make room for a new
+    // RUN once the array is full. SESS_RUNNING sessions are never evicted.
     int64_t last_active_ms;
     // Pause detection (RUN only): poll the wchan probe every PAUSE_POLL_MS
     // and emit STEP_PAUSED once `blocked` is observed PAUSE_CONFIRM_TICKS
@@ -159,10 +164,6 @@ typedef struct {
 // unaffected (still ~500ms after the wrapped command's last byte).
 #define INPUT_GRACE_MS       500
 
-// 30 min — see Phase 3 step 6. Picked to outlive a typical agent step but
-// reclaim slots when an agent crashes / forgets to CLOSE.
-#define IDLE_TIMEOUT_MS (30 * 60 * 1000)
-
 typedef struct {
     ws_t ws;
     noise_ws_t noise;
@@ -185,11 +186,15 @@ typedef struct {
     char     close_reason[128];
     char     err_msg[160];
 
-    session_t sessions[MAX_SESSIONS];
+    session_t *sessions;     // heap, length = g_max_sessions
     uint8_t  pty_buf[BUF_SIZE];
     char     b64_buf[BUF_SIZE * 2];
     uint8_t  msg_buf[MAX_MSG];
 } edge_t;
+
+// Runtime cap, set once in main() before edge_t is allocated. All loops over
+// sessions use this; never read directly before main() resolves it.
+static int g_max_sessions = DEFAULT_MAX_SESSIONS;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -280,7 +285,7 @@ static int is_valid_id(const char *s, size_t len) {
 }
 
 static session_t *find_session(edge_t *e, const char *sid, size_t sid_len) {
-    for (int i = 0; i < MAX_SESSIONS; i++) {
+    for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (s->active && strlen(s->session_id) == sid_len &&
             memcmp(s->session_id, sid, sid_len) == 0) {
@@ -291,10 +296,36 @@ static session_t *find_session(edge_t *e, const char *sid, size_t sid_len) {
 }
 
 static session_t *free_slot(edge_t *e) {
-    for (int i = 0; i < MAX_SESSIONS; i++) {
+    for (int i = 0; i < g_max_sessions; i++) {
         if (!e->sessions[i].active) return &e->sessions[i];
     }
     return NULL;
+}
+
+// Forward decls used by evict_lru_idle().
+static void send_exit(edge_t *e, session_t *s, int code);
+
+// LRU eviction: when the array is full and a RUN needs a slot, SIGKILL the
+// oldest SESS_IDLE session and reclaim it synchronously. SESS_RUNNING is
+// never evicted — there's an in-flight step the backend is awaiting.
+// Returns the reclaimed slot, or NULL if every slot is busy.
+static session_t *evict_lru_idle(edge_t *e) {
+    session_t *victim = NULL;
+    for (int i = 0; i < g_max_sessions; i++) {
+        session_t *s = &e->sessions[i];
+        if (!s->active || s->state == SESS_RUNNING) continue;
+        if (!victim || s->last_active_ms < victim->last_active_ms) victim = s;
+    }
+    if (!victim) return NULL;
+    fprintf(stderr, "LRU evict: killing %s (idle %lld ms)\n",
+            victim->session_id, (long long)(monotonic_ms() - victim->last_active_ms));
+    bridge_pty_signal(&victim->pty, /*SIGKILL=*/9);
+    // Surface EXIT so the backend can drop its mapping. Synchronous close
+    // here (rather than waiting for reap) keeps the slot allocator simple.
+    send_exit(e, victim, -9);
+    bridge_pty_close(&victim->pty);
+    victim->active = 0;
+    return victim;
 }
 
 static int send_json(edge_t *e, const char *s, size_t n) {
@@ -454,7 +485,8 @@ static void run_finish(session_t *s) {
     s->run_block_id[0] = '\0';
     s->sentinel_len = 0;
     s->pause_consec_ticks = 0;
-    // Idle-GC: command just finished; restart the idle timer from now.
+    // LRU: command just finished; refresh the activity stamp so this session
+    // is the most-recently-used.
     s->last_active_ms = monotonic_ms();
 }
 
@@ -618,7 +650,15 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         int is_new = (sid_len == 3 && memcmp(sid, "new", 3) == 0);
         if (is_new) {
             s = free_slot(e);
-            if (!s) { free(cmd); return send_error(e, NULL, 0, bid, bid_len, "MAX_SESSIONS", "max 16 concurrent sessions"); }
+            // Array full: evict the LRU idle session to make room. Only RUN
+            // sessions (which have an in-flight step) are protected.
+            if (!s) s = evict_lru_idle(e);
+            if (!s) {
+                free(cmd);
+                char errmsg[64];
+                snprintf(errmsg, sizeof errmsg, "all %d sessions busy", g_max_sessions);
+                return send_error(e, NULL, 0, bid, bid_len, "MAX_SESSIONS", errmsg);
+            }
             // Paths can legitimately contain JSON-escaped bytes; decode properly.
             char cwd_buf[1024]; cwd_buf[0] = '\0'; size_t cwd_len = 0;
             int has_cwd = json_get_str_decoded(msg, msg_len, "cwd", cwd_buf, sizeof(cwd_buf), &cwd_len);
@@ -894,15 +934,17 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 
-// Per-tick session servicing: reap, deadline, pause-probe, idle-GC, PTY drain.
-// PTY master fds are non-blocking (set by bridge_pty_spawn), so reads here
-// return 0 immediately when no data is available.
+// Per-tick session servicing: reap, deadline, pause-probe, PTY drain. PTY
+// master fds are non-blocking (set by bridge_pty_spawn), so reads here
+// return 0 immediately when no data is available. Idle sessions live
+// forever — slot pressure is handled lazily via LRU eviction on the next
+// RUN (see evict_lru_idle()).
 static void service_sessions(edge_t *e) {
     int64_t now = monotonic_ms();
 
     // Reap exited shells; if a step was in flight, surface STEP_DONE first
     // so the backend's pending RUN promise settles cleanly.
-    for (int i = 0; i < MAX_SESSIONS; i++) {
+    for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active) continue;
         int code;
@@ -922,7 +964,7 @@ static void service_sessions(edge_t *e) {
     }
 
     // Per-step deadline. Don't kill the shell — just settle the RUN.
-    for (int i = 0; i < MAX_SESSIONS; i++) {
+    for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
         if (now < s->deadline_ms) continue;
@@ -938,7 +980,7 @@ static void service_sessions(edge_t *e) {
     // STEP_PAUSED once `blocked` has been observed PAUSE_CONFIRM_TICKS times
     // in a row. A single non-blocked tick (e.g. process resumed, or it was a
     // transient pipe_read between bytes) resets the counter.
-    for (int i = 0; i < MAX_SESSIONS; i++) {
+    for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active || s->state != SESS_RUNNING) continue;
         if (now - s->last_pause_poll_ms < PAUSE_POLL_MS) continue;
@@ -965,19 +1007,8 @@ static void service_sessions(edge_t *e) {
                 s->run_block_id, fg, pwd);
     }
 
-    // Idle-session GC.
-    for (int i = 0; i < MAX_SESSIONS; i++) {
-        session_t *s = &e->sessions[i];
-        if (!s->active || s->state == SESS_RUNNING) continue;
-        if (now - s->last_active_ms < IDLE_TIMEOUT_MS) continue;
-        fprintf(stderr, "Idle GC: killing %s (idle %lld ms)\n",
-                s->session_id, (long long)(now - s->last_active_ms));
-        bridge_pty_signal(&s->pty, /*SIGKILL=*/9);
-        s->last_active_ms = now;
-    }
-
     // Drain PTY masters (non-blocking; returns 0 on EAGAIN).
-    for (int i = 0; i < MAX_SESSIONS; i++) {
+    for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (s->active) forward_pty_output(e, s);
     }
@@ -1101,6 +1132,37 @@ static int parse_pubkey_hex(const char *hex, uint8_t out[32]) {
     return 0;
 }
 
+// Resolve concurrent-session cap from BRIDGE_MAX_SESSIONS, clamped to a
+// sane range. Intentionally undocumented in --help; tune for heavy users.
+static int resolve_max_sessions(void) {
+    const char *s = getenv("BRIDGE_MAX_SESSIONS");
+    if (!s || !*s) return DEFAULT_MAX_SESSIONS;
+    int v = atoi(s);
+    if (v < 1) v = 1;
+    if (v > 4096) v = 4096;  // hard upper bound — fd/RAM ceiling well before this
+    return v;
+}
+
+// Best-effort: raise RLIMIT_NOFILE's soft limit toward `want` (capped at the
+// hard limit). Any process is allowed to do this without privileges; only
+// raising the hard limit needs CAP_SYS_RESOURCE. Failure is logged but not
+// fatal — the existing limit may already be sufficient.
+static void bump_fd_limit(int want) {
+#ifndef _WIN32
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return;
+    rlim_t target = (rlim_t)want;
+    if (rl.rlim_cur >= target) return;
+    rlim_t cap = rl.rlim_max == RLIM_INFINITY ? target : rl.rlim_max;
+    rl.rlim_cur = target < cap ? target : cap;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0)
+        fprintf(stderr, "warn: could not raise RLIMIT_NOFILE to %d (have %lu): %s\n",
+                want, (unsigned long)rl.rlim_cur, strerror(errno));
+#else
+    (void)want;
+#endif
+}
+
 int main(int argc, char **argv) {
     // If a new binary was staged next to us (by a prior `exec` update command),
     // swap it in before we do anything else. See update.h.
@@ -1199,13 +1261,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Connecting to %s:%u (device: %.8s…) ...\n",
             host, (unsigned)port, saved_creds.device_id);
 
+    g_max_sessions = resolve_max_sessions();
+    // Each session needs a master fd + a few transient pipes in the child
+    // spawn path. Add headroom for the bridge's own fds (ws, stdio, etc.).
+    bump_fd_limit(g_max_sessions + 64);
+
     edge_t *e = calloc(1, sizeof(*e));
     if (!e) return 1;
+    e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
+    if (!e->sessions) { free(e); return 1; }
 
     int rc = run(e, saved_creds.device_id, saved_creds.device_secret,
                  host, port, DEFAULT_PATH, server_pubkey);
 
-    for (int i = 0; i < MAX_SESSIONS; i++) {
+    for (int i = 0; i < g_max_sessions; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
     }
 
@@ -1234,6 +1303,7 @@ int main(int argc, char **argv) {
                     "  port (14100/4100) used by `login`/`enroll`. Or re-run `todoforai-bridge login`.\n");
         }
     }
+    free(e->sessions);
     free(e);
     return rc == 0 ? 0 : 1;
 }

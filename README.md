@@ -149,7 +149,8 @@ No new protocol messages, no in-binary HTTP client, no extra dependencies.
   `step_paused` works on Linux, macOS, and Windows; on Windows the
   `passwordPrompt` flag is always 0 (the child's ECHO state isn't exposed
   through the ConPTY API).
-- Session limit is 16 concurrent PTYs (`MAX_SESSIONS` in `main.c`).
+- Session cap defaults to 256 concurrent PTYs. When full, RUNs evict the
+  least-recently-used idle session (running sessions are never evicted).
 - WebSocket uses plain `ws://` — TLS is replaced by Noise end-to-end.
   Typically deployed behind nginx/Cloudflare which terminates external
   TLS on 443 and forwards plain WS to the backend; the Noise channel
