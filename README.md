@@ -51,7 +51,7 @@ Server side: `backend/src/api/ws/handlers/BridgeHandler.ts`.
 | `util.c` / `util.h`   | Base64 + SHA-1 (for WS-Accept)                      |
 | `pty.c` / `pty.h`     | `forkpty` session: read/write/resize/signal         |
 | `identity.c` / `.h`   | Host identity gathering (`uname`, `pwd`, cwd)       |
-| `tools.c` / `.h`      | Probe installed CLI tools, emit `installed_tools`   |
+| `tools.c` / `.h`      | Probe installed CLI tools via `scan_tools` function-call |
 | `update.c` / `.h`     | Self-update: startup swap of staged `<exe>.new`     |
 | `ws.c` / `ws.h`       | RFC 6455 WebSocket client (sync connect, poll loop) |
 | `json.c` / `json.h`   | Minimal JSON parser/writer + base64                 |

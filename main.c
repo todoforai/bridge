@@ -19,6 +19,11 @@
 //     → {"type":"ack","requestId":"..."}                            // success reply for input
 //     → {"type":"exit","sessionId":"uuid","blockId":"...","code":N}
 //     ↔ {"type":"error","sessionId":"uuid","blockId":"...","code":"ERR","message":"..."}
+//   Payload-wrapped (generic function dispatch, shared with agent↔edge):
+//     ← {"type":"FUNCTION_CALL_REQUEST_AGENT","payload":{"requestId","functionName","args",...}}
+//     → {"type":"FUNCTION_CALL_RESULT_AGENT","payload":{"requestId","success","result"|"error",...}}
+//   Bridge implements one function today: `scan_tools` (args.entries =
+//   "<key>\t<b64_versionCmd>\t<b64_statusCmd>\n..."; result = installed-tools dict).
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -410,9 +415,13 @@ static int send_function_call_result(edge_t *e,
                                      const char *aid, size_t aid_len,
                                      const char *eid, size_t eid_len,
                                      const char *result_obj, size_t result_len) {
-    char *buf = malloc(result_len + 512);
+    // Envelope ≈ 80 bytes of literal JSON + each ID up to 6× expansion via
+    // \uXXXX (control bytes). IDs come unvalidated from agent-controlled
+    // payload so be generous.
+    size_t cap = result_len + (rid_len + aid_len + eid_len) * 6 + 128;
+    char *buf = malloc(cap);
     if (!buf) return -1;
-    size_t cap = result_len + 512, u = 0;
+    size_t u = 0;
     int ok =
         json_emit_raw(buf, cap, &u, "{", 1) == 0 &&
         jfield_str(buf, cap, &u, "type", "FUNCTION_CALL_RESULT_AGENT", -1, 0) == 0 &&
@@ -948,39 +957,28 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         json_get_obj(payload, payload_len, "args", &args, &args_len);
 
         if (fn_len == 10 && memcmp(fn, "scan_tools", 10) == 0) {
-            // args = {"entries": "<line-oriented base64 catalog>"}
-            const char *entries = NULL; size_t entries_len = 0;
-            if (!args || !json_get_str(args, args_len, "entries", &entries, &entries_len)) {
+            // args = {"entries": "<line-oriented base64 catalog>"}.
+            // json_get_str_decoded works on any object substring, so we can
+            // call it directly on the nested `args` range (with proper
+            // \t/\n/\"/\\ unescape, incl. \uXXXX).
+            const char *raw = NULL; size_t raw_len = 0;
+            if (!args || !json_get_str(args, args_len, "entries", &raw, &raw_len)) {
                 send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
                                          "scan_tools requires args.entries");
                 return 0;
             }
-
-            // Unescape JSON \t, \n, \\, \" in place (we own a decoded copy).
-            char *buf = malloc(entries_len + 1);
+            char *buf = malloc(raw_len + 1);
             if (!buf) {
                 send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, "out of memory");
                 return 0;
             }
-            size_t w = 0;
-            for (size_t i = 0; i < entries_len; i++) {
-                char c = entries[i];
-                if (c == '\\' && i + 1 < entries_len) {
-                    char nc = entries[++i];
-                    switch (nc) {
-                        case 't':  buf[w++] = '\t'; break;
-                        case 'n':  buf[w++] = '\n'; break;
-                        case 'r':  buf[w++] = '\r'; break;
-                        case '\\': buf[w++] = '\\'; break;
-                        case '"':  buf[w++] = '"';  break;
-                        case '/':  buf[w++] = '/';  break;
-                        default:   buf[w++] = nc;   break;
-                    }
-                } else {
-                    buf[w++] = c;
-                }
+            size_t entries_len = 0;
+            if (!json_get_str_decoded(args, args_len, "entries", buf, raw_len + 1, &entries_len)) {
+                free(buf);
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                         "scan_tools: malformed args.entries");
+                return 0;
             }
-            buf[w] = '\0';
 
             char *result = malloc(MAX_MSG);
             if (!result) {
@@ -989,7 +987,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 return 0;
             }
             bridge_scan_stats_t stats;
-            int n = bridge_scan_tools(buf, w, result, MAX_MSG, &stats);
+            int n = bridge_scan_tools(buf, entries_len, result, MAX_MSG, &stats);
             free(buf);
             if (n > 0) {
                 send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)n);

@@ -1,8 +1,8 @@
 // Scan server-pushed tool catalog: run each tool's versionCmd + statusCmd,
-// collect results, emit an `installed_tools` message.
+// collect results, emit a JSON object keyed by tool name.
 //
-// Runs once per `tool_catalog` message (typically on connect). To refresh
-// after install/uninstall the server can re-send the catalog.
+// Triggered by a `scan_tools` FUNCTION_CALL_REQUEST_AGENT (typically on
+// connect). To refresh after install/uninstall the server can re-issue the call.
 #ifndef BRIDGE_TOOLS_H
 #define BRIDGE_TOOLS_H
 

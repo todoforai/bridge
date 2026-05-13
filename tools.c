@@ -1,6 +1,6 @@
 // bridge_scan_tools: run each catalog entry's versionCmd + statusCmd via
 // `sh -c`, collect {installed, version, statusOutput, authenticated}, emit a
-// single `installed_tools` JSON message. Per-command timeout.
+// single JSON object keyed by tool name. Per-command timeout.
 //
 // Simplicity rules:
 //   - shell does the heavy lifting (every cmd is already `sh -c`-ready)
