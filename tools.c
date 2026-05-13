@@ -416,17 +416,9 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
     }
 #endif
 
-    // Assemble JSON in catalog order.
+    // Assemble JSON object (just the {<key>:{...},...} dict, no envelope).
     size_t used = 0;
-    int hdr_ok =
-        json_emit_raw(out, out_cap, &used, "{", 1) == 0 &&
-        json_emit_str(out, out_cap, &used, "type", -1) == 0 &&
-        json_emit_raw(out, out_cap, &used, ":", 1) == 0 &&
-        json_emit_str(out, out_cap, &used, "installed_tools", -1) == 0 &&
-        json_emit_raw(out, out_cap, &used, ",", 1) == 0 &&
-        json_emit_str(out, out_cap, &used, "data", -1) == 0 &&
-        json_emit_raw(out, out_cap, &used, ":{", 2) == 0;
-    if (!hdr_ok) { free(probes); return -1; }
+    if (json_emit_raw(out, out_cap, &used, "{", 1) < 0) { free(probes); return -1; }
 
     for (int i = 0; i < n; i++) {
         probe_t *p = &probes[i];
@@ -440,7 +432,7 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
     }
 
     free(probes);
-    if (json_emit_raw(out, out_cap, &used, "}}", 2) < 0) return -1;
+    if (json_emit_raw(out, out_cap, &used, "}", 1) < 0) return -1;
     if (used >= out_cap) return -1;
     out[used] = '\0';
     return (int)used;

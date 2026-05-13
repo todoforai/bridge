@@ -175,6 +175,13 @@ int json_get_str(const char *buf, size_t len, const char *key,
     return t == JT_STR;
 }
 
+int json_get_obj(const char *buf, size_t len, const char *key,
+                 const char **out, size_t *out_len) {
+    json_type_t t;
+    if (!json_find(buf, len, key, &t, out, out_len)) return 0;
+    return t == JT_OBJ;
+}
+
 int json_get_bool(const char *buf, size_t len, const char *key, int *out) {
     json_type_t t; const char *vp; size_t vl;
     if (!json_find(buf, len, key, &t, &vp, &vl)) return 0;

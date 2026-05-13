@@ -37,6 +37,12 @@ int json_get_str(const char *buf, size_t len, const char *key,
 int json_get_str_decoded(const char *buf, size_t len, const char *key,
                          char *dst, size_t cap, size_t *out_len);
 
+// Look up `key` and require its value to be an object. *out spans the raw
+// `{...}` bytes (inclusive of braces), suitable for re-parsing with json_get_*.
+// Returns 1 on found-and-object, 0 otherwise.
+int json_get_obj(const char *buf, size_t len, const char *key,
+                 const char **out, size_t *out_len);
+
 int json_get_bool(const char *buf, size_t len, const char *key, int *out);
 int json_get_long(const char *buf, size_t len, const char *key, long *out);
 

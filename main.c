@@ -8,17 +8,15 @@
 //   `sessionId`). It has no notion of TODOs — that mapping lives in the
 //   backend. `blockId` rides on RUN frames as an RPC correlation key.
 //   A RUN without `sessionId` is one-shot: the PTY auto-closes on STEP_DONE
-//   (unless STEP_PAUSED upgraded it to a persistent session).
+//   (unless STEP_AWAITING_INPUT upgraded it to a persistent session).
 //     → {"type":"identity","data":{...}}
 //     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
-//     → {"type":"run_started","sessionId":"uuid","blockId":"...","created":bool}
+//     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
-//     → {"type":"step_paused","sessionId":"uuid","blockId":"...","passwordPrompt":bool}
-//     → {"type":"step_done","sessionId":"uuid","blockId":"...","exitCode":N|null,"timedOut":bool}
-//     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"..."}   // resumes paused RUN
-//     ← {"type":"signal","sessionId":"uuid","signal":"SIGINT|SIGTERM|SIGKILL","requestId":"..."}
-//     → {"type":"ack","requestId":"..."}                            // success reply for input/signal
-//     ← {"type":"close","sessionId":"uuid","force":bool}
+//     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"fgPid":N,"passwordPrompt":bool}
+//     → {"type":"step_done","sessionId":"uuid","blockId":"...","shellPid":N,"exitCode":N|null,"timedOut":bool}
+//     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"..."}   // resumes a step waiting on stdin
+//     → {"type":"ack","requestId":"..."}                            // success reply for input
 //     → {"type":"exit","sessionId":"uuid","blockId":"...","code":N}
 //     ↔ {"type":"error","sessionId":"uuid","blockId":"...","code":"ERR","message":"..."}
 
@@ -118,7 +116,7 @@ typedef struct {
     bridge_pty_t pty;
     // One-shot: the RUN that spawned this session omitted `sessionId`, so
     // the bridge owns lifecycle and will close the PTY on STEP_DONE. Cleared
-    // if the run pauses (STEP_PAUSED) — at that point the agent has the
+    // if the run hits STEP_AWAITING_INPUT — at that point the agent has the
     // minted sessionId and the session becomes persistent for resume.
     int one_shot;
 
@@ -146,10 +144,11 @@ typedef struct {
     // Used as LRU key when evicting an idle session to make room for a new
     // RUN once the array is full. SESS_RUNNING sessions are never evicted.
     int64_t last_active_ms;
-    // Pause detection (RUN only): poll the wchan probe every PAUSE_POLL_MS
-    // and emit STEP_PAUSED once `blocked` is observed PAUSE_CONFIRM_TICKS
-    // times in a row. Any non-blocked tick resets the counter, so resumption
-    // (input arrived → process leaves n_tty_read) is detected implicitly.
+    // Awaiting-input detection (RUN only): poll the wchan probe every
+    // PAUSE_POLL_MS and emit STEP_AWAITING_INPUT once `blocked` is observed
+    // PAUSE_CONFIRM_TICKS times in a row. Any non-blocked tick resets the
+    // counter, so resumption (input arrived → process leaves n_tty_read) is
+    // detected implicitly.
     int64_t last_pause_poll_ms;
     int     pause_consec_ticks;
     // Monotonic ms stamp set AFTER bridge_pty_write_all returns (RUN cmd or
@@ -402,6 +401,54 @@ static int send_ack(edge_t *e, const char *rid, size_t rid_len) {
     return send_json(e, buf, u);
 }
 
+// Emit a FUNCTION_CALL_RESULT_AGENT frame. `result_obj` is a pre-built JSON
+// value (object/array/string/number/bool/null) — inlined verbatim into the
+// `result` field. Payload-wrapped to match the agent↔edge function-call
+// envelope (the only payload-wrapped frame the bridge produces).
+static int send_function_call_result(edge_t *e,
+                                     const char *rid, size_t rid_len,
+                                     const char *aid, size_t aid_len,
+                                     const char *eid, size_t eid_len,
+                                     const char *result_obj, size_t result_len) {
+    char *buf = malloc(result_len + 512);
+    if (!buf) return -1;
+    size_t cap = result_len + 512, u = 0;
+    int ok =
+        json_emit_raw(buf, cap, &u, "{", 1) == 0 &&
+        jfield_str(buf, cap, &u, "type", "FUNCTION_CALL_RESULT_AGENT", -1, 0) == 0 &&
+        json_emit_raw(buf, cap, &u, ",\"payload\":{", 12) == 0 &&
+        jfield_str(buf, cap, &u, "requestId", rid, (long)rid_len, 0) == 0 &&
+        (aid_len > 0 ? jfield_str(buf, cap, &u, "agentId", aid, (long)aid_len, 1) : 0) == 0 &&
+        (eid_len > 0 ? jfield_str(buf, cap, &u, "edgeId", eid, (long)eid_len, 1) : 0) == 0 &&
+        json_emit_raw(buf, cap, &u, ",\"success\":true,\"result\":", 25) == 0 &&
+        json_emit_raw(buf, cap, &u, result_obj, result_len) == 0 &&
+        json_emit_raw(buf, cap, &u, "}}", 2) == 0;
+    if (ok) send_json(e, buf, u);
+    free(buf);
+    return ok ? 0 : -1;
+}
+
+static int send_function_call_error(edge_t *e,
+                                    const char *rid, size_t rid_len,
+                                    const char *aid, size_t aid_len,
+                                    const char *eid, size_t eid_len,
+                                    const char *message) {
+    char buf[1024]; size_t u = 0;
+    int ok =
+        json_emit_raw(buf, sizeof buf, &u, "{", 1) == 0 &&
+        jfield_str(buf, sizeof buf, &u, "type", "FUNCTION_CALL_RESULT_AGENT", -1, 0) == 0 &&
+        json_emit_raw(buf, sizeof buf, &u, ",\"payload\":{", 12) == 0 &&
+        jfield_str(buf, sizeof buf, &u, "requestId", rid, (long)rid_len, 0) == 0 &&
+        (aid_len > 0 ? jfield_str(buf, sizeof buf, &u, "agentId", aid, (long)aid_len, 1) : 0) == 0 &&
+        (eid_len > 0 ? jfield_str(buf, sizeof buf, &u, "edgeId", eid, (long)eid_len, 1) : 0) == 0 &&
+        json_emit_raw(buf, sizeof buf, &u, ",\"success\":false,", 17) == 0 &&
+        jfield_str(buf, sizeof buf, &u, "error", message, -1, 0) == 0 &&
+        json_emit_raw(buf, sizeof buf, &u, "}}", 2) == 0;
+    if (ok) send_json(e, buf, u);
+    fprintf(stderr, "function_call_error: %s\n", message);
+    return ok ? 0 : -1;
+}
+
 static void send_exit(edge_t *e, session_t *s, int code) {
     char buf[384]; size_t u = 0;
     char code_buf[32]; snprintf(code_buf, sizeof code_buf, "%d", code);
@@ -477,17 +524,18 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
     send_json(e, buf, u);
 }
 
-// Bridge → server: "command is blocked waiting for stdin". The PTY stays
-// alive and the RUN stays in flight; backend resolves the pending RUN promise
-// with `paused:true` so the agent gets the prompt text and can resume by
+// Bridge → server: "the step's foreground process is blocked in a tty read,
+// waiting for stdin". The shell itself is alive (not SIGSTOP'd) and the RUN
+// stays in flight — backend resolves the pending RUN promise with
+// `awaitingInput:true` so the agent gets the prompt text and can resume by
 // sending INPUT on the same sessionId.
 // `passwordPrompt` is true when the slave has ECHO disabled (sudo/getpass/ssh).
-static void send_step_paused(edge_t *e, session_t *s, long fg_pid, int password_prompt) {
+static void send_step_awaiting_input(edge_t *e, session_t *s, long fg_pid, int password_prompt) {
     char buf[512]; size_t u = 0;
     char shell_pid_buf[24]; snprintf(shell_pid_buf, sizeof shell_pid_buf, "%ld", SHELL_PID(s));
     char fg_pid_buf[24]; snprintf(fg_pid_buf, sizeof fg_pid_buf, "%ld", fg_pid);
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
-        jfield_str(buf, sizeof buf, &u, "type", "step_paused", -1, 0) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "step_awaiting_input", -1, 0) < 0 ||
         jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
         emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
@@ -503,8 +551,8 @@ static void send_step_paused(edge_t *e, session_t *s, long fg_pid, int password_
 //
 // One-shot sessions (spawned by a RUN with no `sessionId`) are torn down
 // here: the agent never asked for a persistent session, so the slot is
-// reclaimed eagerly. If the run paused mid-step, `one_shot` was cleared on
-// STEP_PAUSED — the session has been "promoted" and survives this finish.
+// reclaimed eagerly. If the run hit STEP_AWAITING_INPUT mid-step, `one_shot`
+// was cleared there — the session has been "promoted" and survives this finish.
 static void run_finish(session_t *s) {
     s->state = SESS_IDLE;
     s->tail_len = 0;
@@ -670,7 +718,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
         // Required fields: blockId, cmdB64. `sessionId` is optional — when
         // absent, the bridge spawns a one-shot PTY and auto-closes it on
-        // STEP_DONE (kept alive only if STEP_PAUSED fires first).
+        // STEP_DONE (kept alive only if STEP_AWAITING_INPUT fires first).
         const char *sid = NULL; size_t sid_len = 0;
         int has_sid = json_get_str(msg, msg_len, "sessionId", &sid, &sid_len) && sid_len > 0;
         if (!has_bid || bid_len == 0)
@@ -774,7 +822,13 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (timeout_ms > 365LL * 24 * 60 * 60 * 1000) timeout_ms = 365LL * 24 * 60 * 60 * 1000;
         s->deadline_ms = timeout_ms > 0 ? monotonic_ms() + timeout_ms : 0;
 
-        // Wrapper: brace-group tolerates trailing operators in user input;
+        // Wrapper: run the user cmd inside a brace group so we can capture
+        // its exit status ($?) and emit a per-step sentinel line afterwards.
+        // Assumes `cmd` is syntactically complete shell input: trailing
+        // operators (&&, ||, |), unterminated quotes, or unclosed heredocs
+        // leave the shell waiting for more input — the sentinel never runs
+        // and the step will fail via timeout. Background jobs (cmd &) cause
+        // the sentinel to fire when the job is *launched*, not when it ends.
         // printf with explicit \n on both sides makes the sentinel its own line.
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + 64;
         char *wrapped = malloc(wrapped_cap);
@@ -815,7 +869,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         #undef RUN_FAIL_CLEANUP
 
     } else if (IS("input")) {
-        // Forward raw stdin bytes — used to resume a paused RUN. The bridge
+        // Forward raw stdin bytes — used to resume a RUN awaiting input. The bridge
         // doesn't track which RUN consumes the bytes; the PTY/kernel/shell do.
         // Optional `requestId` is echoed via ACK on success or ERROR on failure
         // so the caller can correlate (e.g. "session already died").
@@ -864,47 +918,95 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
         if (has_rid) send_ack(e, rid, rid_len);
 
-    } else if (IS("tool_catalog")) {
-        // Server pushed the shell-command catalog; scan and reply.
-        const char *entries = NULL; size_t entries_len = 0;
-        if (!json_get_str(msg, msg_len, "entries", &entries, &entries_len)) return 0;
+    } else if (IS("FUNCTION_CALL_REQUEST_AGENT")) {
+        // Generic agent→edge function dispatch. Envelope is payload-wrapped
+        // unlike all other bridge frames:
+        //   {"type":"FUNCTION_CALL_REQUEST_AGENT",
+        //    "payload":{"requestId":"...","agentId":"...","edgeId":"...",
+        //               "functionName":"scan_tools","args":{...}}}
+        const char *payload = NULL; size_t payload_len = 0;
+        if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len))
+            return send_error(e, NULL, 0, NULL, 0, "MISSING_PAYLOAD",
+                              "FUNCTION_CALL_REQUEST_AGENT requires payload object");
 
-        // Unescape JSON \t, \n, \\, \" in place (we own a decoded copy).
-        char *buf = malloc(entries_len + 1);
-        if (!buf) return 0;
-        size_t w = 0;
-        for (size_t i = 0; i < entries_len; i++) {
-            char c = entries[i];
-            if (c == '\\' && i + 1 < entries_len) {
-                char n = entries[++i];
-                switch (n) {
-                    case 't':  buf[w++] = '\t'; break;
-                    case 'n':  buf[w++] = '\n'; break;
-                    case 'r':  buf[w++] = '\r'; break;
-                    case '\\': buf[w++] = '\\'; break;
-                    case '"':  buf[w++] = '"';  break;
-                    case '/':  buf[w++] = '/';  break;
-                    default:   buf[w++] = n;    break;
-                }
-            } else {
-                buf[w++] = c;
+        const char *req = NULL; size_t req_len = 0;
+        if (!json_get_str(payload, payload_len, "requestId", &req, &req_len) || req_len == 0)
+            return send_error(e, NULL, 0, NULL, 0, "MISSING_REQUEST_ID",
+                              "FUNCTION_CALL_REQUEST_AGENT requires requestId");
+
+        const char *aid = NULL; size_t aid_len = 0;
+        json_get_str(payload, payload_len, "agentId", &aid, &aid_len);
+        const char *eid = NULL; size_t eid_len = 0;
+        json_get_str(payload, payload_len, "edgeId", &eid, &eid_len);
+
+        const char *fn = NULL; size_t fn_len = 0;
+        if (!json_get_str(payload, payload_len, "functionName", &fn, &fn_len))
+            return send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                            "FUNCTION_CALL_REQUEST_AGENT requires functionName");
+
+        const char *args = NULL; size_t args_len = 0;
+        json_get_obj(payload, payload_len, "args", &args, &args_len);
+
+        if (fn_len == 10 && memcmp(fn, "scan_tools", 10) == 0) {
+            // args = {"entries": "<line-oriented base64 catalog>"}
+            const char *entries = NULL; size_t entries_len = 0;
+            if (!args || !json_get_str(args, args_len, "entries", &entries, &entries_len)) {
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                         "scan_tools requires args.entries");
+                return 0;
             }
-        }
-        buf[w] = '\0';
 
-        char *out = malloc(MAX_MSG);
-        if (!out) { free(buf); return 0; }
-        bridge_scan_stats_t stats;
-        int n = bridge_scan_tools(buf, w, out, MAX_MSG, &stats);
-        if (n > 0) {
-            send_json(e, out, (size_t)n);
-            fprintf(stderr, "✓ Probed CLI tools: %d installed, %d authenticated\n",
-                    stats.installed, stats.authenticated);
+            // Unescape JSON \t, \n, \\, \" in place (we own a decoded copy).
+            char *buf = malloc(entries_len + 1);
+            if (!buf) {
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, "out of memory");
+                return 0;
+            }
+            size_t w = 0;
+            for (size_t i = 0; i < entries_len; i++) {
+                char c = entries[i];
+                if (c == '\\' && i + 1 < entries_len) {
+                    char nc = entries[++i];
+                    switch (nc) {
+                        case 't':  buf[w++] = '\t'; break;
+                        case 'n':  buf[w++] = '\n'; break;
+                        case 'r':  buf[w++] = '\r'; break;
+                        case '\\': buf[w++] = '\\'; break;
+                        case '"':  buf[w++] = '"';  break;
+                        case '/':  buf[w++] = '/';  break;
+                        default:   buf[w++] = nc;   break;
+                    }
+                } else {
+                    buf[w++] = c;
+                }
+            }
+            buf[w] = '\0';
+
+            char *result = malloc(MAX_MSG);
+            if (!result) {
+                free(buf);
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, "out of memory");
+                return 0;
+            }
+            bridge_scan_stats_t stats;
+            int n = bridge_scan_tools(buf, w, result, MAX_MSG, &stats);
+            free(buf);
+            if (n > 0) {
+                send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)n);
+                fprintf(stderr, "✓ Probed CLI tools: %d installed, %d authenticated\n",
+                        stats.installed, stats.authenticated);
+            } else {
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                         "scan_tools failed (overflow or empty catalog)");
+                fprintf(stderr, "CLI tool probe failed (overflow or empty)\n");
+            }
+            free(result);
         } else {
-            fprintf(stderr, "CLI tool probe failed (overflow or empty)\n");
+            char errmsg[128];
+            snprintf(errmsg, sizeof errmsg, "Unknown function: %.*s. Available: scan_tools",
+                     (int)fn_len, fn);
+            send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
-        free(out);
-        free(buf);
     }
 
     #undef IS
@@ -961,10 +1063,11 @@ static void service_sessions(edge_t *e) {
         run_finish(s);
     }
 
-    // Pause detection: poll the wchan probe at PAUSE_POLL_MS cadence; emit
-    // STEP_PAUSED once `blocked` has been observed PAUSE_CONFIRM_TICKS times
-    // in a row. A single non-blocked tick (e.g. process resumed, or it was a
-    // transient pipe_read between bytes) resets the counter.
+    // Awaiting-input detection: poll the wchan probe at PAUSE_POLL_MS
+    // cadence; emit STEP_AWAITING_INPUT once `blocked` has been observed
+    // PAUSE_CONFIRM_TICKS times in a row. A single non-blocked tick (e.g.
+    // process resumed, or it was a transient pipe_read between bytes)
+    // resets the counter.
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active || s->state != SESS_RUNNING) continue;
@@ -991,8 +1094,8 @@ static void service_sessions(edge_t *e) {
         // sessionId and may resume by sending INPUT (or another RUN against
         // this session). STEP_DONE must not tear the PTY down under it.
         s->one_shot = 0;
-        send_step_paused(e, s, fg, pwd);
-        fprintf(stderr, "RUN paused (waiting for stdin): %s fg=%ld pwd=%d\n",
+        send_step_awaiting_input(e, s, fg, pwd);
+        fprintf(stderr, "RUN awaiting input: %s fg=%ld pwd=%d\n",
                 s->run_block_id, fg, pwd);
     }
 
