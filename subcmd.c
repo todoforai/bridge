@@ -6,7 +6,6 @@
 
 #include "subcmd.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -26,24 +25,6 @@
 // intentionally omitted from help to keep the public surface minimal.
 const char *USAGE_MAIN = "";
 
-// ── Noise one-shot RPC helper (reuses transport code from login.h) ──────────
-
-// True if host is a local/dev address (uses dev-port defaults).
-// Matches localhost, IPv6 loopback, and any RFC1918 private range — covers
-// every dev/sandbox setup (10.x sandbox gateway, 172.16/12 docker, 192.168.x LAN).
-static int is_local_host(const char *h) {
-    if (!h) return 0;
-    if (strcmp(h, "localhost") == 0 || strcmp(h, "::1") == 0 || strcmp(h, "[::1]") == 0) return 1;
-    if (strncmp(h, "127.", 4) == 0)     return 1;          // 127.0.0.0/8
-    if (strncmp(h, "10.", 3)  == 0)     return 1;          // 10.0.0.0/8
-    if (strncmp(h, "192.168.", 8) == 0) return 1;          // 192.168.0.0/16
-    if (strncmp(h, "172.", 4) == 0) {                      // 172.16.0.0/12
-        int o2 = atoi(h + 4);
-        if (o2 >= 16 && o2 <= 31) return 1;
-    }
-    return 0;
-}
-
 // Resolve backend Noise addr (host:port). `host`/`port_s` may be NULL;
 // precedence: CLI flag > env (NOISE_BACKEND_HOST / _PORT) > saved login
 // backendHost > prod default.
@@ -58,80 +39,10 @@ static void resolve_backend_addr(const char *host, const char *port_s,
 
     if (!host) host = LOGIN_DEFAULT_BACKEND_HOST;
     if (!port_s) {
-        port_s = is_local_host(host) ? "14100" : LOGIN_DEFAULT_NOISE_PORT;
+        port_s = login_is_local_host(host) ? LOGIN_DEV_NOISE_PORT : LOGIN_DEFAULT_NOISE_PORT;
         fprintf(stderr, "[bridge] no port specified for host=%s, defaulting to %s (set NOISE_BACKEND_PORT or --port to override)\n", host, port_s);
     }
     snprintf(addr_buf, addr_cap, "%s:%s", host, port_s);
-}
-
-// Connect, handshake, send one encrypted JSON request, return decrypted reply.
-// Returns response length (>= 0) or -1 on error. Writes NUL-terminated JSON
-// into resp_buf (truncated to resp_cap-1 if needed). Prints actionable
-// diagnostics to stderr on TCP / handshake failures.
-//
-// pinned_pub_hex != NULL: pin (used by `enroll` — caller is already logged in).
-// pinned_pub_hex == NULL: learn-mode TOFU (used by `login --token` on a fresh
-//   machine); on success the server's static pubkey is written to
-//   `learned_pub_hex` (must point at a 65-byte buffer).
-static int noise_oneshot(const char *backend_addr, const char *pinned_pub_hex,
-                         const char *req, size_t req_len,
-                         char *resp_buf, size_t resp_cap,
-                         char *learned_pub_hex) {
-    login_sock_init();
-
-    uint8_t pinned[32];
-    const uint8_t *pin = NULL;
-    if (pinned_pub_hex) {
-        if (login_hex_decode(pinned, 32, pinned_pub_hex) < 0) {
-            fprintf(stderr, "error: stored backend pubkey is corrupt (re-run `todoforai-bridge login`)\n");
-            return -1;
-        }
-        pin = pinned;
-    }
-
-    char host[256], port_str[16];
-    const char *colon = strrchr(backend_addr, ':');
-    if (!colon) { fprintf(stderr, "error: invalid backend address (missing port): %s\n", backend_addr); return -1; }
-    size_t hlen = (size_t)(colon - backend_addr);
-    if (hlen >= sizeof(host)) { fprintf(stderr, "error: host too long\n"); return -1; }
-    memcpy(host, backend_addr, hlen);
-    host[hlen] = '\0';
-    snprintf(port_str, sizeof(port_str), "%s", colon + 1);
-
-    login_session_t session;
-    uint8_t learned[32];
-    int conn_rc = login_noise_connect(&session, host, port_str, pin,
-                                      learned_pub_hex ? learned : NULL);
-    if (conn_rc == -1) {
-        fprintf(stderr,
-            "error: cannot reach %s (TCP connect failed).\n"
-            "  - Is the backend running and listening on this host:port?\n"
-            "  - Check firewall / network. Try: nc -zv %s %s\n",
-            backend_addr, host, port_str);
-        return -1;
-    }
-    if (conn_rc < 0) {
-        fprintf(stderr,
-            "error: connected to %s but Noise handshake failed.\n"
-            "  - Server identity changed since `login` — run `todoforai-bridge login` again.\n"
-            "  - --port should be the Noise-TCP RPC port (14100 dev, 4100 prod),\n"
-            "    NOT the HTTP/WS bridge port (4000 dev, 80/443 prod).\n",
-            backend_addr);
-        return -1;
-    }
-
-    if (learned_pub_hex) login_hex_encode(learned_pub_hex, learned, 32);
-
-    uint8_t *dec = NULL;
-    int dec_len = login_noise_rpc(session.fd, &session.transport, req, req_len, &dec);
-    login_sock_close(session.fd);
-    if (dec_len < 0) { if (dec) free(dec); return -1; }
-
-    size_t copy = (size_t)dec_len < resp_cap - 1 ? (size_t)dec_len : resp_cap - 1;
-    memcpy(resp_buf, dec, copy);
-    resp_buf[copy] = '\0';
-    free(dec);
-    return (int)copy;
 }
 
 // Parse device creds out of a successful enroll.redeem / login.poll response.
@@ -193,7 +104,7 @@ static int redeem_enroll_token(const char *token, const char *device_name,
 
     char resp[LOGIN_CONFIG_MAX];
     char learned_pub[65] = {0};
-    int rn = noise_oneshot(addr_buf, NULL, req, (size_t)n, resp, sizeof(resp), learned_pub);
+    int rn = login_oneshot_rpc(addr_buf, NULL, req, (size_t)n, resp, sizeof(resp), learned_pub);
     if (rn < 0) { fprintf(stderr, "error: enroll redeem request failed\n"); return -1; }
 
     if (json_envelope_is_error(resp)) {
@@ -340,7 +251,7 @@ int cmd_enroll(int argc, char **argv) {
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: request too long\n"); return 1; }
 
     char resp[LOGIN_CONFIG_MAX];
-    int rn = noise_oneshot(addr_buf, creds.backend_pubkey, req, (size_t)n, resp, sizeof(resp), NULL);
+    int rn = login_oneshot_rpc(addr_buf, creds.backend_pubkey, req, (size_t)n, resp, sizeof(resp), NULL);
     if (rn < 0) { fprintf(stderr, "error: mint request failed\n"); return 1; }
 
     if (json_envelope_is_error(resp)) {
@@ -387,21 +298,7 @@ int cmd_logout(int argc, char **argv) {
         if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
         cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
-    char path[1024];
-    if (login_config_path(path, sizeof(path)) < 0) {
-        fprintf(stderr, "error: failed to resolve config path\n");
-        return 1;
-    }
-    if (remove(path) != 0) {
-        if (errno == ENOENT) {
-            fprintf(stderr, "Not logged in (no credentials at %s).\n", path);
-            return 0;
-        }
-        fprintf(stderr, "error: failed to remove %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-    fprintf(stderr, "\033[32m\xe2\x9c\x85 Logged out. Removed %s\033[0m\n", path);
-    return 0;
+    return login_logout("todoforai-bridge");
 }
 
 // ── help ────────────────────────────────────────────────────────────────────
