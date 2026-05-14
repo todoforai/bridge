@@ -13,7 +13,7 @@
 //     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
 //     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
-//     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"fgPid":N,"passwordPrompt":bool}
+//     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool}
 //     → {"type":"step_done","sessionId":"uuid","blockId":"...","shellPid":N,"exitCode":N|null,"timedOut":bool}
 //     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"..."}   // resumes a step waiting on stdin
 //     → {"type":"ack","requestId":"..."}                            // success reply for input
@@ -537,19 +537,20 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
 // waiting for stdin". The shell itself is alive (not SIGSTOP'd) and the RUN
 // stays in flight — backend resolves the pending RUN promise with
 // `awaitingInput:true` so the agent gets the prompt text and can resume by
-// sending INPUT on the same sessionId.
+// sending INPUT on the same sessionId. The actual blocked pid (often a child
+// of the shell, e.g. sudo) is detected internally but not surfaced on the
+// wire: SIGINT is delivered via PTY stdin (`\x03`), and the kernel TTY line
+// discipline routes it to the foreground pgrp.
 // `passwordPrompt` is true when the slave has ECHO disabled (sudo/getpass/ssh).
-static void send_step_awaiting_input(edge_t *e, session_t *s, long fg_pid, int password_prompt) {
+static void send_step_awaiting_input(edge_t *e, session_t *s, int password_prompt) {
     char buf[512]; size_t u = 0;
     char shell_pid_buf[24]; snprintf(shell_pid_buf, sizeof shell_pid_buf, "%ld", SHELL_PID(s));
-    char fg_pid_buf[24]; snprintf(fg_pid_buf, sizeof fg_pid_buf, "%ld", fg_pid);
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
         jfield_str(buf, sizeof buf, &u, "type", "step_awaiting_input", -1, 0) < 0 ||
         jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
         emit_todo_id(buf, sizeof buf, &u, s) < 0 ||
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "shellPid", shell_pid_buf, 1) < 0 ||
-        jfield_raw(buf, sizeof buf, &u, "fgPid", fg_pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "passwordPrompt", password_prompt ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
@@ -1092,7 +1093,7 @@ static void service_sessions(edge_t *e) {
         // sessionId and may resume by sending INPUT (or another RUN against
         // this session). STEP_DONE must not tear the PTY down under it.
         s->one_shot = 0;
-        send_step_awaiting_input(e, s, fg, pwd);
+        send_step_awaiting_input(e, s, pwd);
         fprintf(stderr, "RUN awaiting input: %s fg=%ld pwd=%d\n",
                 s->run_block_id, fg, pwd);
     }
