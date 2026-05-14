@@ -21,10 +21,9 @@
 
 // ── Usage strings ────────────────────────────────────────────────────────────
 
-// NOTE: --host / --port / --server-pubkey are developmental flags (override
-// backend address + Noise static pubkey). --ttl overrides enroll token TTL
-// (default 300s). All still parsed below, but intentionally omitted from help
-// to keep the public surface minimal.
+// NOTE: --host / --port are developmental flags (override backend Noise addr).
+// --ttl overrides enroll token TTL (default 300s). All still parsed below, but
+// intentionally omitted from help to keep the public surface minimal.
 const char *USAGE_MAIN = "";
 
 // ── Noise one-shot RPC helper (reuses transport code from login.h) ──────────
@@ -45,16 +44,14 @@ static int is_local_host(const char *h) {
     return 0;
 }
 
-// Resolve backend Noise addr + pubkey.
-// Precedence: CLI flag > env (NOISE_BACKEND_HOST / _PORT / _PUBKEY) > saved
-// login backendHost > prod defaults. `host`/`port_s`/`pub_hex` may be NULL.
-static void enroll_backend(const char *host, const char *port_s, const char *pub_hex,
-                           char *addr_buf, size_t addr_cap,
-                           const char **addr, const char **pub) {
+// Resolve backend Noise addr (host:port). `host`/`port_s` may be NULL;
+// precedence: CLI flag > env (NOISE_BACKEND_HOST / _PORT) > saved login
+// backendHost > prod default.
+static void resolve_backend_addr(const char *host, const char *port_s,
+                                 char *addr_buf, size_t addr_cap) {
     if (!host)   host   = getenv("NOISE_BACKEND_HOST");
     if (!port_s) port_s = getenv("NOISE_BACKEND_PORT");
 
-    // Saved host from prior `login` (may be empty for prod).
     login_credentials_t saved;
     (void)login_load_credentials(&saved);
     if (!host && saved.backend_host[0]) host = saved.backend_host;
@@ -65,25 +62,31 @@ static void enroll_backend(const char *host, const char *port_s, const char *pub
         fprintf(stderr, "[bridge] no port specified for host=%s, defaulting to %s (set NOISE_BACKEND_PORT or --port to override)\n", host, port_s);
     }
     snprintf(addr_buf, addr_cap, "%s:%s", host, port_s);
-    *addr = addr_buf;
-
-    *pub = pub_hex ? pub_hex : getenv("NOISE_BACKEND_PUBKEY");
-    if (!*pub) *pub = LOGIN_DEFAULT_BACKEND_PUBKEY;
 }
 
 // Connect, handshake, send one encrypted JSON request, return decrypted reply.
 // Returns response length (>= 0) or -1 on error. Writes NUL-terminated JSON
 // into resp_buf (truncated to resp_cap-1 if needed). Prints actionable
 // diagnostics to stderr on TCP / handshake failures.
-static int noise_oneshot(const char *backend_addr, const char *backend_pub,
+//
+// pinned_pub_hex != NULL: pin (used by `enroll` — caller is already logged in).
+// pinned_pub_hex == NULL: learn-mode TOFU (used by `login --token` on a fresh
+//   machine); on success the server's static pubkey is written to
+//   `learned_pub_hex` (must point at a 65-byte buffer).
+static int noise_oneshot(const char *backend_addr, const char *pinned_pub_hex,
                          const char *req, size_t req_len,
-                         char *resp_buf, size_t resp_cap) {
+                         char *resp_buf, size_t resp_cap,
+                         char *learned_pub_hex) {
     login_sock_init();
 
-    uint8_t remote_pub[32];
-    if (login_hex_decode(remote_pub, 32, backend_pub) < 0) {
-        fprintf(stderr, "error: invalid backend public key (need 64 hex chars)\n");
-        return -1;
+    uint8_t pinned[32];
+    const uint8_t *pin = NULL;
+    if (pinned_pub_hex) {
+        if (login_hex_decode(pinned, 32, pinned_pub_hex) < 0) {
+            fprintf(stderr, "error: stored backend pubkey is corrupt (re-run `todoforai-bridge login`)\n");
+            return -1;
+        }
+        pin = pinned;
     }
 
     char host[256], port_str[16];
@@ -96,7 +99,9 @@ static int noise_oneshot(const char *backend_addr, const char *backend_pub,
     snprintf(port_str, sizeof(port_str), "%s", colon + 1);
 
     login_session_t session;
-    int conn_rc = login_noise_connect(&session, host, port_str, remote_pub);
+    uint8_t learned[32];
+    int conn_rc = login_noise_connect(&session, host, port_str, pin,
+                                      learned_pub_hex ? learned : NULL);
     if (conn_rc == -1) {
         fprintf(stderr,
             "error: cannot reach %s (TCP connect failed).\n"
@@ -108,15 +113,14 @@ static int noise_oneshot(const char *backend_addr, const char *backend_pub,
     if (conn_rc < 0) {
         fprintf(stderr,
             "error: connected to %s but Noise handshake failed.\n"
-            "  - Wrong --server-pubkey for this server (most common cause).\n"
-            "  - Server identity changed — check backend logs for\n"
-            "    '[noise] Server public key: <hex>' and pass it via\n"
-            "    --server-pubkey <hex> (or NOISE_BACKEND_PUBLIC_KEY).\n"
+            "  - Server identity changed since `login` — run `todoforai-bridge login` again.\n"
             "  - --port should be the Noise-TCP RPC port (14100 dev, 4100 prod),\n"
             "    NOT the HTTP/WS bridge port (4000 dev, 80/443 prod).\n",
             backend_addr);
         return -1;
     }
+
+    if (learned_pub_hex) login_hex_encode(learned_pub_hex, learned, 32);
 
     uint8_t *dec = NULL;
     int dec_len = login_noise_rpc(session.fd, &session.transport, req, req_len, &dec);
@@ -155,11 +159,13 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
 // /etc/os-release, sandbox marker, …). Backend derives `deviceType` from
 // `identity.deviceType` and stores the rest as device metadata. An optional
 // `deviceName` overrides the hostname-derived default.
+//
+// Fresh-machine path: no creds yet, so the backend's Noise pubkey is learned
+// (TOFU) on the handshake and persisted with the redeemed device credentials.
 static int redeem_enroll_token(const char *token, const char *device_name,
-                               const char *host, const char *port_s, const char *pub_hex) {
-    const char *addr, *pub;
+                               const char *host, const char *port_s) {
     char addr_buf[280];
-    enroll_backend(host, port_s, pub_hex, addr_buf, sizeof(addr_buf), &addr, &pub);
+    resolve_backend_addr(host, port_s, addr_buf, sizeof(addr_buf));
 
     uint8_t id_bytes[4]; char id_hex[9];
     noise_random(id_bytes, 4);
@@ -186,7 +192,8 @@ static int redeem_enroll_token(const char *token, const char *device_name,
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: payload too long\n"); return -1; }
 
     char resp[LOGIN_CONFIG_MAX];
-    int rn = noise_oneshot(addr, pub, req, (size_t)n, resp, sizeof(resp));
+    char learned_pub[65] = {0};
+    int rn = noise_oneshot(addr_buf, NULL, req, (size_t)n, resp, sizeof(resp), learned_pub);
     if (rn < 0) { fprintf(stderr, "error: enroll redeem request failed\n"); return -1; }
 
     if (json_envelope_is_error(resp)) {
@@ -201,6 +208,15 @@ static int redeem_enroll_token(const char *token, const char *device_name,
         fprintf(stderr, "error: unexpected response: %s\n", resp);
         return -1;
     }
+
+    // Persist backend host + learned pubkey so the daemon reconnects without flags.
+    const char *bcolon = strrchr(addr_buf, ':');
+    size_t bhlen = bcolon ? (size_t)(bcolon - addr_buf) : strlen(addr_buf);
+    if (bhlen >= sizeof(creds.backend_host)) bhlen = sizeof(creds.backend_host) - 1;
+    memcpy(creds.backend_host, addr_buf, bhlen);
+    creds.backend_host[bhlen] = '\0';
+    snprintf(creds.backend_pubkey, sizeof(creds.backend_pubkey), "%s", learned_pub);
+
     if (login_save_credentials(&creds) < 0) {
         fprintf(stderr, "error: failed to save credentials\n");
         return -1;
@@ -215,7 +231,7 @@ static int redeem_enroll_token(const char *token, const char *device_name,
 // ── login subcommand ────────────────────────────────────────────────────────
 
 int bridge_login_run(const char *device_name, const char *token,
-                     const char *host, const char *port_s, const char *pub_hex) {
+                     const char *host, const char *port_s) {
     // Already logged in? Reuse existing creds — to switch user/device run logout first.
     login_credentials_t existing;
     memset(&existing, 0, sizeof(existing));
@@ -234,14 +250,14 @@ int bridge_login_run(const char *device_name, const char *token,
     // Token path: non-interactive enrollment via short-lived token (sandbox
     // /init, scripted installs). Interactive path: device-code flow + browser.
     // Both fall through to the daemon in main(), so `bridge login [...]`
-    // behaves identically to `bridge` after creds are obtained.
+    // behaves identically to `bridge` after creds are obtained. Both learn
+    // the backend's Noise pubkey on the handshake (TOFU) and pin thereafter.
     if (token && *token) {
-        return redeem_enroll_token(token, device_name, host, port_s, pub_hex) == 0 ? 0 : 1;
+        return redeem_enroll_token(token, device_name, host, port_s) == 0 ? 0 : 1;
     }
-    const char *addr, *pub;
     char addr_buf[280];
-    enroll_backend(host, port_s, pub_hex, addr_buf, sizeof(addr_buf), &addr, &pub);
-    return login_device_flow(addr, pub, "bridge", device_name) == 0 ? 0 : 1;
+    resolve_backend_addr(host, port_s, addr_buf, sizeof(addr_buf));
+    return login_device_flow(addr_buf, "bridge", device_name) == 0 ? 0 : 1;
 }
 
 int cmd_login(int argc, char **argv) {
@@ -250,19 +266,17 @@ int cmd_login(int argc, char **argv) {
     const char *token       = NULL;
     const char *host        = NULL;
     const char *port_s      = NULL;
-    const char *pub_hex     = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "device-name",   ko_required_argument, 'n' },
         { "token",         ko_required_argument, 't' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
-        { "server-pubkey", ko_required_argument, 'k' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:", longopts)) >= 0) {
         // Help request → return CMD_RC_HELP so main() can distinguish "help
         // printed, exit cleanly" from "login succeeded, fall through to daemon".
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return CMD_RC_HELP; }
@@ -270,10 +284,9 @@ int cmd_login(int argc, char **argv) {
         else if (c == 't') token = opt.arg;
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
-        else if (c == 'k') pub_hex = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
-    return bridge_login_run(device_name, token, host, port_s, pub_hex);
+    return bridge_login_run(device_name, token, host, port_s);
 }
 
 // ── enroll subcommand ───────────────────────────────────────────────────────
@@ -283,23 +296,20 @@ int cmd_enroll(int argc, char **argv) {
     long ttl_sec = 300;
     const char *host    = NULL;
     const char *port_s  = NULL;
-    const char *pub_hex = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "ttl",           ko_required_argument, 'T' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
-        { "server-pubkey", ko_required_argument, 'k' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hT:H:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hT:H:p:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
         else if (c == 'T') ttl_sec = atol(opt.arg);
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
-        else if (c == 'k') pub_hex = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
 
@@ -310,10 +320,13 @@ int cmd_enroll(int argc, char **argv) {
         fprintf(stderr, "error: no device credentials found. Run `todoforai-bridge login` first.\n");
         return 1;
     }
+    if (!creds.backend_pubkey[0]) {
+        fprintf(stderr, "error: credentials are missing backend pubkey. Run `todoforai-bridge logout && todoforai-bridge login` to refresh.\n");
+        return 1;
+    }
 
-    const char *addr, *pub;
     char addr_buf[280];
-    enroll_backend(host, port_s, pub_hex, addr_buf, sizeof(addr_buf), &addr, &pub);
+    resolve_backend_addr(host, port_s, addr_buf, sizeof(addr_buf));
 
     uint8_t id_bytes[4]; char id_hex[9];
     noise_random(id_bytes, 4);
@@ -327,7 +340,7 @@ int cmd_enroll(int argc, char **argv) {
     if (n < 0 || (size_t)n >= sizeof(req)) { fprintf(stderr, "error: request too long\n"); return 1; }
 
     char resp[LOGIN_CONFIG_MAX];
-    int rn = noise_oneshot(addr, pub, req, (size_t)n, resp, sizeof(resp));
+    int rn = noise_oneshot(addr_buf, creds.backend_pubkey, req, (size_t)n, resp, sizeof(resp), NULL);
     if (rn < 0) { fprintf(stderr, "error: mint request failed\n"); return 1; }
 
     if (json_envelope_is_error(resp)) {

@@ -86,10 +86,10 @@ make release-windows-x64
 # Custom server
 ./build/todoforai-bridge --host 127.0.0.1 --port 4000
 
-# Local-dev login/enroll against a backend on a different host/port
+# Local-dev: point at a backend on a different host/port
 # (Noise TCP RPC port — defaults to api.todofor.ai:4100; for `bun run dev` use 14100)
-./build/todoforai-bridge login  --host 127.0.0.1 --port 14100 --server-pubkey <hex>
-./build/todoforai-bridge enroll --host 127.0.0.1 --port 14100 --server-pubkey <hex>
+./build/todoforai-bridge login  --host 127.0.0.1 --port 14100
+./build/todoforai-bridge enroll --host 127.0.0.1 --port 14100
 
 # Firecracker sandbox: presence of enroll.token=... in /proc/cmdline
 # routes to DeviceType.SANDBOX path (?deviceType=SANDBOX).
@@ -99,21 +99,23 @@ make release-windows-x64
 ./build/todoforai-bridge --help
 ```
 
+The backend's Noise static public key (the trust anchor for the encrypted
+channel) is **learned during `login`** via the Noise_NX handshake and persisted
+to `credentials.json` as `backendPubkey`. All later connections (daemon run,
+`enroll`) pin against it. No flag, no env, no hardcoded default — same flow in
+dev, prod, and self-hosted. If the server's identity changes (key rotation,
+new deployment), `login` again to re-learn.
+
 ## Environment variables
 
 CLI flags take precedence; env vars are fallbacks for non-interactive
 deployments (sandbox init, systemd units, CI).
 
-| Variable               | Used by              | Equivalent flag   | Purpose                                            |
-|------------------------|----------------------|-------------------|----------------------------------------------------|
-| `NOISE_BACKEND_HOST`   | run, login, enroll   | `--host`          | Backend hostname (default `api.todofor.ai`)        |
-| `NOISE_BACKEND_PORT`   | login, enroll        | `--port`          | Noise TCP RPC port (default `4100`, dev `14100`)   |
-| `NOISE_BACKEND_PUBKEY` | run, login, enroll   | `--server-pubkey` | Backend Noise static pubkey (32 bytes, hex)        |
-| `BRIDGE_PORT`          | run                  | `--port`          | Bridge HTTP/WS port (default `80`, dev `4000`)     |
-
-The server's Noise static public key (32 bytes, X25519, hex-encoded)
-must match what the backend advertises at startup. Default is baked into
-`DEFAULT_SERVER_PUBKEY_HEX` in `main.c`.
+| Variable             | Used by              | Equivalent flag | Purpose                                          |
+|----------------------|----------------------|-----------------|--------------------------------------------------|
+| `NOISE_BACKEND_HOST` | run, login, enroll   | `--host`        | Backend hostname (default `api.todofor.ai`)      |
+| `NOISE_BACKEND_PORT` | login, enroll        | `--port`        | Noise TCP RPC port (default `4100`, dev `14100`) |
+| `BRIDGE_PORT`        | run                  | `--port`        | Bridge HTTP/WS port (default `80`, dev `4000`)   |
 
 ## Updates
 

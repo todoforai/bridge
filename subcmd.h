@@ -13,9 +13,9 @@ enum { CMD_RC_HELP = 2 };
 
 int  cmd_login(int argc, char **argv);
 // Run the login flow with pre-parsed overrides (no argv parsing). Any NULL
-// arg falls through to env / saved-creds / defaults inside enroll_backend.
+// arg falls through to env / saved-creds / defaults inside resolve_backend_addr.
 int  bridge_login_run(const char *device_name, const char *token,
-                      const char *host, const char *port_s, const char *pub_hex);
+                      const char *host, const char *port_s);
 int  cmd_logout(int argc, char **argv);
 int  cmd_enroll(int argc, char **argv);
 int  cmd_whoami(int argc, char **argv);

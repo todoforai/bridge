@@ -94,10 +94,6 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #define BLOCK_ID_CAP         64
 #define MAX_MSG              (64 * 1024)
 
-// Server's Noise static public key — shared with sandbox/browser CLIs via
-// LOGIN_DEFAULT_BACKEND_PUBKEY. Overridable via NOISE_BACKEND_PUBKEY env
-// or --server-pubkey flag.
-#define DEFAULT_SERVER_PUBKEY_HEX LOGIN_DEFAULT_BACKEND_PUBKEY
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
@@ -1112,7 +1108,7 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
     if (n < 0) {
         fail(e, e->noise.handshake_done
                 ? "noise decrypt failed (corrupt frame, replay, or out-of-order)"
-                : "noise handshake failed (wrong --server-pubkey or incompatible build)");
+                : "noise handshake failed (server identity changed — re-run `todoforai-bridge login`)");
         return;
     }
     if (n == 0) {
@@ -1282,21 +1278,19 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    const char *host = NULL, *port_s = NULL, *pubkey_hex = NULL;
+    const char *host = NULL, *port_s = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
-        { "server-pubkey", ko_required_argument, 'k' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:k:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:", longopts)) >= 0) {
         if      (c == 'h') { print_help(); return 0; }
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
-        else if (c == 'k') pubkey_hex = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE_MAIN, argc, argv, &opt, c);
     }
 
@@ -1312,10 +1306,10 @@ int main(int argc, char **argv) {
     // `login --token`, so they never hit this path.
     if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
         fprintf(stderr, "No device credentials found. Starting login...\n\n");
-        // Forward --host / --server-pubkey so login targets the same backend.
-        // --port is intentionally not forwarded: it's BRIDGE_PORT (HTTP/WS) here
-        // vs NOISE_BACKEND_PORT for login — different transports.
-        int rc = bridge_login_run(NULL, NULL, host, NULL, pubkey_hex);
+        // Forward --host so login targets the same backend. --port is
+        // intentionally not forwarded: it's BRIDGE_PORT (HTTP/WS) here vs
+        // NOISE_BACKEND_PORT for login — different transports.
+        int rc = bridge_login_run(NULL, NULL, host, NULL);
         if (rc != 0) return rc;
         if (login_load_credentials(&saved_creds) < 0
             || !saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
@@ -1338,12 +1332,17 @@ int main(int argc, char **argv) {
         port = 4000; // dev default: bun listens directly (no nginx)
     }
 
-    if (!pubkey_hex) pubkey_hex = getenv("NOISE_BACKEND_PUBKEY");
-    if (!pubkey_hex) pubkey_hex = DEFAULT_SERVER_PUBKEY_HEX;
-
+    // The Noise pubkey was pinned during `login` (TOFU on the NX handshake).
+    // No flag, no env, no hardcoded default — just what we learned on day one.
+    if (!saved_creds.backend_pubkey[0]) {
+        fprintf(stderr,
+            "error: credentials are missing the backend pubkey.\n"
+            "Run `todoforai-bridge logout && todoforai-bridge login` to refresh.\n");
+        return 1;
+    }
     uint8_t server_pubkey[32];
-    if (parse_pubkey_hex(pubkey_hex, server_pubkey) != 0) {
-        fprintf(stderr, "invalid server pubkey (need 64 hex chars)\n");
+    if (parse_pubkey_hex(saved_creds.backend_pubkey, server_pubkey) != 0) {
+        fprintf(stderr, "error: stored backend pubkey is corrupt (re-run `todoforai-bridge login`).\n");
         return 1;
     }
 
@@ -1378,7 +1377,7 @@ int main(int argc, char **argv) {
             switch (e->close_code) {
                 case 4401: hint = "\nRe-run `todoforai-bridge login` (device removed or secret rotated)."; break;
                 case 4408: hint = "\nServer didn't receive auth in time — check network/firewall."; break;
-                case 4001: hint = "\nWrong --server-pubkey or incompatible build. Try `todoforai-bridge --version`."; break;
+                case 4001: hint = "\nIncompatible build or server identity changed. Try `todoforai-bridge --version` or re-run `todoforai-bridge login`."; break;
                 case 4003: break;  // protocol error, reason is self-explanatory
                 default:   break;
             }
