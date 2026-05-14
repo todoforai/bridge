@@ -57,9 +57,9 @@ static int file_exists(const char *path) {
 //   2. Firecracker DMI product name (Linux, when DMI is exposed).
 static int is_sandbox(void) {
     if (file_exists("/etc/todoforai-sandbox")) return 1;
-    char buf[64] = {0};
     FILE *f = fopen("/sys/class/dmi/id/product_name", "r");
     if (f) {
+        char buf[64] = {0};
         if (fgets(buf, sizeof(buf), f)) {
             // strip trailing whitespace
             size_t n = strlen(buf);

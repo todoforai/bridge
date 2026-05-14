@@ -111,6 +111,44 @@ test-run: | build
 	$(CC) -O0 -g -Wall -Wextra -o build/test-run test_run.c pty_posix.c -lutil
 	./build/test-run
 
+# Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
+# Only scans bridge sources, not vendored todoforai-c-core / monocypher.
+BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c pty_posix.c
+ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
+ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
+
+.PHONY: analyze analyze-gcc analyze-cppcheck analyze-scan-build
+analyze: analyze-gcc analyze-cppcheck analyze-scan-build
+
+analyze-gcc: | build
+	@mkdir -p build/analysis
+	@: > build/analysis/gcc-analyze.log
+	@for f in $(BRIDGE_SRCS); do \
+	    echo "=== $$f ===" >> build/analysis/gcc-analyze.log; \
+	    $(CC) -fanalyzer -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 \
+	        -Wnull-dereference -Wstrict-prototypes -Wmissing-prototypes \
+	        -Wno-unused-function $(ANALYZE_DEFS) $(ANALYZE_INCLUDES) \
+	        -c $$f -o /dev/null 2>> build/analysis/gcc-analyze.log; \
+	done
+	@echo "gcc -fanalyzer: $$(grep -c '^[^:]*:[0-9]*:[0-9]*: warning' build/analysis/gcc-analyze.log) warning(s) -> build/analysis/gcc-analyze.log"
+
+analyze-cppcheck: | build
+	@mkdir -p build/analysis
+	@command -v cppcheck >/dev/null || { echo "cppcheck not installed; skipping"; exit 0; }
+	@cppcheck --enable=all --inconclusive --std=c11 \
+	    --suppress=missingIncludeSystem --suppress=unusedFunction \
+	    --suppress=checkersReport \
+	    $(ANALYZE_INCLUDES) -I. $(BRIDGE_SRCS) 2> build/analysis/cppcheck.log || true
+	@echo "cppcheck: $$(grep -cE '^[^:]+:[0-9]+:[0-9]+:' build/analysis/cppcheck.log) finding(s) -> build/analysis/cppcheck.log"
+
+analyze-scan-build: | build
+	@mkdir -p build/analysis
+	@command -v scan-build >/dev/null || { echo "scan-build not installed; skipping"; exit 0; }
+	@scan-build -o build/analysis/scan-build $(CC) -O0 -g -Wall -Wextra \
+	    -Wno-unused-function $(ANALYZE_DEFS) $(ANALYZE_INCLUDES) \
+	    -o /tmp/_bridge_sb $(SRCS) $(LIBS) > build/analysis/scan-build.log 2>&1 || true
+	@grep -E 'bug(s)? found|No bugs found' build/analysis/scan-build.log | tail -1
+
 # Local dev: build + drop into ~/.todoforai/bin/ (on PATH) + print version.
 dev: build/todoforai-bridge
 	install -m755 $< $(HOME)/.todoforai/bin/todoforai-bridge

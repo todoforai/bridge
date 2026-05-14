@@ -202,8 +202,8 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
             if (used + 1 < cap) {
                 ssize_t n = read(pipefd[0], out + used, cap - 1 - used);
                 if (n > 0) { used += (size_t)n; out[used] = '\0'; continue; }
-                if (n == 0) break; // EOF
-                if (n < 0 && errno != EAGAIN) break;
+                else if (n == 0) break; // EOF
+                else if (errno != EAGAIN) break;
             } else {
                 // buffer full — drain and discard
                 char scratch[256];
