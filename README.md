@@ -164,8 +164,8 @@ the same `machine_exec` channel used for shell tools, base64-encoding paths and
 file heads so the wire stays ASCII-clean. The full body is fetched on demand via
 the `Skill` tool, which reads the file via `base64 < <path>` like `ReadTool`.
 
-Required tools on the bridge: `sh`, `find`, `head`, `base64` — all POSIX
-baseline; no extra installation needed.
+Required tools on the bridge: `sh`, `find`, `head`, `base64`. Standard on
+GNU/BSD/macOS userspace; no extra installation needed.
 
 ## Notes
 
