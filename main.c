@@ -42,6 +42,7 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <winsock2.h>   // WSAPoll, struct pollfd, POLL* — must precede windows.h
 #  include <windows.h>
+#  include <direct.h>     // _mkdir
 #  define poll WSAPoll
 // Portable byte-substring search: glibc has memmem; mingw/MSVCRT does not.
 static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
@@ -266,6 +267,29 @@ static size_t gen_sentinel(char *out, size_t cap) {
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
+
+// Default cwd when RUN omits `cwd`: <tmpdir>/todoforai. Mirrors
+// edge/bun/src/shell.ts so both transports behave identically when no
+// workspace is configured (instead of inheriting wherever the daemon was
+// launched). mkdir errors are ignored — if the dir genuinely can't be used,
+// the child's chdir fails and surfaces as SPAWN_FAILED.
+static const char *resolve_default_cwd(void) {
+    static char path[512];
+    if (path[0]) return path;
+#ifdef _WIN32
+    char tmp[MAX_PATH];
+    DWORD n = GetTempPathA(sizeof(tmp), tmp);
+    if (n == 0 || n >= sizeof(tmp)) { strcpy(path, "C:\\"); return path; }
+    snprintf(path, sizeof(path), "%s%stodoforai", tmp, tmp[n-1] == '\\' ? "" : "\\");
+    _mkdir(path);
+#else
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
+    snprintf(path, sizeof(path), "%s/todoforai", tmpdir);
+    mkdir(path, 0700);
+#endif
+    return path;
+}
 
 static int is_valid_uuid(const char *s, size_t len) {
     if (len != 36) return 0;
@@ -769,7 +793,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                     return send_error(e, NULL, 0, bid, bid_len, "INVALID_CWD", "cwd does not exist or is not a directory");
                 }
             }
-            if (bridge_pty_spawn(&s->pty, DEFAULT_SHELL, has_cwd ? cwd_buf : NULL, /*no_echo=*/1) != 0) {
+            // No cwd from agent → fall back to <tmpdir>/todoforai (mirrors edge),
+            // so we don't leak whatever pwd the bridge daemon was launched in.
+            const char *spawn_cwd = has_cwd ? cwd_buf : resolve_default_cwd();
+            if (bridge_pty_spawn(&s->pty, DEFAULT_SHELL, spawn_cwd, /*no_echo=*/1) != 0) {
                 free(cmd);
                 return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", "failed to spawn PTY");
             }
