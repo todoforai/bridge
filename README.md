@@ -139,6 +139,34 @@ EXE=$(readlink -f /proc/$PPID/exe) \
 
 No new protocol messages, no in-binary HTTP client, no extra dependencies.
 
+## Skills (`SKILL.md`)
+
+The TODOforAI agent discovers local skills on a bridge the same way it does on
+an edge — by walking two well-known locations and reading `SKILL.md` files:
+
+| Scope  | Path                                  | Source                              |
+|--------|---------------------------------------|-------------------------------------|
+| `repo` | `<workspace-root>/.agents/skills/**`  | one per workspace root              |
+| `user` | `$HOME/.agents/skills/**`             | resolved on the bridge device       |
+
+Discovery rules (mirror `edge/bun/src/skills.ts`):
+
+- Walk depth: `find -maxdepth 6`; hidden entries (`.*`) are pruned.
+- Only files literally named `SKILL.md` are accepted.
+- Only the first 8 KiB of each file is read for metadata.
+- Frontmatter (YAML between leading `---` lines) provides:
+  - `name` — skill identifier (falls back to parent directory name)
+  - `description` — full description
+  - `metadata.short-description` — optional shorter line preferred in the prompt
+
+On a bridge there's no `get_skills` RPC: the agent runs `find` + `head` over
+the same `machine_exec` channel used for shell tools, base64-encoding paths and
+file heads so the wire stays ASCII-clean. The full body is fetched on demand via
+the `Skill` tool, which reads the file via `base64 < <path>` like `ReadTool`.
+
+Required tools on the bridge: `sh`, `find`, `head`, `base64` — all POSIX
+baseline; no extra installation needed.
+
 ## Notes
 
 - POSIX + Windows (ConPTY, Win10 1809+). Windows build via
