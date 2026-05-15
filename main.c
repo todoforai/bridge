@@ -220,6 +220,19 @@ static void fail(edge_t *e, const char *fmt, ...) {
     e->done = 1;
 }
 
+// Clear per-connection state between reconnect attempts. e->sessions is NOT
+// touched — PTY processes survive across reconnects. run() always calls
+// ws_close() + noise_ws_wipe() before returning, so the memsets here clear
+// already-released structs (no leak).
+static void reset_connection_state(edge_t *e) {
+    memset(&e->ws, 0, sizeof(e->ws));
+    memset(&e->noise, 0, sizeof(e->noise));
+    e->done = 0; e->rc = 0;
+    e->identity_sent = 0; e->auth_sent_ms = 0;
+    e->got_close_frame = 0; e->close_code = 0;
+    e->close_reason[0] = '\0'; e->err_msg[0] = '\0';
+}
+
 static int64_t monotonic_ms(void) {
 #ifdef _WIN32
     return (int64_t)GetTickCount64();
@@ -1167,11 +1180,13 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     // ws rx capacity: plaintext MAX_MSG + Noise auth tag (16) + WS header slack.
     if (ws_connect(&e->ws, host, port, path, MAX_MSG + NOISE_TAG_LEN + 16, 10000) != 0) {
         fail(e, "%s", e->ws.err);
+        noise_ws_wipe(&e->noise);
         return -1;
     }
     if (noise_ws_start(&e->noise, &e->ws) != 0) {
         fail(e, "failed to start noise handshake");
         ws_close(&e->ws);
+        noise_ws_wipe(&e->noise);
         return -1;
     }
 
@@ -1388,37 +1403,67 @@ int main(int argc, char **argv) {
     e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
     if (!e->sessions) { free(e); return 1; }
 
-    int rc = run(e, saved_creds.device_id, saved_creds.device_secret,
+    // Reconnect loop. PTY sessions in e->sessions[] survive across reconnects:
+    // they're independent OS processes (master fd + child pid) with no tie to
+    // the WS transport. PTY/session IDs are retained; subsequent frames use
+    // the same sessionId after reconnect so backend routing resumes naturally.
+    // (Note: any in-flight RPC the backend had pending across the disconnect
+    // is rejected by BridgeHandler.handleClose — not replayed by us.)
+    const int max_attempts = 20;
+    int attempt = 0;
+    int rc;
+    for (;;) {
+        rc = run(e, saved_creds.device_id, saved_creds.device_secret,
                  host, port, DEFAULT_PATH, server_pubkey);
+        if (rc == 0) break;  // clean exit (reserved; not produced today)
 
-    for (int i = 0; i < g_max_sessions; i++) {
-        if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
-    }
+        // A healthy session that later dropped should NOT count against the
+        // attempt budget — budget is for genuine "can't connect at all" runs.
+        // identity_sent=1 means we got past auth, i.e. the connection lived.
+        int was_authenticated = e->identity_sent;
 
-    if (rc != 0) {
-        // Server-sent close frames carry the most specific reason — prefer them.
-        // Otherwise fall back to err_msg, which fail() guarantees is populated.
+        // Diagnose THIS disconnect.
         if (e->got_close_frame) {
             const char *reason = e->close_reason[0] ? e->close_reason : "(no reason)";
-            const char *hint = "";
-            switch (e->close_code) {
-                case 4401: hint = "\nRe-run `todoforai-bridge login` (device removed or secret rotated)."; break;
-                case 4408: hint = "\nServer didn't receive auth in time — check network/firewall."; break;
-                case 4001: hint = "\nIncompatible build or server identity changed. Try `todoforai-bridge --version` or re-run `todoforai-bridge login`."; break;
-                case 4003: break;  // protocol error, reason is self-explanatory
-                default:   break;
-            }
-            fprintf(stderr, "Disconnected by server (code=%u): %s.%s\n",
-                    e->close_code, reason, hint);
+            fprintf(stderr, "Disconnected by server (code=%u): %s.\n",
+                    e->close_code, reason);
         } else {
             fprintf(stderr, "Connection failed: %s.\n",
                     e->err_msg[0] ? e->err_msg : "(no diagnostic — please report)");
-            // Connect-time failures: hint at common misconfig.
             if (!e->noise.handshake_done)
                 fprintf(stderr,
                     "  --port is the HTTP/WS port (4000 dev, 80/443 prod), NOT the Noise-TCP\n"
                     "  port (14100/4100) used by `login`/`enroll`. Or re-run `todoforai-bridge login`.\n");
         }
+
+        // Only one truly fatal case: credentials no longer accepted. Everything
+        // else (handshake/protocol/timeout/replaced) is treated as transient —
+        // backoff naturally throttles repeated rejections.
+        if (e->got_close_frame && e->close_code == 4401) {
+            fprintf(stderr, "Re-run `todoforai-bridge login` (device removed or secret rotated).\n");
+            break;
+        }
+
+        if (was_authenticated) attempt = 0;  // healthy connection dropped → fresh budget
+        if (++attempt >= max_attempts) {
+            fprintf(stderr, "Max reconnection attempts (%d) reached.\n", max_attempts);
+            break;
+        }
+
+        int delay = attempt < 16 ? 4 + attempt : 20;
+        fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n", delay, attempt, max_attempts);
+#ifdef _WIN32
+        Sleep((DWORD)delay * 1000);
+#else
+        // No SIGINT handler installed — default disposition terminates the
+        // process during sleep(), which is the desired behavior for Ctrl+C.
+        sleep((unsigned)delay);
+#endif
+        reset_connection_state(e);
+    }
+
+    for (int i = 0; i < g_max_sessions; i++) {
+        if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
     }
     free(e->sessions);
     free(e);
