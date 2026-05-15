@@ -22,8 +22,11 @@
 //   Payload-wrapped (generic function dispatch, shared with agent↔edge):
 //     ← {"type":"FUNCTION_CALL_REQUEST_AGENT","payload":{"requestId","functionName","args",...}}
 //     → {"type":"FUNCTION_CALL_RESULT_AGENT","payload":{"requestId","success","result"|"error",...}}
-//   Bridge implements one function today: `scan_tools` (args.entries =
-//   "<key>\t<b64_versionCmd>\t<b64_statusCmd>\n..."; result = installed-tools dict).
+//   Bridge implements:
+//     • `scan_tools`     — args.entries = "<key>\t<b64_versionCmd>\t<b64_statusCmd>\n…";
+//                          result = installed-tools dict.
+//     • `write_file_b64` — args = {path, dataB64, offset?, truncate?};
+//                          result = {bytesWritten, totalSize}.
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
