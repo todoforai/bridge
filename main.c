@@ -43,6 +43,9 @@
 #  include <winsock2.h>   // WSAPoll, struct pollfd, POLL* — must precede windows.h
 #  include <windows.h>
 #  include <direct.h>     // _mkdir
+#  include <io.h>         // _open/_write/_lseeki64/_chsize_s
+#  include <fcntl.h>      // _O_WRONLY/_O_CREAT/_O_BINARY/_O_APPEND
+#  include <sys/stat.h>   // _S_IREAD/_S_IWRITE
 #  define poll WSAPoll
 // Portable byte-substring search: glibc has memmem; mingw/MSVCRT does not.
 static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
@@ -56,6 +59,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 }
 #  define memmem(h, hl, n, nl) memmem_compat((h), (hl), (n), (nl))
 #else
+#  include <fcntl.h>
 #  include <poll.h>
 #  include <sys/resource.h>
 #  include <unistd.h>
@@ -1036,9 +1040,128 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 fprintf(stderr, "CLI tool probe failed (overflow or empty)\n");
             }
             free(result);
+        } else if (fn_len == 14 && memcmp(fn, "write_file_b64", 14) == 0) {
+            // args = {"path": "...", "dataB64": "...", "offset"?: N | -1, "truncate"?: bool}
+            //   offset omitted or 0  → write from start (default truncate=true)
+            //   offset = -1          → append (O_APPEND, truncate must be false)
+            //   offset > 0           → pwrite at byte offset (chunk upload, default truncate=false)
+            // Result: {"bytesWritten": N, "totalSize": N}
+            // Portable fd helpers — MSVC names POSIX fd ops with leading underscores.
+            #ifdef _WIN32
+            #  define wfb_close(fd)        _close(fd)
+            #  define wfb_fstat(fd, st)    _fstati64((fd), (st))
+            #  define WFB_STAT             struct _stati64
+            #else
+            #  define wfb_close(fd)        close(fd)
+            #  define wfb_fstat(fd, st)    fstat((fd), (st))
+            #  define WFB_STAT             struct stat
+            #endif
+
+            #define WFB_FAIL(msg) do { \
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, (msg)); \
+                free(path); free(decoded); \
+                if (fd >= 0) wfb_close(fd); \
+                return 0; \
+            } while (0)
+
+            char *path = NULL, *decoded = NULL;
+            int fd = -1;
+
+            const char *praw = NULL; size_t praw_len = 0;
+            if (!args || !json_get_str(args, args_len, "path", &praw, &praw_len) || praw_len == 0)
+                WFB_FAIL("write_file_b64 requires args.path");
+            path = malloc(praw_len + 1);
+            if (!path) WFB_FAIL("out of memory");
+            size_t plen = 0;
+            if (!json_get_str_decoded(args, args_len, "path", path, praw_len + 1, &plen))
+                WFB_FAIL("write_file_b64: malformed args.path");
+            (void)plen;
+
+            const char *b64 = NULL; size_t b64_len = 0;
+            if (!json_get_str(args, args_len, "dataB64", &b64, &b64_len))
+                WFB_FAIL("write_file_b64 requires args.dataB64");
+
+            // json_get_long → `long` is 32-bit on Windows LLP64. The bridge's parser
+            // doesn't expose i64; offsets >2GB on Windows aren't supported today.
+            long offset = 0;
+            json_get_long(args, args_len, "offset", &offset);
+            if (offset < -1) WFB_FAIL("write_file_b64: offset must be >= -1");
+
+            int truncate_set = 0, truncate_val = 0;
+            if (json_get_bool(args, args_len, "truncate", &truncate_val)) truncate_set = 1;
+            // Default: truncate iff we're writing from the start. Append + truncate
+            // is incoherent (would truncate to dec_len, corrupting the file).
+            int do_truncate = truncate_set ? truncate_val : (offset == 0);
+            if (offset < 0 && do_truncate)
+                WFB_FAIL("write_file_b64: cannot combine offset=-1 (append) with truncate=true");
+
+            size_t dec_cap = b64_len / 4 * 3 + 4;
+            decoded = malloc(dec_cap);
+            if (!decoded) WFB_FAIL("out of memory");
+            size_t dec_len = b64_decode(b64, b64_len, decoded, dec_cap);
+            if (dec_len == 0 && b64_len > 0) WFB_FAIL("write_file_b64: invalid base64");
+
+#ifdef _WIN32
+            int flags = _O_WRONLY | _O_CREAT | _O_BINARY;
+            if (offset < 0) flags |= _O_APPEND;
+            fd = _open(path, flags, _S_IREAD | _S_IWRITE);
+#else
+            int flags = O_WRONLY | O_CREAT | O_CLOEXEC;
+            if (offset < 0) flags |= O_APPEND;
+            fd = open(path, flags, 0644);
+#endif
+            if (fd < 0) WFB_FAIL("write_file_b64: open failed");
+
+            // Write in a loop — handle short writes / EINTR on regular files.
+            // pwrite/write on a regular file rarely short-writes, but be safe.
+            size_t written = 0;
+            while (written < dec_len) {
+                long long wn;
+                size_t remain = dec_len - written;
+#ifdef _WIN32
+                if (written == 0 && offset > 0) {
+                    if (_lseeki64(fd, (int64_t)offset, SEEK_SET) < 0)
+                        WFB_FAIL("write_file_b64: seek failed");
+                }
+                unsigned int chunk = remain > (1u << 30) ? (1u << 30) : (unsigned int)remain;
+                wn = _write(fd, (char *)decoded + written, chunk);
+#else
+                if (offset > 0) wn = pwrite(fd, (char *)decoded + written, remain, (off_t)offset + (off_t)written);
+                else            wn = write(fd,  (char *)decoded + written, remain);
+                if (wn < 0 && errno == EINTR) continue;
+#endif
+                if (wn <= 0) WFB_FAIL("write_file_b64: write failed");
+                written += (size_t)wn;
+            }
+
+            int64_t end_off = (offset > 0 ? offset : 0) + (int64_t)dec_len;
+            if (do_truncate) {
+#ifdef _WIN32
+                if (_chsize_s(fd, end_off) != 0) WFB_FAIL("write_file_b64: truncate failed");
+#else
+                if (ftruncate(fd, (off_t)end_off) != 0) WFB_FAIL("write_file_b64: truncate failed");
+#endif
+            }
+
+            // Total file size after the write (post-truncate if applied).
+            WFB_STAT st;
+            int64_t total = end_off;
+            if (wfb_fstat(fd, &st) == 0) total = (int64_t)st.st_size;
+            wfb_close(fd); fd = -1;
+
+            char result[96];
+            int rn = snprintf(result, sizeof result,
+                              "{\"bytesWritten\":%zu,\"totalSize\":%lld}",
+                              dec_len, (long long)total);
+            send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)rn);
+            free(path); free(decoded);
+            #undef WFB_FAIL
+            #undef WFB_STAT
+            #undef wfb_close
+            #undef wfb_fstat
         } else {
             char errmsg[128];
-            snprintf(errmsg, sizeof errmsg, "Unknown function: %.*s. Available: scan_tools",
+            snprintf(errmsg, sizeof errmsg, "Unknown function: %.*s. Available: scan_tools, write_file_b64",
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }

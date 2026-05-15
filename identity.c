@@ -95,6 +95,54 @@ static void detect_distro(const char *os_sysname, char *distro, size_t dcap, cha
     }
 }
 
+// Best-effort host-stable machine identifier. Read-only OS-provided UUID with
+// no PII (not MAC/serial). Empty string when unavailable (locked-down kernels,
+// containers without /etc/machine-id, no ioreg, etc.) — backend treats it as
+// optional. Trims to fit `cap-1` chars.
+static void detect_machine_id(const char *os_sysname, char *out, size_t cap) {
+    out[0] = '\0';
+#ifdef _WIN32
+    (void)os_sysname;
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SOFTWARE\\Microsoft\\Cryptography", 0,
+                      KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS) {
+        // Leave room for our own NUL terminator — RegQueryValueExA only writes
+        // one when the source value is itself NUL-terminated.
+        DWORD type = 0, n = (DWORD)(cap - 1);
+        if (RegQueryValueExA(k, "MachineGuid", NULL, &type,
+                             (LPBYTE)out, &n) != ERROR_SUCCESS || type != REG_SZ) {
+            out[0] = '\0';
+        } else {
+            out[n < cap ? n : cap - 1] = '\0';
+        }
+        RegCloseKey(k);
+    }
+#else
+    FILE *f = NULL;
+    if (strcasecmp(os_sysname, "Linux") == 0) {
+        f = fopen("/etc/machine-id", "r");
+        if (!f) f = fopen("/var/lib/dbus/machine-id", "r");
+    } else if (strcasecmp(os_sysname, "Darwin") == 0) {
+        f = popen("ioreg -d2 -c IOPlatformExpertDevice 2>/dev/null "
+                  "| awk -F'\"' '/IOPlatformUUID/{print $4; exit}'", "r");
+        if (f) {
+            if (fgets(out, (int)cap, f)) { /* fall through */ }
+            pclose(f);
+            f = NULL;
+        }
+    }
+    if (f) {
+        if (!fgets(out, (int)cap, f)) out[0] = '\0';
+        fclose(f);
+    }
+#endif
+    // Strip trailing whitespace/newline.
+    size_t n = strlen(out);
+    while (n && (out[n-1] == '\n' || out[n-1] == '\r' || out[n-1] == ' ' || out[n-1] == '\t'))
+        out[--n] = '\0';
+}
+
 // Map host info to a DeviceType enum value the backend understands.
 // Only the bridge itself enrolls via this code path → the answer is PC, SANDBOX,
 // or (defensively) UNKNOWN. Other device types come from other binaries.
@@ -205,12 +253,14 @@ void bridge_identity_gather(bridge_identity_t *id) {
     }
 #endif
 
+    detect_machine_id(id->os, id->machine_id, sizeof(id->machine_id));
+
     // Sanitize all fields: replace control bytes with space — keeps the
     // resulting JSON identifiers ASCII-clean even if a hostname/distro field
     // accidentally contains a stray byte.
     char *fields[] = { id->os, id->arch, id->hostname, id->kernel, id->distro,
                        id->distro_version, id->device_type, id->user,
-                       id->shell, id->home, id->cwd };
+                       id->shell, id->home, id->cwd, id->machine_id };
     for (size_t f = 0; f < sizeof(fields)/sizeof(fields[0]); f++) {
         for (char *p = fields[f]; *p; p++) {
             if ((unsigned char)*p < 0x20) *p = ' ';
@@ -254,6 +304,7 @@ int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     KV("shell",          id.shell);
     KV("home",           id.home);
     KV("cwd",            id.cwd);
+    if (id.machine_id[0]) KV("machine_id", id.machine_id);
     if (json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
 
     if (!top_level && json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;

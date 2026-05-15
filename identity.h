@@ -28,6 +28,7 @@ typedef struct {
     char shell[128];
     char home[256];
     char cwd[512];
+    char machine_id[65];     // /etc/machine-id | IOPlatformUUID | Win MachineGuid (empty if unavailable)
 } bridge_identity_t;
 
 void bridge_identity_gather(bridge_identity_t *id);
