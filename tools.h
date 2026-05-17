@@ -8,8 +8,13 @@
 
 #include <stddef.h>
 
+// Cap on the comma-joined list of just-installed tool names exposed in stats.
+// Bridge logs them on stderr; full list is also in the JSON reply (installedNow).
+#define BRIDGE_INSTALLED_NOW_CAP 512
+
 typedef struct {
-    int installed, authenticated;
+    int installed, authenticated, installed_now;
+    char installed_now_names[BRIDGE_INSTALLED_NOW_CAP]; // ", "-joined, may be truncated
 } bridge_scan_stats_t;
 
 // Full scan from the line-oriented payload of a TOOL_CATALOG message:

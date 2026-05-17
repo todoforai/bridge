@@ -1037,6 +1037,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)n);
                 fprintf(stderr, "✓ Probed CLI tools: %d installed, %d authenticated\n",
                         stats.installed, stats.authenticated);
+                if (stats.installed_now > 0) {
+                    fprintf(stderr, "✓ Preinstalled %d %s: %s\n",
+                            stats.installed_now,
+                            stats.installed_now == 1 ? "tool" : "tools",
+                            stats.installed_now_names);
+                }
             } else {
                 send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
                                          "scan_tools failed (overflow or empty catalog)");
@@ -1255,6 +1261,13 @@ static void service_sessions(edge_t *e) {
         // sessionId and may resume by sending INPUT (or another RUN against
         // this session). STEP_DONE must not tear the PTY down under it.
         s->one_shot = 0;
+        // Clear the per-step deadline: while parked awaiting input the agent
+        // owns the lifecycle (its awaitResume has its own timeout). Without
+        // this, the original timeout still fires and emits STEP_DONE(timedOut),
+        // tearing down the backend's pendingRun while the user is still
+        // typing — subsequent resume calls find no parked run and spawn a
+        // new one-shot instead of feeding stdin to this session.
+        s->deadline_ms = 0;
         send_step_awaiting_input(e, s, pwd);
         fprintf(stderr, "RUN awaiting input: %s fg=%ld pwd=%d\n",
                 s->run_block_id, fg, pwd);

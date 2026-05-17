@@ -41,6 +41,7 @@
 
 #define VERSION_TIMEOUT_MS 5000
 #define STATUS_TIMEOUT_MS  10000
+#define INSTALL_TIMEOUT_MS 180000 // 3 min for package managers (npm/pip/bun)
 #define OUT_CAP            200   // trim captured output (matches edge scanner)
 #define VERSION_CAP        100
 
@@ -178,6 +179,16 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
         close(pipefd[0]); close(pipefd[1]);
         // New process group so we can kill the whole shell pipeline on timeout.
         setpgid(0, 0);
+        // Make ~/.local/bin visible to probes/installs so a tool just dropped
+        // there by an earlier install step is found on the re-probe in the
+        // same scan_tools call (Ubuntu's ~/.profile only adds it at login).
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            const char *old = getenv("PATH");
+            char path_buf[2048];
+            snprintf(path_buf, sizeof path_buf, "%s/.local/bin:%s", home, old ? old : "/usr/local/bin:/usr/bin:/bin");
+            setenv("PATH", path_buf, 1);
+        }
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -254,21 +265,27 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
 
 
 
-// Decode one catalog line: "<key>\t<b64_versionCmd>\t<b64_statusCmd>".
-// Returns 1 on success, 0 if the line is malformed/oversized.
+// Decode one catalog line: "<key>\t<b64_versionCmd>\t<b64_statusCmd>[\t<b64_installCmd>]".
+// The 4th field is optional; when present and the tool is missing, scan_tools
+// runs it and re-probes. Returns 1 on success, 0 if malformed/oversized.
 static int parse_entry(const char *line, size_t line_len,
                        char *key, size_t key_cap,
                        char *vcmd, size_t vcmd_cap, int *have_v,
-                       char *scmd, size_t scmd_cap, int *have_s) {
-    *have_v = *have_s = 0;
+                       char *scmd, size_t scmd_cap, int *have_s,
+                       char *icmd, size_t icmd_cap, int *have_i) {
+    *have_v = *have_s = *have_i = 0;
     const char *t1 = memchr(line, '\t', line_len);
     if (!t1) return 0;
     const char *t2 = memchr(t1 + 1, '\t', (size_t)(line + line_len - (t1 + 1)));
     if (!t2) return 0;
+    // Optional 3rd tab separating statusCmd from installCmd.
+    const char *t3 = memchr(t2 + 1, '\t', (size_t)(line + line_len - (t2 + 1)));
+    const char *s_end = t3 ? t3 : line + line_len;
 
     size_t kl = (size_t)(t1 - line);
     size_t vl = (size_t)(t2 - (t1 + 1));
-    size_t sl = (size_t)(line + line_len - (t2 + 1));
+    size_t sl = (size_t)(s_end - (t2 + 1));
+    size_t il = t3 ? (size_t)(line + line_len - (t3 + 1)) : 0;
     if (kl == 0 || kl >= key_cap) return 0;
     memcpy(key, line, kl); key[kl] = '\0';
 
@@ -281,27 +298,42 @@ static int parse_entry(const char *line, size_t line_len,
         dl = b64_decode(t2 + 1, sl, scmd, scmd_cap - 1);
         if (dl > 0 && dl < scmd_cap) { scmd[dl] = '\0'; *have_s = 1; }
     }
+    if (il > 0 && il < icmd_cap * 2) {
+        dl = b64_decode(t3 + 1, il, icmd, icmd_cap - 1);
+        if (dl > 0 && dl < icmd_cap) { icmd[dl] = '\0'; *have_i = 1; }
+    }
     return 1;
 }
 
 // One catalog entry: input cmds + post-probe results.
 typedef struct {
     char key[64];
-    char vcmd[512], scmd[512];
-    int  have_v, have_s;
+    char vcmd[512], scmd[512], icmd[1024];
+    int  have_v, have_s, have_i;
     char version_out[VERSION_CAP + 1];
     char status_out[OUT_CAP + 1];
     int  v_exit, s_exit;
-    int  installed, authed;
+    int  installed, authed, installed_now;
 } probe_t;
 
-// Run versionCmd + statusCmd for one entry. Pure: no shared state.
+// Run versionCmd + statusCmd. If missing and installCmd is present, run it
+// once and re-probe. Pure: no shared state.
 static void probe_run(probe_t *p) {
     p->v_exit = p->s_exit = -1;
     if (p->have_v) p->v_exit = run_shell(p->vcmd, VERSION_TIMEOUT_MS, p->version_out, sizeof(p->version_out));
     if (p->have_s) p->s_exit = run_shell(p->scmd, STATUS_TIMEOUT_MS,  p->status_out,  sizeof(p->status_out));
     p->installed = (p->have_v && p->v_exit == 0 && p->version_out[0] != '\0') ||
                    (!p->have_v && p->have_s && p->s_exit == 0);
+
+    if (!p->installed && p->have_i) {
+        char sink[OUT_CAP + 1];
+        run_shell(p->icmd, INSTALL_TIMEOUT_MS, sink, sizeof(sink));
+        if (p->have_v) p->v_exit = run_shell(p->vcmd, VERSION_TIMEOUT_MS, p->version_out, sizeof(p->version_out));
+        if (p->have_s) p->s_exit = run_shell(p->scmd, STATUS_TIMEOUT_MS,  p->status_out,  sizeof(p->status_out));
+        p->installed = (p->have_v && p->v_exit == 0 && p->version_out[0] != '\0') ||
+                       (!p->have_v && p->have_s && p->s_exit == 0);
+        p->installed_now = p->installed;
+    }
     p->authed = p->have_s ? (p->s_exit == 0) : p->installed;
 }
 
@@ -320,6 +352,11 @@ static int probe_append_json(const probe_t *p, int first,
         if (json_emit_str(out, out_cap, used, "version", -1) < 0) return -1;
         if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
         if (json_emit_str(out, out_cap, used, p->version_out, -1) < 0) return -1;
+    }
+    if (p->installed_now) {
+        if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
+        if (json_emit_str(out, out_cap, used, "installedNow", -1) < 0) return -1;
+        if (json_emit_raw(out, out_cap, used, ":true", 5) < 0) return -1;
     }
     if (p->installed && p->have_s) {
         if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
@@ -377,7 +414,8 @@ static probe_t *parse_catalog(const char *entries, size_t entries_len, int *out_
         if (parse_entry(p, (size_t)(line_end - p),
                         e->key, sizeof(e->key),
                         e->vcmd, sizeof(e->vcmd), &e->have_v,
-                        e->scmd, sizeof(e->scmd), &e->have_s)) {
+                        e->scmd, sizeof(e->scmd), &e->have_s,
+                        e->icmd, sizeof(e->icmd), &e->have_i)) {
             n++;
         }
         p = line_end + 1;
@@ -389,7 +427,10 @@ static probe_t *parse_catalog(const char *entries, size_t entries_len, int *out_
 int bridge_scan_tools(const char *entries, size_t entries_len,
                       char *out, size_t out_cap,
                       bridge_scan_stats_t *stats) {
-    if (stats) { stats->installed = stats->authenticated = 0; }
+    if (stats) {
+        stats->installed = stats->authenticated = stats->installed_now = 0;
+        stats->installed_now_names[0] = '\0';
+    }
 
     int n = 0;
     probe_t *probes = parse_catalog(entries, entries_len, &n);
@@ -425,6 +466,15 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
         if (stats) {
             if (p->installed)              stats->installed++;
             if (p->installed && p->authed) stats->authenticated++;
+            if (p->installed_now) {
+                stats->installed_now++;
+                size_t cur = strlen(stats->installed_now_names);
+                size_t need = (cur ? 2 : 0) + strlen(p->key);
+                if (cur + need + 1 < sizeof(stats->installed_now_names)) {
+                    if (cur) { stats->installed_now_names[cur++] = ','; stats->installed_now_names[cur++] = ' '; }
+                    strcpy(stats->installed_now_names + cur, p->key);
+                }
+            }
         }
         if (probe_append_json(p, i == 0, out, out_cap, &used) < 0) {
             free(probes); return -1;

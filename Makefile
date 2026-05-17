@@ -108,7 +108,7 @@ release-windows-x64: | build
 # wrapped commands, asserts the bridge's emit/parse logic matches.
 .PHONY: test-run
 test-run: | build
-	$(CC) -O0 -g -Wall -Wextra -o build/test-run test_run.c pty_posix.c -lutil
+	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-run test/test_run.c pty_posix.c -lutil
 	./build/test-run
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
