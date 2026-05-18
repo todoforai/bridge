@@ -1529,8 +1529,8 @@ int main(int argc, char **argv) {
 
     // Show 8-char device id prefix so the trailing "..." reads as "connecting…"
     // rather than "id truncated". Full id is in ~/.config/todoforai/credentials.json.
-    fprintf(stderr, "Connecting to %s:%u (device: %.8s…) ...\n",
-            host, (unsigned)port, saved_creds.device_id);
+    fprintf(stderr, "Connecting to %s:%u (device: %.8s…, bridge %s) ...\n",
+            host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
 
     g_max_sessions = resolve_max_sessions();
     // Each session needs a master fd + a few transient pipes in the child
