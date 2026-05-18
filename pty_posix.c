@@ -172,7 +172,11 @@ int bridge_pty_pollfd(const bridge_pty_t *p) {
 #endif
 
 // Authoritative: read /proc/<pid>/syscall. Returns 1 iff the task is blocked
-// inside read()/pread64()/readv() on an fd pointing at /dev/pts/*. Format:
+// inside read()/pread64()/readv() on an fd pointing at the controlling
+// terminal — /dev/pts/* (normal stdin) or /dev/tty (sudo/ssh/getpass open
+// the controlling terminal explicitly on a non-0 fd; the symlink resolves
+// to literal "/dev/tty"). Caller already gates by tcgetpgrp on our master,
+// so a /dev/tty hit here is always our pts. Format:
 //   <num> <arg0> <arg1> <arg2> <arg3> <arg4> <arg5> <sp> <pc>
 // "running" appears for non-sleeping tasks. Permission denied is normal for
 // non-owned processes; caller falls back to wchan.
@@ -192,13 +196,13 @@ static int proc_syscall_is_tty_read(pid_t pid) {
     unsigned long arg0 = 0;
     if (sscanf(buf, "%ld %lx", &sysnum, &arg0) != 2) return 0;
     if (sysnum != BRIDGE_SYS_READ) return 0;
-    // Resolve fd → path; require /dev/pts/*.
+    // Resolve fd → path; accept /dev/pts/* or /dev/tty.
     snprintf(path, sizeof(path), "/proc/%d/fd/%lu", (int)pid, arg0);
     char target[64];
     ssize_t tn = readlink(path, target, sizeof(target) - 1);
     if (tn <= 0) return 0;
     target[tn] = '\0';
-    return strncmp(target, "/dev/pts/", 9) == 0;
+    return strncmp(target, "/dev/pts/", 9) == 0 || strcmp(target, "/dev/tty") == 0;
 }
 
 // Fallback: read /proc/<pid>/wchan and return 1 iff the task is parked in a

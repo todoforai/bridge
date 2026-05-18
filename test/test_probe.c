@@ -1,6 +1,6 @@
 // Smoke test for bridge_pty_probe_blocked.
 // Spawns a shell, runs `read -r v`, sleeps to let it block on stdin, probes.
-// Then runs sudo (if present) to test the password_prompt flag.
+// Then runs a /dev/tty getpass (mimics sudo's password prompt path).
 #define _POSIX_C_SOURCE 200809L
 #include "pty.h"
 #include <fcntl.h>
@@ -60,7 +60,24 @@ int main(void) {
         msleep(100);
         bridge_pty_close(&p);
     }
-    // 3) busy command — should NOT be blocked
+    // 3) /dev/tty read via python — sudo opens the controlling terminal
+    // explicitly (fd != 0, target "/dev/tty"). Validates the syscall path
+    // accepts /dev/tty in addition to /dev/pts/*. Skips if python3 missing.
+    if (system("command -v python3 >/dev/null 2>&1") == 0) {
+        bridge_pty_t p;
+        if (bridge_pty_spawn(&p, "/bin/bash", NULL, /*no_echo=*/0) != 0) { fprintf(stderr, "spawn failed\n"); return 1; }
+        const char *cmd = "python3 -c 'import os; fd=os.open(\"/dev/tty\", os.O_RDONLY); os.read(fd, 100)'\n";
+        bridge_pty_write_all(&p, cmd, strlen(cmd));
+        // Python startup is slow; need >1s for the syscall to settle in read().
+        drain(&p, 1500);
+        long fg=0; int pwd=0;
+        int r = bridge_pty_probe_blocked(&p, /*echo_baseline=*/1, &fg, &pwd);
+        printf("[/dev/tty] blocked=%d fg=%ld pwd=%d (expect blocked=1)\n", r, fg, pwd); fflush(stdout);
+        bridge_pty_write_all(&p, "hi\n", 3);
+        msleep(100);
+        bridge_pty_close(&p);
+    }
+    // 4) busy command — should NOT be blocked
     {
         bridge_pty_t p;
         if (bridge_pty_spawn(&p, "/bin/sh", NULL, /*no_echo=*/1) != 0) { fprintf(stderr, "spawn failed\n"); return 1; }
