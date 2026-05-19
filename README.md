@@ -14,8 +14,6 @@ else — SSH, port exposure, overlay networking, language runtimes — is
 configured by the AI at the user's request by running commands through
 this same channel.
 
-See [`../ARCHITECTURE_BRIDGE_MACHINES.md`](../ARCHITECTURE_BRIDGE_MACHINES.md)
-for the overall model.
 
 ## Wire protocol
 
