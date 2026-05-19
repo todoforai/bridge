@@ -145,39 +145,26 @@ typedef struct {
     char run_block_id[BLOCK_ID_CAP + 1];
     size_t run_block_id_len;
     int64_t deadline_ms;                 // 0 = no deadline
-    // Rolling tail buffer: holds the trailing (sentinel_len) bytes that
-    // could be the start of a sentinel split across read() chunks.
+    // Rolling buffer for the trailing sentinel_len bytes (sentinel may span
+    // read() chunks).
     uint8_t tail_buf[TAIL_CAP];
     size_t  tail_len;
-    // Monotonic ms of last activity (spawn / INPUT / OUTPUT / STEP_DONE).
-    // Used as LRU key when evicting an idle session to make room for a new
-    // RUN once the array is full. SESS_RUNNING sessions are never evicted.
+    // LRU key for idle-session eviction. SESS_RUNNING is never evicted.
     int64_t last_active_ms;
-    // Awaiting-input detection (RUN only): poll the wchan probe every
-    // PAUSE_POLL_MS and emit STEP_AWAITING_INPUT once `blocked` is observed
-    // PAUSE_CONFIRM_TICKS times in a row. Any non-blocked tick resets the
-    // counter, so resumption (input arrived → process leaves n_tty_read) is
-    // detected implicitly.
+    // Awaiting-input probe: poll wchan every PAUSE_POLL_MS, fire after
+    // PAUSE_CONFIRM_TICKS consecutive `blocked` ticks. Resumption resets implicitly.
     int64_t last_pause_poll_ms;
     int     pause_consec_ticks;
-    // Monotonic ms stamp set AFTER bridge_pty_write_all returns (RUN cmd or
-    // INPUT). Bridge is single-threaded, so the probe can't run during the
-    // write — only the trailing ldisc drain (≤4KB) is a false-pause window.
-    // Probe waits INPUT_GRACE_MS past this stamp before it may fire.
+    // Stamp after bridge_pty_write_all; probe waits INPUT_GRACE_MS past it to
+    // avoid false-pause during the trailing line-discipline drain.
     int64_t last_input_ms;
 } session_t;
 
-// Pause poll cadence + confirmation. 2 ticks at 250 ms ⇒ ~250-500 ms latency
-// to detect a real prompt; FP rate ~1-2% (vs. ~30-60% for output-quiescence).
+// 2 ticks × 250 ms ⇒ ~250-500 ms latency, FP rate ~1-2%.
 #define PAUSE_POLL_MS        250
 #define PAUSE_CONFIRM_TICKS  2
-// Grace period AFTER bridge_pty_write_all returns before pause detection may
-// fire. The bridge is single-threaded so the probe can't run during the
-// write itself; the only false-pause window is the trailing line-discipline
-// drain (≤ Linux n_tty buffer ~4KB, drains at >>1MB/s → tens of ms in
-// practice). Sized generously to cover slow VMs while staying well below
-// PAUSE_POLL_MS+PAUSE_CONFIRM_TICKS, so latency for genuine prompts is
-// unaffected (still ~500ms after the wrapped command's last byte).
+// Grace after write covers the ldisc drain (~tens of ms on Linux n_tty);
+// stays well below PAUSE_POLL_MS*PAUSE_CONFIRM_TICKS so prompt latency is unaffected.
 #define INPUT_GRACE_MS       500
 
 typedef struct {
@@ -187,16 +174,20 @@ typedef struct {
     const char *device_secret;
     int done;
     int rc;
-    // Auth → identity sequencing. Backend's pre-auth handler awaits
-    // validateDevice() asynchronously; if both frames land in one TCP segment
-    // (TCP-coalesced into one segment), the second hits the handler with
-    // authenticated=false and is rejected as "expected auth". Defer identity
-    // until the auth round-trip has had time to settle on the backend.
+    // Defer identity until auth round-trip settles: backend awaits
+    // validateDevice() async, so a TCP-coalesced 2nd frame is rejected.
     int identity_sent;
     int64_t auth_sent_ms;
 
-    // Last disconnect reason — surfaced by main() so users get actionable output
-    // instead of a bare "Disconnected".
+    // Bearer (sat_… 64 hex) from backend post-auth. Exported as
+    // TODOFORAI_API_TOKEN to PTY children (subagent/-explore auth without
+    // user shipping a real API key). Refresh = reconnect.
+    char subagent_token[80];
+
+    // Bridge's HTTP API URL, exported as TODOFORAI_API_URL so child CLIs
+    // route to the SAME backend that minted the token.
+    char api_url[320];
+
     uint16_t close_code;
     int      got_close_frame;
     char     close_reason[128];
@@ -238,6 +229,8 @@ static void reset_connection_state(edge_t *e) {
     e->identity_sent = 0; e->auth_sent_ms = 0;
     e->got_close_frame = 0; e->close_code = 0;
     e->close_reason[0] = '\0'; e->err_msg[0] = '\0';
+    // Token is reissued by the backend on every reconnect; drop the stale one.
+    e->subagent_token[0] = '\0';
 }
 
 static int64_t monotonic_ms(void) {
@@ -573,15 +566,9 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
     send_json(e, buf, u);
 }
 
-// Bridge → server: "the step's foreground process is blocked in a tty read,
-// waiting for stdin". The shell itself is alive (not SIGSTOP'd) and the RUN
-// stays in flight — backend resolves the pending RUN promise with
-// `awaitingInput:true` so the agent gets the prompt text and can resume by
-// sending INPUT on the same sessionId. The actual blocked pid (often a child
-// of the shell, e.g. sudo) is detected internally but not surfaced on the
-// wire: SIGINT is delivered via PTY stdin (`\x03`), and the kernel TTY line
-// discipline routes it to the foreground pgrp.
-// `passwordPrompt` is true when the slave has ECHO disabled (sudo/getpass/ssh).
+// Bridge → server: step's fg process is blocked in a tty read. RUN stays in
+// flight; backend resolves the promise with awaitingInput:true so the agent
+// can resume via INPUT on the same sessionId. `passwordPrompt` ⇔ ECHO off.
 static void send_step_awaiting_input(edge_t *e, session_t *s, int password_prompt) {
     char buf[512]; size_t u = 0;
     char shell_pid_buf[24]; snprintf(shell_pid_buf, sizeof shell_pid_buf, "%ld", SHELL_PID(s));
@@ -596,13 +583,9 @@ static void send_step_awaiting_input(edge_t *e, session_t *s, int password_promp
     send_json(e, buf, u);
 }
 
-// Reset per-step state. Subsequent PTY bytes (e.g. trailing async output)
-// emit OUTPUT without a blockId — the backend routes them to the session.
-//
-// One-shot sessions (spawned by a RUN with no `sessionId`) are torn down
-// here: the agent never asked for a persistent session, so the slot is
-// reclaimed eagerly. If the run hit STEP_AWAITING_INPUT mid-step, `one_shot`
-// was cleared there — the session has been "promoted" and survives this finish.
+// Reset per-step state. Trailing PTY bytes still emit OUTPUT (no blockId).
+// One-shot sessions tear down here; promoted sessions (one_shot cleared in
+// send_step_awaiting_input) survive.
 static void run_finish(session_t *s) {
     s->state = SESS_IDLE;
     s->tail_len = 0;
@@ -615,15 +598,8 @@ static void run_finish(session_t *s) {
     // is the most-recently-used.
     s->last_active_ms = monotonic_ms();
     if (s->one_shot) {
-        // The wrapped command finished but the shell is still alive — we
-        // own its lifecycle, so SIGKILL it synchronously and reclaim the
-        // slot. SIGKILL (not "exit\n") keeps bridge_pty_close's blocking
-        // waitpid bounded; same pattern as evict_lru_idle.
-        //
-        // No EXIT frame: the backend has already settled the agent's
-        // promise via STEP_DONE, and backend's EXIT handler is log-only —
-        // emitting "code=-9" after every successful one-shot would just be
-        // noise that looks like a failure.
+        // SIGKILL (not "exit\n") to keep bridge_pty_close's waitpid bounded.
+        // No EXIT frame: STEP_DONE already settled the promise.
         fprintf(stderr, "PTY auto-close %s (one-shot done)\n", s->session_id);
         bridge_pty_signal(&s->pty, /*SIGKILL=*/9);
         bridge_pty_close(&s->pty);
@@ -875,20 +851,25 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (timeout_ms > 365LL * 24 * 60 * 60 * 1000) timeout_ms = 365LL * 24 * 60 * 60 * 1000;
         s->deadline_ms = timeout_ms > 0 ? monotonic_ms() + timeout_ms : 0;
 
-        // Wrapper: run the user cmd inside a brace group so we can capture
-        // its exit status ($?) and emit a per-step sentinel line afterwards.
-        // Assumes `cmd` is syntactically complete shell input: trailing
-        // operators (&&, ||, |), unterminated quotes, or unclosed heredocs
-        // leave the shell waiting for more input — the sentinel never runs
-        // and the step will fail via timeout. Background jobs (cmd &) cause
-        // the sentinel to fire when the job is *launched*, not when it ends.
-        // printf with explicit \n on both sides makes the sentinel its own line.
-        size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + 64;
+        // Wrap cmd in a brace group to capture $? and emit the per-step
+        // sentinel. Assumes syntactically complete shell input; background
+        // jobs (cmd &) make the sentinel fire at *launch*. Prefix `export`
+        // when a subagent token is set so child CLIs authenticate without
+        // TODOFORAI_API_KEY. Token (`sat_` + 64 hex) and api_url are shell-safe.
+        size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len
+                             + sizeof(e->subagent_token) + sizeof(e->api_url) + 128;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
-        int wn = snprintf(wrapped, wrapped_cap,
-            "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
-            (int)cmd_len, cmd, s->sentinel);
+        int wn;
+        if (e->subagent_token[0]) {
+            wn = snprintf(wrapped, wrapped_cap,
+                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                e->subagent_token, e->api_url, (int)cmd_len, cmd, s->sentinel);
+        } else {
+            wn = snprintf(wrapped, wrapped_cap,
+                "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                (int)cmd_len, cmd, s->sentinel);
+        }
         free(cmd);
         if (wn <= 0 || (size_t)wn >= wrapped_cap) {
             free(wrapped);
@@ -920,6 +901,21 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->last_input_ms = monotonic_ms();
         free(wrapped);
         #undef RUN_FAIL_CLEANUP
+
+    } else if (IS("subagent_token")) {
+        // Server pushes a short-lived bearer token (sat_…) right after auth.
+        // Bridge stashes it on edge_t and exports it as TODOFORAI_API_TOKEN
+        // into every PTY's wrapper env (see RUN handler). Refresh = reconnect.
+        const char *t = NULL; size_t tlen = 0;
+        if (json_get_str(msg, msg_len, "token", &t, &tlen) && tlen > 0 && tlen < sizeof e->subagent_token) {
+            memcpy(e->subagent_token, t, tlen);
+            e->subagent_token[tlen] = '\0';
+            fprintf(stderr, "subagent_token received (%zu bytes)\n", tlen);
+        } else {
+            // Bad/oversized token: clear so we don't leak a partial value into env.
+            e->subagent_token[0] = '\0';
+            fprintf(stderr, "subagent_token: missing or invalid 'token' field; ignoring\n");
+        }
 
     } else if (IS("input")) {
         // Forward raw stdin bytes — used to resume a RUN awaiting input. The bridge
@@ -972,11 +968,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (has_rid) send_ack(e, rid, rid_len);
 
     } else if (IS("FUNCTION_CALL_REQUEST_AGENT")) {
-        // Generic agent→edge function dispatch. Envelope is payload-wrapped
-        // unlike all other bridge frames:
-        //   {"type":"FUNCTION_CALL_REQUEST_AGENT",
-        //    "payload":{"requestId":"...","agentId":"...","edgeId":"...",
-        //               "functionName":"scan_tools","args":{...}}}
+        // Payload-wrapped: {"payload":{"requestId","agentId","edgeId","functionName","args"}}
         const char *payload = NULL; size_t payload_len = 0;
         if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len))
             return send_error(e, NULL, 0, NULL, 0, "MISSING_PAYLOAD",
@@ -1050,12 +1042,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             }
             free(result);
         } else if (fn_len == 14 && memcmp(fn, "write_file_b64", 14) == 0) {
-            // args = {"path": "...", "dataB64": "...", "offset"?: N | -1, "truncate"?: bool}
-            //   offset omitted or 0  → write from start (default truncate=true)
-            //   offset = -1          → append (O_APPEND, truncate must be false)
-            //   offset > 0           → pwrite at byte offset (chunk upload, default truncate=false)
-            // Result: {"bytesWritten": N, "totalSize": N}
-            // Portable fd helpers — MSVC names POSIX fd ops with leading underscores.
+            // args: {path, dataB64, offset?: N|-1, truncate?: bool}
+            //   offset = 0 / omitted → write from start (truncate default=true)
+            //   offset = -1          → append (truncate must be false)
+            //   offset > 0           → pwrite (truncate default=false)
+            // Result: {bytesWritten, totalSize}
             #ifdef _WIN32
             #  define wfb_close(fd)        _close(fd)
             #  define wfb_fstat(fd, st)    _fstati64((fd), (st))
@@ -1182,11 +1173,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 
-// Per-tick session servicing: reap, deadline, pause-probe, PTY drain. PTY
-// master fds are non-blocking (set by bridge_pty_spawn), so reads here
-// return 0 immediately when no data is available. Idle sessions live
-// forever — slot pressure is handled lazily via LRU eviction on the next
-// RUN (see evict_lru_idle()).
+// Per-tick: reap, deadline, pause-probe, PTY drain (non-blocking).
+// Idle sessions live forever; slot pressure handled via LRU on the next RUN.
 static void service_sessions(edge_t *e) {
     int64_t now = monotonic_ms();
 
@@ -1230,22 +1218,15 @@ static void service_sessions(edge_t *e) {
         run_finish(s);
     }
 
-    // Awaiting-input detection: poll the wchan probe at PAUSE_POLL_MS
-    // cadence; emit STEP_AWAITING_INPUT once `blocked` has been observed
-    // PAUSE_CONFIRM_TICKS times in a row. A single non-blocked tick (e.g.
-    // process resumed, or it was a transient pipe_read between bytes)
-    // resets the counter.
+    // Awaiting-input probe: see PAUSE_POLL_MS / PAUSE_CONFIRM_TICKS comments above.
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active || s->state != SESS_RUNNING) continue;
         if (now - s->last_pause_poll_ms < PAUSE_POLL_MS) continue;
         s->last_pause_poll_ms = now;
 
-        // Grace window after our last write to the PTY: large single-line
-        // inputs (e.g. multi-MB doc_write base64) take seconds to drain
-        // through line discipline, during which the slave shell legitimately
-        // sits in read(/dev/pts/*) — but waiting for *us*, not for user
-        // stdin. Skip the probe entirely for INPUT_GRACE_MS after each write.
+        // Skip during ldisc-drain after large writes (multi-MB base64) —
+        // the shell legitimately sits in read() waiting on *us*, not user stdin.
         if (now - s->last_input_ms < INPUT_GRACE_MS) { s->pause_consec_ticks = 0; continue; }
 
         long fg = 0; int pwd = 0;
@@ -1257,16 +1238,10 @@ static void service_sessions(edge_t *e) {
             send_output_bytes(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
         }
-        // Promote one-shot to persistent: the agent now has the minted
-        // sessionId and may resume by sending INPUT (or another RUN against
-        // this session). STEP_DONE must not tear the PTY down under it.
+        // Promote one-shot → persistent so STEP_DONE doesn't tear it down.
         s->one_shot = 0;
-        // Clear the per-step deadline: while parked awaiting input the agent
-        // owns the lifecycle (its awaitResume has its own timeout). Without
-        // this, the original timeout still fires and emits STEP_DONE(timedOut),
-        // tearing down the backend's pendingRun while the user is still
-        // typing — subsequent resume calls find no parked run and spawn a
-        // new one-shot instead of feeding stdin to this session.
+        // Drop the per-step deadline: agent owns lifecycle via awaitResume.
+        // Otherwise timeout fires STEP_DONE(timedOut) while the user is typing.
         s->deadline_ms = 0;
         send_step_awaiting_input(e, s, pwd);
         fprintf(stderr, "RUN awaiting input: %s fg=%ld pwd=%d\n",
@@ -1312,6 +1287,15 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                const uint8_t pubkey[32]) {
     e->device_id = device_id;
     e->device_secret = device_secret;
+    // Derive HTTP API URL from the Noise host:port (same backend, different scheme).
+    {
+        const char *scheme = login_is_local_host(host) ? "http" : "https";
+        int default_port = (scheme[4] == 's') ? 443 : 80;
+        if ((int)port == default_port)
+            snprintf(e->api_url, sizeof e->api_url, "%s://%s", scheme, host);
+        else
+            snprintf(e->api_url, sizeof e->api_url, "%s://%s:%u", scheme, host, (unsigned)port);
+    }
     if (noise_ws_init(&e->noise, pubkey) != 0) {
         fail(e, "failed to initialize noise (bad server pubkey?)");
         return -1;
@@ -1432,18 +1416,15 @@ static void bump_fd_limit(int want) {
 }
 
 int main(int argc, char **argv) {
-    // If a new binary was staged next to us (by a prior `exec` update command),
-    // swap it in before we do anything else. See update.h.
+    // Swap in any binary staged by a prior `exec` update. See update.h.
     bridge_update_swap_on_start(argv[0]);
 
-    // Subcommand dispatch (must come before option parsing so `bridge login -h`
-    // shows the login-specific usage).
+    // Subcommand dispatch before option parsing so `bridge login -h` works.
     if (argc >= 2 && strcmp(argv[1], "login") == 0) {
         int rc = cmd_login(argc - 1, argv + 1);
-        if (rc == CMD_RC_HELP) return 0;   // help printed → done, don't start daemon
+        if (rc == CMD_RC_HELP) return 0;
         if (rc != 0) return rc;
-        // Fall through into the daemon: user is now logged in, no need to re-run.
-        argc = 1;
+        argc = 1;   // fall through into daemon
     }
     if (argc >= 2 && strcmp(argv[1], "logout") == 0) {
         return cmd_logout(argc - 1, argv + 1);
@@ -1480,16 +1461,11 @@ int main(int argc, char **argv) {
     memset(&saved_creds, 0, sizeof(saved_creds));
     (void)login_load_credentials(&saved_creds);
 
-    // No creds yet → run the login flow inline. The user just typed
-    // `todoforai-bridge`, so do the obvious thing instead of asking them
-    // to re-run with `login`. After successful login we fall through and
-    // start the daemon. Sandbox/systemd setups always pre-provision via
-    // `login --token`, so they never hit this path.
+    // No creds → run login inline, then fall through to daemon.
+    // Sandbox/systemd setups pre-provision via `login --token` and skip this.
     if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
         fprintf(stderr, "No device credentials found. Starting login...\n\n");
-        // Forward --host so login targets the same backend. --port is
-        // intentionally not forwarded: it's BRIDGE_PORT (HTTP/WS) here vs
-        // NOISE_BACKEND_PORT for login — different transports.
+        // Forward --host only; --port here is BRIDGE_PORT (HTTP/WS), not Noise.
         int rc = bridge_login_run(NULL, NULL, host, NULL);
         if (rc != 0) return rc;
         if (login_load_credentials(&saved_creds) < 0
@@ -1542,12 +1518,9 @@ int main(int argc, char **argv) {
     e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
     if (!e->sessions) { free(e); return 1; }
 
-    // Reconnect loop. PTY sessions in e->sessions[] survive across reconnects:
-    // they're independent OS processes (master fd + child pid) with no tie to
-    // the WS transport. PTY/session IDs are retained; subsequent frames use
-    // the same sessionId after reconnect so backend routing resumes naturally.
-    // (Note: any in-flight RPC the backend had pending across the disconnect
-    // is rejected by BridgeHandler.handleClose — not replayed by us.)
+    // Reconnect loop. PTY sessions survive (independent processes, no WS tie);
+    // sessionIds are retained so backend routing resumes after reconnect.
+    // In-flight RPCs across the disconnect are rejected by handleClose — not replayed.
     const int max_attempts = 20;
     int attempt = 0;
     int rc;

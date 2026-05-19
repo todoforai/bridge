@@ -1,5 +1,4 @@
-// CLI subcommands: login / enroll / whoami / help.
-// Extracted from main.c. The daemon path stays in main.c.
+// CLI subcommands: login / logout / enroll / whoami / help.
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -11,23 +10,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "args.h"      // ketopt + cli_usage helpers
-#include "identity.h"  // BRIDGE_VERSION, bridge_identity_json
-#include "noise.h"     // noise_random
+#include "args.h"
+#include "identity.h"
+#include "noise.h"
 
 #define LOGIN_IMPLEMENTATION
 #include "login.h"
 
-// ── Usage strings ────────────────────────────────────────────────────────────
-
-// NOTE: --host / --port are developmental flags (override backend Noise addr).
-// --ttl overrides enroll token TTL (default 300s). All still parsed below, but
-// intentionally omitted from help to keep the public surface minimal.
+// --host / --port / --ttl are dev flags, parsed but omitted from help.
 const char *USAGE_MAIN = "";
 
-// Resolve backend Noise addr (host:port). `host`/`port_s` may be NULL;
-// precedence: CLI flag > env (NOISE_BACKEND_HOST / _PORT) > saved login
-// backendHost > prod default.
+// Precedence: CLI flag > env (NOISE_BACKEND_HOST/_PORT) > saved login > prod default.
 static void resolve_backend_addr(const char *host, const char *port_s,
                                  char *addr_buf, size_t addr_cap) {
     if (!host)   host   = getenv("NOISE_BACKEND_HOST");
@@ -45,8 +38,7 @@ static void resolve_backend_addr(const char *host, const char *port_s,
     snprintf(addr_buf, addr_cap, "%s:%s", host, port_s);
 }
 
-// Parse device creds out of a successful enroll.redeem / login.poll response.
-// Looks for the nested "device":{...} and optional "user":{...} objects.
+// Extract nested "device":{...} and optional "user":{...} from a response.
 static int parse_device_creds(const char *resp, login_credentials_t *creds) {
     memset(creds, 0, sizeof(*creds));
     const char *dev = strstr(resp, "\"device\"");
@@ -65,14 +57,8 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
     return (creds->device_id[0] && creds->device_secret[0]) ? 0 : -1;
 }
 
-// Redeem an enrollment token for fresh device credentials and save them.
-// The redeemer self-describes via identity gathered from the host (uname,
-// /etc/os-release, sandbox marker, …). Backend derives `deviceType` from
-// `identity.deviceType` and stores the rest as device metadata. An optional
-// `deviceName` overrides the hostname-derived default.
-//
-// Fresh-machine path: no creds yet, so the backend's Noise pubkey is learned
-// (TOFU) on the handshake and persisted with the redeemed device credentials.
+// Redeem an enrollment token for device credentials and save them.
+// Backend pubkey is learned via TOFU on the handshake and persisted with creds.
 static int redeem_enroll_token(const char *token, const char *device_name,
                                const char *host, const char *port_s) {
     char addr_buf[280];
@@ -120,7 +106,7 @@ static int redeem_enroll_token(const char *token, const char *device_name,
         return -1;
     }
 
-    // Persist backend host + learned pubkey so the daemon reconnects without flags.
+    // Persist backend host + TOFU pubkey so the daemon reconnects without flags.
     const char *bcolon = strrchr(addr_buf, ':');
     size_t bhlen = bcolon ? (size_t)(bcolon - addr_buf) : strlen(addr_buf);
     if (bhlen >= sizeof(creds.backend_host)) bhlen = sizeof(creds.backend_host) - 1;
@@ -143,7 +129,7 @@ static int redeem_enroll_token(const char *token, const char *device_name,
 
 int bridge_login_run(const char *device_name, const char *token,
                      const char *host, const char *port_s) {
-    // Already logged in? Reuse existing creds — to switch user/device run logout first.
+    // Already logged in? Reuse — `logout` first to switch user/device.
     login_credentials_t existing;
     memset(&existing, 0, sizeof(existing));
     if (login_load_credentials(&existing) == 0
@@ -158,11 +144,8 @@ int bridge_login_run(const char *device_name, const char *token,
         return 0;
     }
 
-    // Token path: non-interactive enrollment via short-lived token (sandbox
-    // /init, scripted installs). Interactive path: device-code flow + browser.
-    // Both fall through to the daemon in main(), so `bridge login [...]`
-    // behaves identically to `bridge` after creds are obtained. Both learn
-    // the backend's Noise pubkey on the handshake (TOFU) and pin thereafter.
+    // Token: non-interactive (sandbox /init, scripted installs).
+    // No token: interactive device-code flow + browser.
     if (token && *token) {
         return redeem_enroll_token(token, device_name, host, port_s) == 0 ? 0 : 1;
     }
@@ -188,8 +171,6 @@ int cmd_login(int argc, char **argv) {
     ketopt_t opt = KETOPT_INIT;
     int c;
     while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:", longopts)) >= 0) {
-        // Help request → return CMD_RC_HELP so main() can distinguish "help
-        // printed, exit cleanly" from "login succeeded, fall through to daemon".
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return CMD_RC_HELP; }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
@@ -224,7 +205,7 @@ int cmd_enroll(int argc, char **argv) {
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
 
-    // Must have device creds on disk — only a logged-in bridge can mint.
+    // Only a logged-in bridge can mint enrollment tokens.
     login_credentials_t creds;
     memset(&creds, 0, sizeof(creds));
     if (login_load_credentials(&creds) < 0 || !creds.device_id[0] || !creds.device_secret[0]) {

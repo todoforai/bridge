@@ -223,29 +223,17 @@ int bridge_pty_pollfd(const bridge_pty_t *p) {
 }
 
 // ── Auto-pause detection ────────────────────────────────────────────────────
-//
 // Windows analog of pty_posix.c's /proc/<pid>/syscall + tcgetpgrp probe.
 //
-// "Process group": there is no pgrp on Windows. We use the per-session Job
-// Object as the surrogate — it contains the shell and every descendant
-// (assigned at spawn time, see bridge_pty_spawn). conhost.exe is NOT in the
-// job (it's spawned by CreatePseudoConsole via csrss), so we don't have to
-// filter it out.
+// Pgrp surrogate: per-session Job Object (shell + descendants; conhost is
+// spawned via csrss and not in the job, so no filtering needed).
 //
-// "Blocked in n_tty_read": ConPTY clients call ReadConsole/ReadFile(CONIN$),
-// which translates to an ALPC request to conhost. A thread parked there
-// shows up in NtQuerySystemInformation(SystemProcessInformation) as
-// ThreadState=Waiting (5) and WaitReason=WrLpcReply (17). We deliberately
-// don't accept WrUserRequest — it's the generic "waiting on an event" reason
-// (every idle worker thread is in it) and would produce false positives.
+// "Blocked in n_tty_read": ConPTY clients hit conhost via ALPC; the parked
+// thread shows ThreadState=Waiting + WaitReason=WrLpcReply in
+// NtQuerySystemInformation(SystemProcessInformation). WrUserRequest is too
+// generic to accept (every idle worker thread is in it).
 //
-// Gating: main.c only calls this while the session is in SESS_RUNNING (i.e.
-// between sentinels), so a shell idling at its prompt does not produce
-// false positives — the shell isn't "running" then.
-//
-// password_prompt: not implemented on Windows. The child's
-// ENABLE_ECHO_INPUT bit lives in conhost and isn't exposed through any
-// ConPTY API. Always reported as 0.
+// password_prompt: ENABLE_ECHO_INPUT isn't exposed via ConPTY → always 0.
 
 #define BRIDGE_SystemProcessInformation 5
 #define BRIDGE_STATUS_INFO_LENGTH_MISMATCH ((LONG)0xC0000004L)
@@ -278,11 +266,8 @@ typedef struct {
     LONG           BasePriority;
     HANDLE         UniqueProcessId;
     HANDLE         InheritedFromUniqueProcessId;
-    // Threads array follows immediately after a fixed-size header. The header
-    // size beyond this point varies across Windows versions (HandleCount,
-    // SessionId, working-set fields, etc.), so we don't pin a struct layout —
-    // we walk by NextEntryOffset and start threads at offset
-    // sizeof(SYSTEM_PROCESS_INFORMATION) computed dynamically. See enum loop.
+    // Threads array follows; header trailing fields vary across Windows
+    // versions — we compute thread offset dynamically.
 } bridge_sys_proc_info_t;
 
 typedef LONG (WINAPI *bridge_NtQuerySystemInformation_fn)(
@@ -382,13 +367,8 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
     bridge_sys_proc_info_t *snap = bridge_snapshot_processes();
     if (!snap) { free(jobpids); return 0; }
 
-    // Resolve the per-process header size (offset to the SYSTEM_THREAD_INFORMATION
-    // array) once from the first entry that has both NextEntryOffset and
-    // threads. Layout is uniform across entries within one snapshot, but the
-    // header has grown across Windows versions (extra trailing fields), so
-    // we compute it rather than hardcode. Fallback only triggers in the
-    // pathological case of a single-process snapshot with zero threads, which
-    // can't happen here (the snapshot always contains _Total + System).
+    // Resolve thread-array offset from the first entry with NextEntryOffset
+    // and threads (layout is uniform within one snapshot).
     size_t thread_offset = 0;
     for (bridge_sys_proc_info_t *q = snap; ; ) {
         if (q->NextEntryOffset != 0 && q->NumberOfThreads > 0) {
