@@ -135,6 +135,12 @@ typedef struct {
     char todo_id[BLOCK_ID_CAP + 1];
     size_t todo_id_len;
 
+    // Agent settings id of the calling TODO. Exported as
+    // TODOFORAI_AGENT_SETTINGS_ID in this PTY's wrapper env so a tfa-* child
+    // inherits the parent agent. Cleared when RUN sends an empty value.
+    char agent_settings_id[BLOCK_ID_CAP + 1];
+    size_t agent_settings_id_len;
+
     // RUN state machine ----------------------------------------------------
     // PTY echo is disabled at spawn, so the wrapper command line never
     // appears in OUTPUT and the sentinel scan is unambiguous.
@@ -179,9 +185,9 @@ typedef struct {
     int identity_sent;
     int64_t auth_sent_ms;
 
-    // Bearer (sat_… 64 hex) from backend post-auth. Exported as
-    // TODOFORAI_API_TOKEN to PTY children (subagent/-explore auth without
-    // user shipping a real API key). Refresh = reconnect.
+    // Bearer (dst_… 64 hex) from backend post-auth. Exported as
+    // TODOFORAI_API_TOKEN to PTY children (tfa-* auth without the user
+    // shipping a real API key). Refresh = reconnect.
     char subagent_token[80];
 
     // Bridge's HTTP API URL, exported as TODOFORAI_API_URL so child CLIs
@@ -802,6 +808,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->tail_len = 0;
             s->todo_id_len = 0;
             s->todo_id[0] = '\0';
+            s->agent_settings_id_len = 0;
+            s->agent_settings_id[0] = '\0';
             s->last_active_ms = monotonic_ms();
             s->one_shot = 1;
             created = 1;
@@ -837,6 +845,20 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->todo_id_len = utid_len;
         }
 
+        // Per-RUN agent settings id. Same validation/semantics as todoId:
+        // absent ⇒ keep existing, empty ⇒ clear.
+        const char *uasi = NULL; size_t uasi_len = 0;
+        if (json_get_str(msg, msg_len, "agentSettingsId", &uasi, &uasi_len)) {
+            if (uasi_len > 0 && !is_valid_id(uasi, uasi_len)) {
+                free(cmd); RUN_FAIL_CLEANUP();
+                return send_error(e, NULL, 0, bid, bid_len, "INVALID_AGENT_ID",
+                                  "agentSettingsId must be 1-64 chars of [A-Za-z0-9_.-]");
+            }
+            memcpy(s->agent_settings_id, uasi, uasi_len);
+            s->agent_settings_id[uasi_len] = '\0';
+            s->agent_settings_id_len = uasi_len;
+        }
+
         // Stash per-step routing on the session.
         size_t bn = bid_len < BLOCK_ID_CAP ? bid_len : BLOCK_ID_CAP;
         memcpy(s->run_block_id, bid, bn);
@@ -854,17 +876,22 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Wrap cmd in a brace group to capture $? and emit the per-step
         // sentinel. Assumes syntactically complete shell input; background
         // jobs (cmd &) make the sentinel fire at *launch*. Prefix `export`
-        // when a subagent token is set so child CLIs authenticate without
-        // TODOFORAI_API_KEY. Token (`sat_` + 64 hex) and api_url are shell-safe.
+        // when a device session token is set so tfa-* CLIs authenticate
+        // without a real API key. Token (`dst_` + 64 hex), agent id, and
+        // api_url are all validated charset-safe.
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len
-                             + sizeof(e->subagent_token) + sizeof(e->api_url) + 128;
+                             + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
+                             + sizeof(e->api_url) + 192;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
         if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
-                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
-                e->subagent_token, e->api_url, (int)cmd_len, cmd, s->sentinel);
+                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                e->subagent_token, e->api_url,
+                s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
+                s->agent_settings_id[0] ? s->agent_settings_id : "",
+                (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
                 "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
@@ -903,14 +930,16 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         #undef RUN_FAIL_CLEANUP
 
     } else if (IS("subagent_token")) {
-        // Server pushes a short-lived bearer token (sat_…) right after auth.
+        // Server pushes a short-lived bearer token (dst_…) right after auth.
         // Bridge stashes it on edge_t and exports it as TODOFORAI_API_TOKEN
-        // into every PTY's wrapper env (see RUN handler). Refresh = reconnect.
+        // into every PTY's wrapper env (see RUN handler). Per-PTY
+        // agentSettingsId travels separately on each RUN message.
+        // Refresh = reconnect.
         const char *t = NULL; size_t tlen = 0;
         if (json_get_str(msg, msg_len, "token", &t, &tlen) && tlen > 0 && tlen < sizeof e->subagent_token) {
             memcpy(e->subagent_token, t, tlen);
             e->subagent_token[tlen] = '\0';
-            fprintf(stderr, "subagent_token received (%zu bytes)\n", tlen);
+            fprintf(stderr, "device session token received (%zu bytes)\n", tlen);
         } else {
             // Bad/oversized token: clear so we don't leak a partial value into env.
             e->subagent_token[0] = '\0';
