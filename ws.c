@@ -102,8 +102,14 @@ static ws_fd_t tcp_connect(const char *host, uint16_t port, int timeout_ms,
     }
     freeaddrinfo(res);
     if (fd == WS_INVALID) {
-        if (last_err == 0) snprintf(err, err_cap, "TCP connect to %s:%u timed out", host, port);
-        else               snprintf(err, err_cap, "TCP connect to %s:%u failed (errno %d)", host, port, last_err);
+        if (last_err == 0)
+            snprintf(err, err_cap, "no response from %s:%u (timed out)", host, port);
+        else
+#ifdef _WIN32
+            snprintf(err, err_cap, "cannot connect to %s:%u (winsock %d)", host, port, last_err);
+#else
+            snprintf(err, err_cap, "cannot connect to %s:%u: %s", host, port, strerror(last_err));
+#endif
         return WS_INVALID;
     }
 
