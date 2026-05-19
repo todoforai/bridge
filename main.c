@@ -1547,51 +1547,49 @@ int main(int argc, char **argv) {
     e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
     if (!e->sessions) { free(e); return 1; }
 
-    // Reconnect loop. PTY sessions survive (independent processes, no WS tie);
-    // sessionIds are retained so backend routing resumes after reconnect.
-    // In-flight RPCs across the disconnect are rejected by handleClose — not replayed.
-    const int max_attempts = 20;
+    // Reconnect loop. PTY sessions survive across reconnects; in-flight RPCs
+    // are rejected by handleClose, not replayed.
+    const int max_attempts_pre_auth  = 20;   // ~17 min — surfaces setup mistakes
+    const int max_attempts_post_auth = 60;   // ~5 h   — rides out server outages
     int attempt = 0;
+    int ever_authenticated = 0;
+    char last_err_shown[sizeof e->err_msg] = {0};
     int rc;
     for (;;) {
         rc = run(e, saved_creds.device_id, saved_creds.device_secret,
                  host, port, DEFAULT_PATH, server_pubkey);
-        if (rc == 0) break;  // clean exit (reserved; not produced today)
+        if (rc == 0) break;
 
-        // A healthy session that later dropped should NOT count against the
-        // attempt budget — budget is for genuine "can't connect at all" runs.
-        // identity_sent=1 means we got past auth, i.e. the connection lived.
         int was_authenticated = e->identity_sent;
+        if (was_authenticated) ever_authenticated = 1;
 
-        // Diagnose THIS disconnect.
         if (e->got_close_frame) {
             const char *reason = e->close_reason[0] ? e->close_reason : "(no reason)";
-            fprintf(stderr, "Disconnected by server (code=%u): %s.\n",
-                    e->close_code, reason);
+            fprintf(stderr, "Disconnected by server (code=%u): %s.\n", e->close_code, reason);
+            last_err_shown[0] = '\0';
         } else {
-            fprintf(stderr, "Connection failed: %s.\n",
-                    e->err_msg[0] ? e->err_msg : "(no diagnostic — please report)");
-            if (!e->noise.handshake_done)
-                fprintf(stderr,
-                    "  --port is the HTTP/WS port (4000 dev, 80/443 prod), NOT the Noise-TCP\n"
-                    "  port (14100/4100) used by `login`/`enroll`. Or re-run `todoforai-bridge login`.\n");
+            const char *msg = e->err_msg[0] ? e->err_msg : "(no diagnostic — please report)";
+            if (strcmp(msg, last_err_shown) != 0) {
+                fprintf(stderr, "Connection failed: %s.\n", msg);
+                snprintf(last_err_shown, sizeof last_err_shown, "%s", msg);
+            }
         }
 
-        // Only one truly fatal case: credentials no longer accepted. Everything
-        // else (handshake/protocol/timeout/replaced) is treated as transient —
-        // backoff naturally throttles repeated rejections.
         if (e->got_close_frame && e->close_code == 4401) {
             fprintf(stderr, "Re-run `todoforai-bridge login` (device removed or secret rotated).\n");
             break;
         }
 
-        if (was_authenticated) attempt = 0;  // healthy connection dropped → fresh budget
-        if (++attempt >= max_attempts) {
-            fprintf(stderr, "Max reconnection attempts (%d) reached.\n", max_attempts);
+        if (was_authenticated) attempt = 0;  // healthy drop → fresh budget
+        ++attempt;
+        int max_attempts = ever_authenticated ? max_attempts_post_auth : max_attempts_pre_auth;
+        if (attempt >= max_attempts) {
+            fprintf(stderr, "Giving up after %d attempts.\n", max_attempts);
             break;
         }
 
-        int delay = attempt < 16 ? 4 + attempt : 20;
+        // Backoff: 1, 2, 4, 8, …, capped at 300s.
+        int delay = attempt < 9 ? (1 << (attempt - 1)) : 300;
         fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n", delay, attempt, max_attempts);
 #ifdef _WIN32
         Sleep((DWORD)delay * 1000);
