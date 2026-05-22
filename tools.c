@@ -156,8 +156,10 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
                         out[used-1] == ' '  || out[used-1] == '\t')) {
         out[--used] = '\0';
     }
+    // Strip ANSI/control bytes but keep \n \r \t (see Linux branch).
     for (size_t i = 0; i < used; i++) {
-        if ((unsigned char)out[i] < 0x20) out[i] = ' ';
+        unsigned char c = (unsigned char)out[i];
+        if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') out[i] = ' ';
     }
 
     return timed_out ? -1 : (int)exit_code;
@@ -252,10 +254,11 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
         out[--used] = '\0';
     }
 
-    // Sanitize: replace control bytes (incl. ANSI ESC) with space — keeps the
-    // value JSON-safe even if json_emit_str's own escape table grows later.
+    // Strip ANSI/control bytes but keep \n \r \t — json_emit_str escapes them
+    // properly, and the UI (whitespace-pre-wrap) renders multi-line output.
     for (size_t i = 0; i < used; i++) {
-        if ((unsigned char)out[i] < 0x20) out[i] = ' ';
+        unsigned char c = (unsigned char)out[i];
+        if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') out[i] = ' ';
     }
 
     if (WIFEXITED(exit_code)) return WEXITSTATUS(exit_code);
