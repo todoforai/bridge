@@ -64,6 +64,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #else
 #  include <fcntl.h>
 #  include <poll.h>
+#  include <sys/file.h>     // flock
 #  include <sys/resource.h>
 #  include <unistd.h>
 #endif
@@ -1444,6 +1445,37 @@ static void bump_fd_limit(int want) {
 #endif
 }
 
+// Acquire an exclusive per-device lock so two bridge processes can't race
+// for the same backend session slot. The kernel releases the lock on exit
+// (process death, kill, segfault, …) so there's no stale-lockfile cleanup
+// to maintain. Returns 0 on success, -1 if another process holds it.
+// Windows: no-op (flock unavailable; relying on server-side flap guard).
+#ifndef _WIN32
+static int acquire_device_lock(const char *device_id) {
+    // device_id is backend-issued `dev_<hex>`; refuse anything that could
+    // escape the config dir if the creds file was hand-edited.
+    for (const char *p = device_id; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return 0;
+    }
+    char cfg[1024];
+    if (login_config_path(cfg, sizeof cfg) < 0) return 0;  // no $HOME → skip
+    // Strip "/credentials.json" to get the config dir, then build lock path.
+    char *slash = strrchr(cfg, '/');
+    if (!slash) return 0;
+    *slash = '\0';
+    char lock_path[1280];
+    snprintf(lock_path, sizeof lock_path, "%s/bridge-%s.lock", cfg, device_id);
+    int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return 0;  // best-effort; don't block startup on FS errors
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        close(fd);
+        return -1;
+    }
+    // Intentionally leak fd — kernel releases the lock on process exit.
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
     // Swap in any binary staged by a prior `exec` update. See update.h.
     bridge_update_swap_on_start(argv[0]);
@@ -1531,6 +1563,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: stored backend pubkey is corrupt (re-run `todoforai-bridge login`).\n");
         return 1;
     }
+
+    // Refuse to start if another bridge process on this machine is already
+    // running for the same device. Without this, two bridges flap-loop kicking
+    // each other off the server (close code 4000) every ~1s.
+#ifndef _WIN32
+    if (acquire_device_lock(saved_creds.device_id) < 0) {
+        fprintf(stderr,
+            "error: another todoforai-bridge is already running for device %.8s… on this machine.\n"
+            "       Stop it first (`pgrep -af todoforai-bridge`) or remove the duplicate from pm2/systemd.\n",
+            saved_creds.device_id);
+        return 1;
+    }
+#endif
 
     // Show 8-char device id prefix so the trailing "..." reads as "connecting…"
     // rather than "id truncated". Full id is in ~/.config/todoforai/credentials.json.
