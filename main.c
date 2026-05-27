@@ -941,6 +941,16 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             memcpy(e->subagent_token, t, tlen);
             e->subagent_token[tlen] = '\0';
             fprintf(stderr, "device session token received (%zu bytes)\n", tlen);
+            // Persist as `apiToken` so CLIs invoked outside a bridge-spawned
+            // PTY (no TODOFORAI_API_TOKEN in env) can still auth. Refreshed
+            // on every reconnect; TTL ~24h matches backend session TTL.
+            login_credentials_t upd;
+            memset(&upd, 0, sizeof upd);
+            if (tlen < sizeof upd.api_token) {
+                memcpy(upd.api_token, t, tlen);
+                upd.api_token[tlen] = '\0';
+                (void)login_save_credentials(&upd);
+            }
         } else {
             // Bad/oversized token: clear so we don't leak a partial value into env.
             e->subagent_token[0] = '\0';
