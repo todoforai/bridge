@@ -223,9 +223,50 @@ static int proc_wchan_is_tty_read(pid_t pid) {
     return (strstr(buf, "n_tty_read") != NULL) || (strstr(buf, "tty_read") != NULL);
 }
 
-// Combined check: prefer syscall (authoritative), fall back to wchan symbol.
+// Read field 3 (state char) of /proc/<pid>/stat. World-readable even for
+// setuid processes (unlike `syscall`/`wchan`/`fd/*` which are ptrace-gated).
+// 'S' = sleeping interruptible (typical tty read), 'D' = uninterruptible
+// (disk I/O), 'R' = running, 'Z'/'T'/'X' = zombie/stopped/dead.
+static char proc_state(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char sb[512];
+    ssize_t n = read(fd, sb, sizeof(sb) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    sb[n] = '\0';
+    char *rp = strrchr(sb, ')');
+    if (!rp || rp[1] != ' ') return 0;
+    return rp[2];
+}
+
+// Last-resort fallback for ptrace-opaque setuid processes (sudo, ssh, su,
+// passwd, doas, …): /proc/<pid>/syscall returns EACCES and wchan returns
+// "0", so the authoritative checks above can't decide. The caller has
+// already proven this pid is the foreground pgrp on OUR pty (via
+// tcgetpgrp), so a sleeping state plus an open syscall file we can't read
+// (EACCES, distinguishing it from ENOENT for a dead pid) is the
+// canonical sudo-password-prompt signature on Linux ≥ 4.x with
+// Yama/ptrace_scope hardening. Conservative: only fires when we positively
+// see EACCES, never when the proc is gone or running.
+static int proc_is_opaque_sleeping(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/syscall", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { close(fd); return 0; }  // readable → caller already checked
+    if (errno != EACCES) return 0;          // dead/missing — not our case
+    char st = proc_state(pid);
+    return st == 'S' || st == 'D';
+}
+
+// Combined check: prefer syscall (authoritative), fall back to wchan symbol,
+// then to the ptrace-opaque-sleeping heuristic for setuid children.
 static int proc_is_blocked_on_tty(pid_t pid) {
-    return proc_syscall_is_tty_read(pid) || proc_wchan_is_tty_read(pid);
+    return proc_syscall_is_tty_read(pid) ||
+           proc_wchan_is_tty_read(pid)   ||
+           proc_is_opaque_sleeping(pid);
 }
 
 // Read field 5 (pgrp) of /proc/<pid>/stat. The `comm` field (#2) may contain
