@@ -151,7 +151,15 @@ int bridge_login_run(const char *device_name, const char *token,
     }
     char addr_buf[280];
     resolve_backend_addr(host, port_s, addr_buf, sizeof(addr_buf));
-    return login_device_flow(addr_buf, "bridge", device_name) == 0 ? 0 : 1;
+    // Send identity (incl. machine_id) so the backend dedupes by stable host
+    // id — same path as enroll redeem. Without this, logout+login on the same
+    // PC mints a fresh Device row every time. Best-effort: if gathering fails
+    // (e.g. truncation on weird hosts), log in without it — backend just falls
+    // back to create-new, same as old bridges.
+    char identity[1024];
+    const char *identity_arg = bridge_identity_json(identity, sizeof(identity), 1) >= 0
+                                 ? identity : NULL;
+    return login_device_flow(addr_buf, "bridge", device_name, identity_arg) == 0 ? 0 : 1;
 }
 
 int cmd_login(int argc, char **argv) {
