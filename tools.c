@@ -330,12 +330,24 @@ static void probe_run(probe_t *p) {
 
     if (!p->installed && p->have_i) {
         char sink[OUT_CAP + 1];
-        run_shell(p->icmd, INSTALL_TIMEOUT_MS, sink, sizeof(sink));
+        int install_exit = run_shell(p->icmd, INSTALL_TIMEOUT_MS, sink, sizeof(sink));
         if (p->have_v) p->v_exit = run_shell(p->vcmd, VERSION_TIMEOUT_MS, p->version_out, sizeof(p->version_out));
         if (p->have_s) p->s_exit = run_shell(p->scmd, STATUS_TIMEOUT_MS,  p->status_out,  sizeof(p->status_out));
         p->installed = (p->have_v && p->v_exit == 0 && p->version_out[0] != '\0') ||
                        (!p->have_v && p->have_s && p->s_exit == 0);
         p->installed_now = p->installed;
+        // Log install failures — silent failures here were hiding broken
+        // installCmds (missing bun/npm, network errors, …). Only log when
+        // the tool is still not installed after the install attempt, so
+        // we don't spam on the happy path.
+        if (!p->installed) {
+            size_t n = strlen(sink);
+            const char *tail = n > 512 ? sink + n - 512 : sink;
+            fprintf(stderr, "[scan_tools] install failed key=%s exit=%d (timeout=%s): %s\n",
+                    p->key, install_exit,
+                    install_exit == -1 ? "yes" : "no",
+                    tail[0] ? tail : "<no output>");
+        }
     }
     p->authed = p->have_s ? (p->s_exit == 0) : p->installed;
 }

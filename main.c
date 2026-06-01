@@ -1478,6 +1478,13 @@ static int acquire_device_lock(const char *device_id) {
     int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return 0;  // best-effort; don't block startup on FS errors
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        // EWOULDBLOCK is the only "someone else holds it" signal. Anything
+        // else means locking is unavailable on this kernel/fs (minimal
+        // Firecracker guests return ENOSYS; some FSes return ENOLCK/
+        // EOPNOTSUPP) — treat as best-effort and proceed, exactly like an
+        // open() failure. Without this, a non-flock fs would falsely report
+        // "another bridge running" and the sandbox /init would kernel-panic.
+        if (errno != EWOULDBLOCK) { close(fd); return 0; }
         close(fd);
         return -1;
     }
@@ -1643,8 +1650,12 @@ int main(int argc, char **argv) {
             break;
         }
 
-        // Backoff: 1, 2, 4, 8, …, capped at 300s.
-        int delay = attempt < 9 ? (1 << (attempt - 1)) : 300;
+        // Backoff: 1, 2, 4, 8, …, capped at 300s. The first few retries stay
+        // at <=2s so a routine backend restart (down ~20s) is ridden out with
+        // tight polling instead of stalling up to 16s mid-window.
+        int delay = attempt <= 6 ? (attempt <= 1 ? 1 : 2)
+                  : attempt < 9  ? (1 << (attempt - 1))
+                  :                300;
         fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n", delay, attempt, max_attempts);
 #ifdef _WIN32
         Sleep((DWORD)delay * 1000);
