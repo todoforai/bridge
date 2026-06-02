@@ -1,12 +1,12 @@
 CC      ?= cc
 
-# Locate todoforai-c-core: prefer vendored submodule, else sibling checkout.
-# An uninitialized submodule (empty vendor/todoforai-c-core dir) falls through
-# to the sibling path; if neither exists, fail loudly instead of cryptic
-# "no such file" from the compiler.
-CORE := $(if $(wildcard vendor/todoforai-c-core/noise),vendor/todoforai-c-core,$(if $(wildcard ../todoforai-c-core/noise),../todoforai-c-core,))
+# Locate todoforai-c-core: a sibling checkout (../todoforai-c-core), same as
+# sandbox-manager consumes it. A leftover vendor/ checkout is still honored for
+# back-compat. If neither exists, fail loudly instead of a cryptic compiler
+# "no such file".
+CORE := $(if $(wildcard ../todoforai-c-core/noise),../todoforai-c-core,$(if $(wildcard vendor/todoforai-c-core/noise),vendor/todoforai-c-core,))
 ifeq ($(CORE),)
-$(error todoforai-c-core not found. Run: git submodule update --init --recursive)
+$(error todoforai-c-core not found. Clone it as a sibling: git clone https://github.com/todoforai/todoforai-c-core ../todoforai-c-core)
 endif
 
 # Version string baked into the binary. Derived from git so a tag is the

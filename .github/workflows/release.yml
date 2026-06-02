@@ -59,9 +59,16 @@ jobs:
           # On manual runs, build the requested tag (not the default branch),
           # so the embedded BRIDGE_VERSION matches the release tag.
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-          submodules: recursive
           # Full history so `git describe --tags` resolves the version.
           fetch-depth: 0
+
+      # c-core is a sibling repo (not a submodule). The Makefile resolves CORE
+      # to ../todoforai-c-core, which is this checkout one level up from bridge/.
+      - name: Checkout todoforai-c-core
+        uses: actions/checkout@v4
+        with:
+          repository: todoforai/todoforai-c-core
+          path: todoforai-c-core
 
       - name: Install zig (linux + windows targets)
         if: startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'windows-')
