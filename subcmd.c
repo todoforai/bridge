@@ -48,6 +48,10 @@ static int parse_device_creds(const char *resp, login_credentials_t *creds) {
     json_find_string(dev, "id",     creds->device_id,     sizeof(creds->device_id));
     json_find_string(dev, "secret", creds->device_secret, sizeof(creds->device_secret));
     json_find_string(dev, "name",   creds->device_name,   sizeof(creds->device_name));
+    // Top-level apiToken (dst_…): a ready-to-use device-session token so
+    // credentials.json is complete before the daemon reconnects. Optional —
+    // older backends omit it and the daemon fills it in via subagent_token.
+    json_find_string(resp, "apiToken", creds->api_token, sizeof(creds->api_token));
     const char *usr = strstr(resp, "\"user\"");
     if (usr && (usr = strchr(usr, '{'))) {
         json_find_string(usr, "id",    creds->user_id,    sizeof(creds->user_id));
