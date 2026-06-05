@@ -1327,14 +1327,19 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                const uint8_t pubkey[32]) {
     e->device_id = device_id;
     e->device_secret = device_secret;
-    // Derive HTTP API URL from the Noise host:port (same backend, different scheme).
+    // Derive the public HTTP API URL from the Noise host. In prod a TLS
+    // terminator (nginx/Cloudflare) fronts the backend on 443 while the Noise
+    // channel rides plain WS on port 80 — so the transport `port` must NOT leak
+    // into an https:// URL (that yields the impossible https://host:80, which
+    // TLS-handshakes against a plaintext port → "wrong version number"). Only
+    // local/dev hosts carry the explicit port through.
     {
-        const char *scheme = login_is_local_host(host) ? "http" : "https";
-        int default_port = (scheme[4] == 's') ? 443 : 80;
-        if ((int)port == default_port)
-            snprintf(e->api_url, sizeof e->api_url, "%s://%s", scheme, host);
-        else
+        const int local = login_is_local_host(host);
+        const char *scheme = local ? "http" : "https";
+        if (local && port != 80)
             snprintf(e->api_url, sizeof e->api_url, "%s://%s:%u", scheme, host, (unsigned)port);
+        else
+            snprintf(e->api_url, sizeof e->api_url, "%s://%s", scheme, host);
     }
     if (noise_ws_init(&e->noise, pubkey) != 0) {
         fail(e, "failed to initialize noise (bad server pubkey?)");
