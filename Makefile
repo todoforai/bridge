@@ -149,9 +149,19 @@ analyze-scan-build: | build
 	    -o /tmp/_bridge_sb $(SRCS) $(LIBS) > build/analysis/scan-build.log 2>&1 || true
 	@grep -E 'bug(s)? found|No bugs found' build/analysis/scan-build.log | tail -1
 
-# Local dev: build + drop into ~/.todoforai/bin/ (on PATH) + print version.
+# Local dev: build + drop into ~/.todoforai/bin/ + ensure it's on PATH + print version.
 dev: build/todoforai-bridge
 	install -m755 $< $(HOME)/.todoforai/bin/todoforai-bridge
+	@case ":$$PATH:" in \
+	    *":$(HOME)/.todoforai/bin:"*) ;; \
+	    *":$(HOME)/.local/bin:"*) mkdir -p "$(HOME)/.local/bin"; \
+	       ln -sf "$(HOME)/.todoforai/bin/todoforai-bridge" "$(HOME)/.local/bin/todoforai-bridge"; \
+	       echo "note: linked todoforai-bridge into ~/.local/bin (already on PATH)";; \
+	    *) line='export PATH="$$HOME/.todoforai/bin:$$PATH"'; \
+	       case "$${SHELL##*/}" in zsh) rc="$(HOME)/.zshrc";; bash) rc="$(HOME)/.bashrc";; *) rc="$(HOME)/.profile";; esac; \
+	       grep -qsF "$$line" "$$rc" 2>/dev/null || printf '\n# added by todoforai bridge (make dev)\n%s\n' "$$line" >>"$$rc"; \
+	       echo "note: added ~/.todoforai/bin to PATH in $$rc — run 'source $$rc' or open a new shell";; \
+	esac
 	@$(HOME)/.todoforai/bin/todoforai-bridge --version
 
 clean:
