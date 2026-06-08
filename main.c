@@ -179,6 +179,7 @@ typedef struct {
     noise_ws_t noise;
     const char *device_id;
     const char *device_secret;
+    const char *user_email;  // for the auth banner; points into main()'s saved_creds
     int done;
     int rc;
     // Defer identity until auth round-trip settles: backend awaits
@@ -1406,7 +1407,10 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             int il = bridge_identity_json(id, sizeof id, 0);
             if (il <= 0 || send_json(e, id, (size_t)il) != 0) { fail(e, "failed to send identity frame"); break; }
             e->identity_sent = 1;
-            fprintf(stderr, "✓ Authenticated\n");
+            if (e->user_email && e->user_email[0])
+                fprintf(stderr, "✓ Authenticated as %s\n", e->user_email);
+            else
+                fprintf(stderr, "✓ Authenticated\n");
         }
         service_sessions(e);
         // Drain any send queue produced by service_sessions / handle_command.
@@ -1613,6 +1617,7 @@ int main(int argc, char **argv) {
     if (!e) return 1;
     e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
     if (!e->sessions) { free(e); return 1; }
+    e->user_email = saved_creds.user_email;  // safe: saved_creds outlives the run loop
 
     // Reconnect loop. PTY sessions survive across reconnects; in-flight RPCs
     // are rejected by handleClose, not replayed.
