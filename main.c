@@ -1660,12 +1660,12 @@ int main(int argc, char **argv) {
             break;
         }
 
-        // Backoff: 1, 2, 4, 8, …, capped at 300s. The first few retries stay
-        // at <=2s so a routine backend restart (down ~20s) is ridden out with
-        // tight polling instead of stalling up to 16s mid-window.
-        int delay = attempt <= 6 ? (attempt <= 1 ? 1 : 2)
-                  : attempt < 9  ? (1 << (attempt - 1))
-                  :                300;
+        // Backoff: 1, then 2s for the first several retries so a routine
+        // backend restart (down ~20s) is ridden out with tight polling, then
+        // exponential 4, 8, 16, … capped at 300s.
+        int delay = attempt <= 1 ? 1
+                  : attempt <= 6 ? 2
+                  :                (1 << (attempt - 5)) > 300 ? 300 : (1 << (attempt - 5));
         fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n", delay, attempt, max_attempts);
 #ifdef _WIN32
         Sleep((DWORD)delay * 1000);
