@@ -479,8 +479,14 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
     for (int i = 0; i < n; i++) {
         probe_t *p = &probes[i];
         if (stats) {
-            if (p->installed)              stats->installed++;
-            if (p->installed && p->authed) stats->authenticated++;
+            if (p->installed)                            stats->installed++;
+            // Auth only applies to tools that define a statusCmd (`have_s`).
+            // Tools without one have no auth concept — don't count them as
+            // authenticated (that would make the banner read N/N spuriously).
+            if (p->installed && p->have_s) {
+                stats->auth_applicable++;
+                if (p->authed) stats->authenticated++;
+            }
             if (p->installed_now) {
                 stats->installed_now++;
                 size_t cur = strlen(stats->installed_now_names);

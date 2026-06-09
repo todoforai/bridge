@@ -10,7 +10,7 @@
 #define BRIDGE_INSTALLED_NOW_CAP 512
 
 typedef struct {
-    int installed, authenticated, installed_now;
+    int installed, authenticated, auth_applicable, installed_now;
     char installed_now_names[BRIDGE_INSTALLED_NOW_CAP];
 } bridge_scan_stats_t;
 

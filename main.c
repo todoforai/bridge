@@ -1068,8 +1068,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             free(buf);
             if (n > 0) {
                 send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)n);
-                fprintf(stderr, "✓ Probed CLI tools: %d installed, %d authenticated\n",
-                        stats.installed, stats.authenticated);
+                fprintf(stderr, "✓ Probed CLI tools: %d installed, %d/%d authenticated (of tools with auth)\n",
+                        stats.installed, stats.authenticated, stats.auth_applicable);
                 if (stats.installed_now > 0) {
                     fprintf(stderr, "✓ Preinstalled %d %s: %s\n",
                             stats.installed_now,
