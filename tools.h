@@ -6,12 +6,8 @@
 
 #include <stddef.h>
 
-// Cap on the ", "-joined installedNow names (full list also in JSON reply).
-#define BRIDGE_INSTALLED_NOW_CAP 512
-
 typedef struct {
-    int installed, authenticated, auth_applicable, installed_now;
-    char installed_now_names[BRIDGE_INSTALLED_NOW_CAP];
+    int installed, authenticated, auth_applicable;
 } bridge_scan_stats_t;
 
 // Parse "<key>\t<b64_versionCmd>\t<b64_statusCmd>\n..." into JSON in `out`.
