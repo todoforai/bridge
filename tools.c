@@ -17,6 +17,7 @@
 
 #include "tools.h"
 #include "json.h"
+#include "env_path.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -76,6 +77,7 @@ static const char *win_shell(void) {
 
 static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
     if (cap) out[0] = '\0';
+    bridge_prepend_tools_path_win();
     const char *sh = win_shell();
     if (!sh) return -1;
 
@@ -180,16 +182,12 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
         close(pipefd[0]); close(pipefd[1]);
         // New process group so we can kill the whole shell pipeline on timeout.
         setpgid(0, 0);
-        // Make ~/.local/bin visible to probes/installs so a tool just dropped
-        // there by an earlier install step is found on the re-probe in the
-        // same scan_tools call (Ubuntu's ~/.profile only adds it at login).
-        const char *home = getenv("HOME");
-        if (home && *home) {
-            const char *old = getenv("PATH");
-            char path_buf[2048];
-            snprintf(path_buf, sizeof path_buf, "%s/.local/bin:%s", home, old ? old : "/usr/local/bin:/usr/bin:/bin");
-            setenv("PATH", path_buf, 1);
-        }
+        // Make the managed tools binDir (~/.todoforai/tools/bin, mirroring the
+        // edge) and ~/.local/bin visible to probes/installs so a tool just
+        // dropped there by an earlier install step is found on the re-probe in
+        // the same scan_tools call (Ubuntu's ~/.profile only adds them at login).
+        char *tools_path = bridge_build_tools_path();
+        if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }

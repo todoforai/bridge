@@ -15,6 +15,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include "pty.h"
+#include "env_path.h"
 
 #include <windows.h>
 #include <winternl.h>   // UNICODE_STRING, used by the SYSTEM_PROCESS_INFORMATION layout
@@ -47,6 +48,10 @@ static const char *resolve_shell(const char *shell) {
 
 int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no_echo) {
     memset(p, 0, sizeof(*p));
+
+    // Make the managed tools binDir discoverable: CreateProcessA below inherits
+    // our env (lpEnvironment=NULL), so prepend it to the bridge process PATH.
+    bridge_prepend_tools_path_win();
 
     HANDLE in_read = NULL, in_write = NULL, out_read = NULL, out_write = NULL;
     SECURITY_ATTRIBUTES sa = { .nLength = sizeof(sa), .bInheritHandle = FALSE };

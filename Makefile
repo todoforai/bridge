@@ -27,7 +27,7 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c \
+COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c env_path.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
@@ -113,7 +113,7 @@ test-run: | build
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c pty_posix.c
+BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c env_path.c pty_posix.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 
