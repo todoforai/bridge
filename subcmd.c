@@ -20,15 +20,15 @@
 // --host / --port / --ttl are dev flags, parsed but omitted from help.
 const char *USAGE_MAIN = "";
 
-// Precedence: CLI flag > env (NOISE_BACKEND_HOST/_PORT) > saved login > prod default.
 static void resolve_backend_addr(const char *host, const char *port_s,
                                  char *addr_buf, size_t addr_cap) {
-    if (!host)   host   = getenv("NOISE_BACKEND_HOST");
-    if (!port_s) port_s = getenv("NOISE_BACKEND_PORT");
-
+    // Precedence: --host flag → saved profile creds → env → prod default.
     login_credentials_t saved;
     (void)login_load_credentials(&saved);
     if (!host && saved.backend_host[0]) host = saved.backend_host;
+
+    if (!host)   host   = getenv("NOISE_BACKEND_HOST");
+    if (!port_s) port_s = getenv("NOISE_BACKEND_PORT");
 
     if (!host) host = LOGIN_DEFAULT_BACKEND_HOST;
     if (!port_s) {
@@ -167,29 +167,34 @@ int bridge_login_run(const char *device_name, const char *token,
 }
 
 int cmd_login(int argc, char **argv) {
+    // Note: --profile is intentionally undocumented (advanced/dev multi-account).
     static const char *USAGE = "login [--device-name NAME] [--token TOKEN]";
     const char *device_name = NULL;
     const char *token       = NULL;
     const char *host        = NULL;
     const char *port_s      = NULL;
+    const char *profile     = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "device-name",   ko_required_argument, 'n' },
         { "token",         ko_required_argument, 't' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
+        { "profile",       ko_required_argument, 'P' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:P:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return CMD_RC_HELP; }
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
+        else if (c == 'P') profile = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
+    if (profile && login_set_profile(profile) < 0) return 2;
     return bridge_login_run(device_name, token, host, port_s);
 }
 
@@ -270,13 +275,20 @@ int cmd_enroll(int argc, char **argv) {
 
 int cmd_whoami(int argc, char **argv) {
     static const char *USAGE = "whoami";
-    ko_longopt_t longopts[] = {{ "help", ko_no_argument, 'h' }, { 0, 0, 0 }};
+    const char *profile = NULL;
+    ko_longopt_t longopts[] = {
+        { "help",    ko_no_argument,       'h' },
+        { "profile", ko_required_argument, 'P' },
+        { 0, 0, 0 }
+    };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "h", longopts)) >= 0) {
-        if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
-        cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
+    while ((c = ketopt(&opt, argc, argv, 1, "hP:", longopts)) >= 0) {
+        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
+        else if (c == 'P') profile = opt.arg;
+        else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
+    if (profile && login_set_profile(profile) < 0) return 2;
     return login_print_whoami("todoforai-bridge");
 }
 
@@ -284,13 +296,20 @@ int cmd_whoami(int argc, char **argv) {
 
 int cmd_logout(int argc, char **argv) {
     static const char *USAGE = "logout";
-    ko_longopt_t longopts[] = {{ "help", ko_no_argument, 'h' }, { 0, 0, 0 }};
+    const char *profile = NULL;
+    ko_longopt_t longopts[] = {
+        { "help",    ko_no_argument,       'h' },
+        { "profile", ko_required_argument, 'P' },
+        { 0, 0, 0 }
+    };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "h", longopts)) >= 0) {
-        if (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
-        cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
+    while ((c = ketopt(&opt, argc, argv, 1, "hP:", longopts)) >= 0) {
+        if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
+        else if (c == 'P') profile = opt.arg;
+        else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
+    if (profile && login_set_profile(profile) < 0) return 2;
     return login_logout("todoforai-bridge");
 }
 

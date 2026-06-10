@@ -1521,21 +1521,25 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    const char *host = NULL, *port_s = NULL;
+    const char *host = NULL, *port_s = NULL, *profile = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
+        { "profile",       ko_required_argument, 'P' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:P:", longopts)) >= 0) {
         if      (c == 'h') { print_help(); return 0; }
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
+        else if (c == 'P') profile = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE_MAIN, argc, argv, &opt, c);
     }
+    // Select the credential profile before any load (env is last resort).
+    if (profile && login_set_profile(profile) < 0) return 2;
 
     // Load saved device credentials from `bridge login`
     login_credentials_t saved_creds;
@@ -1556,8 +1560,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!host) host = getenv("NOISE_BACKEND_HOST");
+    // Precedence: --host flag → saved profile creds → env → prod default.
     if (!host && saved_creds.backend_host[0]) host = saved_creds.backend_host;
+    if (!host) host = getenv("NOISE_BACKEND_HOST");
     if (!host) host = DEFAULT_HOST;
 
     if (!port_s) port_s = getenv("BRIDGE_PORT"); // bridge HTTP/WS port (not Noise)
