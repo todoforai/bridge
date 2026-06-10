@@ -1619,6 +1619,7 @@ int main(int argc, char **argv) {
     const int max_attempts_post_auth = 60;   // ~5 h   — rides out server outages
     int attempt = 0;
     int ever_authenticated = 0;
+    int relogin_attempted = 0;  // one auto re-enroll per 4401 streak
     char last_err_shown[sizeof e->err_msg] = {0};
     int rc;
     for (;;) {
@@ -1642,11 +1643,29 @@ int main(int argc, char **argv) {
         }
 
         if (e->got_close_frame && e->close_code == 4401) {
+            // Stale creds (device removed or secret rotated server-side).
+            // Self-heal: clear them and re-run the same login flow first-run
+            // uses, then reload and keep the loop going. Guarded to one attempt
+            // per disconnect so a persistently failing login can't tight-loop.
+            if (!relogin_attempted) {
+                relogin_attempted = 1;
+                fprintf(stderr, "Device credentials rejected — re-enrolling this device...\n");
+                login_logout("todoforai-bridge");
+                if (bridge_login_run(NULL, NULL, host, NULL) == 0
+                    && login_load_credentials(&saved_creds) == 0
+                    && saved_creds.device_id[0] && saved_creds.device_secret[0]
+                    && saved_creds.backend_pubkey[0]
+                    && parse_pubkey_hex(saved_creds.backend_pubkey, server_pubkey) == 0) {
+                    attempt = 0;
+                    reset_connection_state(e);
+                    continue;
+                }
+            }
             fprintf(stderr, "Re-run `todoforai-bridge login` (device removed or secret rotated).\n");
             break;
         }
 
-        if (was_authenticated) attempt = 0;  // healthy drop → fresh budget
+        if (was_authenticated) { attempt = 0; relogin_attempted = 0; }  // healthy drop → fresh budget
         ++attempt;
         int max_attempts = ever_authenticated ? max_attempts_post_auth : max_attempts_pre_auth;
         if (attempt >= max_attempts) {
