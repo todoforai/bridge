@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "args.h"
 #include "identity.h"
@@ -78,6 +79,20 @@ static int redeem_enroll_token(const char *token, const char *device_name,
 
     char name_field[300] = "";
     if (device_name && *device_name) {
+        // Device name doubles as the agent's tool-call alias suffix
+        // (`bash_<name>`), so it must be a clean identifier: letters, digits
+        // and `_` only (no `-`), starting alphanumeric, max 64. Reject here
+        // for a clear message instead of letting the backend 400.
+        size_t dlen = strlen(device_name);
+        if (dlen > 64 || !isalnum((unsigned char)device_name[0])) {
+            fprintf(stderr, "error: device name must start with a letter or number and be <=64 chars\n"); return -1;
+        }
+        for (size_t i = 0; i < dlen; i++) {
+            char c = device_name[i];
+            if (!isalnum((unsigned char)c) && c != '_') {
+                fprintf(stderr, "error: device name can only contain letters, numbers and underscores\n"); return -1;
+            }
+        }
         char name_esc[256];
         if (json_escape_buf(name_esc, sizeof(name_esc), device_name) != 0) {
             fprintf(stderr, "error: device name too long\n"); return -1;
