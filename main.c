@@ -115,6 +115,38 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 // `sentinel_len - 1` and rounds the buffer to a power of two.
 #define TAIL_CAP       (BUF_SIZE + SENTINEL_CAP)
 
+// ── Output policy (mirrors packages/shared-fbe/src/outputLimits.ts) ──
+// The bridge owns ALL shell-output management for the RUN path now: it streams
+// the head live, goes silent once the head fills, rolls a tail, and emits a
+// truncation notice + tail at STEP_DONE. The backend is a dumb relay that just
+// concatenates OUTPUT bytes. (size_t)-1 means "no limit" (raw / full head).
+#define OB_NOLIMIT      ((size_t)-1)
+#define OB_STREAM_FIRST 10000              // chars kept/streamed from the start
+#define OB_STREAM_LAST  10000              // chars kept from the end (tail)
+#define OB_RUN_CAP      (256 * 1024)       // absolute ceiling (full mode)
+#define OB_LINE_LEN     300                // per-line width cap
+// Tail buffer: holds the rolling last OB_STREAM_LAST bytes plus one full PTY
+// read of slack so a single append never overflows before we trim.
+#define OB_TAIL_CAP     (OB_STREAM_LAST + BUF_SIZE)
+
+typedef struct {
+    size_t head_limit;   // min(firstLimit, hardCap); stream live until reached
+    size_t last_limit;   // min(lastLimit, hardCap - head_limit); rolling tail
+    size_t line_limit;   // per-line width cap (OB_NOLIMIT = full-width)
+    size_t head_len;     // bytes already streamed into the head
+    size_t total_len;    // total RUN output bytes seen
+    int    truncated;    // head filled and more arrived
+    int    notice_sent;  // truncation notice already emitted
+    // Streaming line-width state (head phase): suppress bytes past line_limit on
+    // the current line; emit " ...[+N chars]" when the newline arrives.
+    size_t col;          // column within the current line (head stream)
+    size_t line_dropped; // bytes dropped on the current (over-long) line
+    // Rolling tail of the last `last_limit` bytes (raw, not line-capped yet).
+    uint8_t tail[OB_TAIL_CAP];
+    size_t  tail_len;
+} out_policy_t;
+
+
 typedef enum { SESS_IDLE = 0, SESS_RUNNING } sess_state_t;
 
 typedef struct {
@@ -165,6 +197,9 @@ typedef struct {
     // Stamp after bridge_pty_write_all; probe waits INPUT_GRACE_MS past it to
     // avoid false-pause during the trailing line-discipline drain.
     int64_t last_input_ms;
+
+    // Per-RUN output policy (head/tail cut + line cap). Reset on each RUN.
+    out_policy_t ob;
 } session_t;
 
 // 2 ticks × 250 ms ⇒ ~250-500 ms latency, FP rate ~1-2%.
@@ -570,6 +605,7 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
         jfield_raw(buf, sizeof buf, &u, "shellPid", pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "exitCode", rc, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "timedOut", timed_out ? "true" : "false", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "truncated", s->ob.truncated ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
 }
@@ -587,6 +623,7 @@ static void send_step_awaiting_input(edge_t *e, session_t *s, int password_promp
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "shellPid", shell_pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "passwordPrompt", password_prompt ? "true" : "false", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "truncated", s->ob.truncated ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
 }
@@ -631,6 +668,136 @@ static void tail_append(session_t *s, const uint8_t *data, size_t len) {
     s->tail_len += len;
 }
 
+// ── Output policy engine (RUN path) ─────────────────────────────────────────
+// Streams the head live (line-capped), goes silent once the head fills, rolls
+// the last `last_limit` bytes in a tail, and emits a truncation notice + tail
+// at the end. Mirrors edge's OutputBuffer (edge/bun/src/shell.ts) so both
+// transports cut identically. The backend just concatenates OUTPUT bytes.
+
+// Resolve the RUN's `output` mode to concrete limits. Mirrors
+// resolveOutputPolicy(): unknown/absent ⇒ "safe".
+static void ob_resolve(out_policy_t *ob, const char *mode, size_t mode_len) {
+    size_t first, last, cap, line;
+#define OB_MODE_IS(str) (mode && mode_len == sizeof(str) - 1 && memcmp(mode, str, sizeof(str) - 1) == 0)
+    if (OB_MODE_IS("wide")) {
+        first = OB_STREAM_FIRST; last = OB_STREAM_LAST; cap = OB_STREAM_FIRST + OB_STREAM_LAST; line = OB_NOLIMIT;
+    } else if (OB_MODE_IS("full")) {
+        first = OB_NOLIMIT; last = 0; cap = OB_RUN_CAP; line = OB_LINE_LEN;
+    } else if (OB_MODE_IS("raw")) {
+        first = OB_NOLIMIT; last = 0; cap = OB_NOLIMIT; line = OB_NOLIMIT;
+    } else { // safe (default)
+        first = OB_STREAM_FIRST; last = OB_STREAM_LAST; cap = OB_STREAM_FIRST + OB_STREAM_LAST; line = OB_LINE_LEN;
+    }
+#undef OB_MODE_IS
+    // head_limit = min(first, cap); last_limit = min(last, cap - head_limit).
+    size_t head = (cap == OB_NOLIMIT) ? first
+                : (first == OB_NOLIMIT) ? cap
+                : (first < cap ? first : cap);
+    size_t lastlim;
+    if (cap == OB_NOLIMIT) lastlim = last;
+    else { size_t room = (head >= cap) ? 0 : cap - head; lastlim = last < room ? last : room; }
+    ob->head_limit = head; ob->last_limit = lastlim; ob->line_limit = line;
+    ob->head_len = 0; ob->total_len = 0; ob->truncated = 0; ob->notice_sent = 0;
+    ob->col = 0; ob->line_dropped = 0; ob->tail_len = 0;
+}
+
+// Clear counters/tail but keep the resolved limits (used at STEP_AWAITING_INPUT,
+// mirroring edge's resetForInteraction so post-prompt output is a fresh delta).
+static void ob_reset(out_policy_t *ob) {
+    ob->head_len = 0; ob->total_len = 0; ob->truncated = 0; ob->notice_sent = 0;
+    ob->col = 0; ob->line_dropped = 0; ob->tail_len = 0;
+}
+
+// Append to the rolling tail, keeping only the last `last_limit` bytes.
+static void ob_tail_push(out_policy_t *ob, const uint8_t *d, size_t n) {
+    size_t cap = ob->last_limit;
+    if (cap == 0) return;
+    if (cap > OB_TAIL_CAP) cap = OB_TAIL_CAP;  // defensive; last_limit ≤ OB_STREAM_LAST today
+    if (n >= cap) { memcpy(ob->tail, d + (n - cap), cap); ob->tail_len = cap; return; }
+    if (ob->tail_len + n > cap) {
+        size_t drop = ob->tail_len + n - cap;
+        memmove(ob->tail, ob->tail + drop, ob->tail_len - drop);
+        ob->tail_len -= drop;
+    }
+    memcpy(ob->tail + ob->tail_len, d, n);
+    ob->tail_len += n;
+}
+
+// Emit `n` bytes through the per-line width cap (col/line_dropped persist across
+// calls so a line can span PTY reads). line_limit == OB_NOLIMIT ⇒ pass through.
+static void ob_emit_capped(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
+    out_policy_t *ob = &s->ob;
+    if (n == 0) return;
+    if (ob->line_limit == OB_NOLIMIT) { send_output_bytes(e, s, d, n); return; }
+    size_t cap = n * 2 + 64;
+    uint8_t *out = malloc(cap);
+    if (!out) { send_output_bytes(e, s, d, n); return; }  // degrade to uncapped
+    size_t u = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = d[i];
+        if (c == '\n') {
+            if (ob->line_dropped > 0) {
+                int m = snprintf((char *)out + u, cap - u, " ...[+%zu chars]", ob->line_dropped);
+                if (m > 0 && (size_t)m < cap - u) u += (size_t)m;
+                ob->line_dropped = 0;
+            }
+            out[u++] = '\n';
+            ob->col = 0;
+        } else if (ob->col < ob->line_limit) {
+            out[u++] = c; ob->col++;
+        } else {
+            ob->line_dropped++;
+        }
+    }
+    if (u > 0) send_output_bytes(e, s, out, u);
+    free(out);
+}
+
+// Feed RUN output bytes: stream the head (line-capped), roll the rest into the
+// tail. Drives s->ob; all RUN-path output goes through here.
+static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
+    out_policy_t *ob = &s->ob;
+    if (n == 0) return;
+    ob->total_len += n;
+    const uint8_t *p = d; size_t rem = n;
+    if (ob->head_limit == OB_NOLIMIT || ob->head_len < ob->head_limit) {
+        size_t room = (ob->head_limit == OB_NOLIMIT) ? rem : ob->head_limit - ob->head_len;
+        size_t take = rem < room ? rem : room;
+        ob_emit_capped(e, s, p, take);
+        ob->head_len += take;
+        p += take; rem -= take;
+    }
+    if (rem > 0) {
+        ob->truncated = 1;
+        ob_tail_push(ob, p, rem);
+    }
+}
+
+// Emit the truncation notice + tail once, at end-of-step (or before a pause).
+// No-op when nothing was dropped. send_step_done reads ob->truncated for the
+// frame flag, so call this just before it.
+static void ob_finish(edge_t *e, session_t *s) {
+    out_policy_t *ob = &s->ob;
+    if (!ob->truncated || ob->notice_sent) return;
+    ob->notice_sent = 1;
+    size_t dropped = ob->total_len > ob->head_len + ob->tail_len
+                   ? ob->total_len - ob->head_len - ob->tail_len : 0;
+    char notice[96];
+    int m = snprintf(notice, sizeof notice, "\n\n... [truncated %zu chars] ...\n\n", dropped);
+    if (m > 0) send_output_bytes(e, s, (const uint8_t *)notice, (size_t)m);
+    if (ob->tail_len > 0) {
+        // Tail is its own block — start a fresh line-cap column state.
+        ob->col = 0; ob->line_dropped = 0;
+        ob_emit_capped(e, s, ob->tail, ob->tail_len);
+        if (ob->line_limit != OB_NOLIMIT && ob->line_dropped > 0) {
+            char suf[32];
+            int k = snprintf(suf, sizeof suf, " ...[+%zu chars]", ob->line_dropped);
+            if (k > 0) send_output_bytes(e, s, (const uint8_t *)suf, (size_t)k);
+            ob->line_dropped = 0;
+        }
+    }
+}
+
 static void forward_pty_output(edge_t *e, session_t *s) {
     long n = bridge_pty_read(&s->pty, e->pty_buf, sizeof(e->pty_buf));
     if (n <= 0) return;
@@ -653,7 +820,7 @@ static void forward_pty_output(edge_t *e, session_t *s) {
         size_t keep = s->sentinel_len > 0 ? s->sentinel_len - 1 : 0;
         size_t emit = s->tail_len > keep ? s->tail_len - keep : 0;
         if (emit > 0) {
-            send_output_bytes(e, s, s->tail_buf, emit);
+            ob_append(e, s, s->tail_buf, emit);
             memmove(s->tail_buf, s->tail_buf + emit, s->tail_len - emit);
             s->tail_len -= emit;
         }
@@ -700,7 +867,7 @@ static void forward_pty_output(edge_t *e, session_t *s) {
         // Treat this sentinel position as ordinary output and resume scanning
         // after the first byte of the false candidate.
         size_t skip = (size_t)found + 1;
-        send_output_bytes(e, s, s->tail_buf, skip);
+        ob_append(e, s, s->tail_buf, skip);
         memmove(s->tail_buf, s->tail_buf + skip, s->tail_len - skip);
         s->tail_len -= skip;
         // Loop hint: caller will run again on next read; if more sentinel
@@ -715,7 +882,7 @@ static void forward_pty_output(edge_t *e, session_t *s) {
         if (found >= 2 && s->tail_buf[found - 2] == '\r' && s->tail_buf[found - 1] == '\n') trim_back = 2;
         else if (found >= 1 && s->tail_buf[found - 1] == '\n') trim_back = 1;
         size_t emit = (size_t)found - trim_back;
-        if (emit > 0) send_output_bytes(e, s, s->tail_buf, emit);
+        if (emit > 0) ob_append(e, s, s->tail_buf, emit);
         size_t keep = s->tail_len - (size_t)found;
         memmove(s->tail_buf, s->tail_buf + (size_t)found, keep);
         s->tail_len = keep;
@@ -727,9 +894,10 @@ static void forward_pty_output(edge_t *e, session_t *s) {
     if (found >= 2 && s->tail_buf[found - 2] == '\r' && s->tail_buf[found - 1] == '\n') trim_back = 2;
     else if (found >= 1 && s->tail_buf[found - 1] == '\n') trim_back = 1;
     size_t pre = (size_t)found - trim_back;
-    if (pre > 0) send_output_bytes(e, s, s->tail_buf, pre);
+    if (pre > 0) ob_append(e, s, s->tail_buf, pre);
 
     (void)line_end;  // bytes after the sentinel line are silently dropped (they shouldn't exist).
+    ob_finish(e, s);  // emit truncation notice + tail (no-op if nothing dropped)
     send_step_done(e, s, has_code, exit_code, /*timedOut=*/0);
     run_finish(s);
 }
@@ -874,6 +1042,13 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Cap to ~1 year so monotonic_ms() + timeout can't overflow int64_t.
         if (timeout_ms > 365LL * 24 * 60 * 60 * 1000) timeout_ms = 365LL * 24 * 60 * 60 * 1000;
         s->deadline_ms = timeout_ms > 0 ? monotonic_ms() + timeout_ms : 0;
+
+        // Resolve this RUN's output policy from `output` (safe|wide|full|raw).
+        // Absent ⇒ "safe". The bridge owns head/tail cut + line cap from here;
+        // the backend just concatenates the OUTPUT frames we emit.
+        const char *omode = NULL; size_t omode_len = 0;
+        json_get_str(msg, msg_len, "output", &omode, &omode_len);
+        ob_resolve(&s->ob, omode, omode_len);
 
         // Wrap cmd in a brace group to capture $? and emit the per-step
         // sentinel. Assumes syntactically complete shell input; background
@@ -1222,9 +1397,10 @@ static void service_sessions(edge_t *e) {
         if (bridge_pty_reap(&s->pty, &code)) {
             if (s->state == SESS_RUNNING) {
                 if (s->tail_len > 0) {
-                    send_output_bytes(e, s, s->tail_buf, s->tail_len);
+                    ob_append(e, s, s->tail_buf, s->tail_len);
                     s->tail_len = 0;
                 }
+                ob_finish(e, s);
                 send_step_done(e, s, /*has_code=*/1, code, /*timedOut=*/0);
                 // Shell already exited — outer block owns the close. Clear
                 // one_shot so run_finish doesn't try to SIGKILL/close again.
@@ -1246,9 +1422,10 @@ static void service_sessions(edge_t *e) {
         if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
         if (now < s->deadline_ms) continue;
         if (s->tail_len > 0) {
-            send_output_bytes(e, s, s->tail_buf, s->tail_len);
+            ob_append(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
         }
+        ob_finish(e, s);
         send_step_done(e, s, /*has_code=*/0, 0, /*timedOut=*/1);
         run_finish(s);
     }
@@ -1270,15 +1447,18 @@ static void service_sessions(edge_t *e) {
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
 
         if (s->tail_len > 0) {
-            send_output_bytes(e, s, s->tail_buf, s->tail_len);
+            ob_append(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
         }
+        ob_finish(e, s);
         // Promote one-shot → persistent so STEP_DONE doesn't tear it down.
         s->one_shot = 0;
         // Drop the per-step deadline: agent owns lifecycle via awaitResume.
         // Otherwise timeout fires STEP_DONE(timedOut) while the user is typing.
         s->deadline_ms = 0;
-        send_step_awaiting_input(e, s, pwd);
+        send_step_awaiting_input(e, s, pwd);  // reads ob.truncated before reset
+        // Post-prompt output is a fresh delta (mirrors edge resetForInteraction).
+        ob_reset(&s->ob);
         fprintf(stderr, "RUN awaiting input: %s fg=%ld pwd=%d\n",
                 s->run_block_id, fg, pwd);
     }
