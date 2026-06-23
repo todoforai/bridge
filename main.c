@@ -64,6 +64,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #else
 #  include <fcntl.h>
 #  include <poll.h>
+#  include <pwd.h>          // getpwnam/getpwuid for ~user expansion
 #  include <sys/file.h>     // flock
 #  include <sys/resource.h>
 #  include <unistd.h>
@@ -80,6 +81,47 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "tools.h"
 #include "update.h"
 #include "login.h"
+
+// Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
+// what /bin/sh would do for shell commands (write_file_b64 bypasses the shell,
+// so it must expand the tilde itself). Returns a malloc'd string the caller
+// frees, or NULL when no expansion applies (path used as-is).
+static char *bridge_expand_tilde(const char *p) {
+    if (!p || p[0] != '~') return NULL;
+    const char *rest = p + 1;                 // after '~'
+    const char *home = NULL;
+#ifdef _WIN32
+    if (*rest != '\0' && *rest != '/' && *rest != '\\') return NULL;  // no ~user on Windows
+    home = getenv("USERPROFILE");
+    if (!home || !*home) return NULL;
+#else
+    char namebuf[256];
+    if (*rest == '\0' || *rest == '/') {       // ~ or ~/...
+        home = getenv("HOME");
+        if (!home || !*home) {
+            struct passwd *pw = getpwuid(getuid());
+            home = pw ? pw->pw_dir : NULL;
+        }
+    } else {                                   // ~user or ~user/...
+        const char *slash = strchr(rest, '/');
+        size_t nlen = slash ? (size_t)(slash - rest) : strlen(rest);
+        if (nlen == 0 || nlen >= sizeof(namebuf)) return NULL;
+        memcpy(namebuf, rest, nlen);
+        namebuf[nlen] = '\0';
+        struct passwd *pw = getpwnam(namebuf);
+        if (!pw) return NULL;
+        home = pw->pw_dir;
+        rest = slash ? slash : rest + nlen;    // remainder starts at '/' (or empty)
+    }
+    if (!home || !*home) return NULL;
+#endif
+    size_t hlen = strlen(home), rlen = strlen(rest);
+    char *out = malloc(hlen + rlen + 1);
+    if (!out) return NULL;
+    memcpy(out, home, hlen);
+    memcpy(out + hlen, rest, rlen + 1);
+    return out;
+}
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 
@@ -1286,6 +1328,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (!json_get_str_decoded(args, args_len, "path", path, praw_len + 1, &plen))
                 WFB_FAIL("write_file_b64: malformed args.path");
             (void)plen;
+
+            // Expand a leading ~ ourselves — this path never touches the shell.
+            char *expanded = bridge_expand_tilde(path);
+            if (expanded) { free(path); path = expanded; }
 
             const char *b64 = NULL; size_t b64_len = 0;
             if (!json_get_str(args, args_len, "dataB64", &b64, &b64_len))
