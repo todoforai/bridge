@@ -104,12 +104,27 @@ release-windows-x64: | build
 	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
 	strip build/todoforai-bridge-windows-x64.exe 2>/dev/null || true
 
+# PTY helpers used by the test harnesses (pty_posix.c calls into env_path.c).
+TEST_DEPS = pty_posix.c env_path.c
+
 # Sentinel-scanner smoke test: spawns a real PTY with echo off, runs a few
 # wrapped commands, asserts the bridge's emit/parse logic matches.
 .PHONY: test-run
 test-run: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-run test/test_run.c pty_posix.c -lutil
+	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-run test/test_run.c $(TEST_DEPS) -lutil
 	./build/test-run
+
+# Bridge-side RUN timing: spawn/warmup/run breakdown per command, no network.
+.PHONY: test-timing
+test-timing: | build
+	$(CC) -O0 -g -Wall -I. -o build/test-timing test/test_timing.c $(TEST_DEPS) -lutil
+	./build/test-timing
+
+# A/B proof of the poll-loop fix: PTY fd out of vs in the pollset (50ms → ~1ms).
+.PHONY: test-pollfix
+test-pollfix: | build
+	$(CC) -O0 -g -Wall -I. -o build/test-pollfix test/test_pollfix.c $(TEST_DEPS) -lutil
+	./build/test-pollfix
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.

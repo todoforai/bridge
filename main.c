@@ -242,6 +242,12 @@ typedef struct {
 
     // Per-RUN output policy (head/tail cut + line cap). Reset on each RUN.
     out_policy_t ob;
+
+    // Timing markers (monotonic ms) for the RUN path. Populated only when
+    // g_timing is set; -1 = not yet stamped this RUN.
+    int64_t t_run_recv;
+    int64_t t_spawned;
+    int64_t t_first_out;
 } session_t;
 
 // 2 ticks × 250 ms ⇒ ~250-500 ms latency, FP rate ~1-2%.
@@ -287,6 +293,9 @@ typedef struct {
 // Runtime cap, set once in main() before edge_t is allocated. All loops over
 // sessions use this; never read directly before main() resolves it.
 static int g_max_sessions = DEFAULT_MAX_SESSIONS;
+// Timing instrumentation: when BRIDGE_TIMING is set, the RUN path logs a
+// per-command breakdown (recv→spawned→firstByte→done) to stderr. Read once.
+static int g_timing = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -650,6 +659,22 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
         jfield_raw(buf, sizeof buf, &u, "truncated", s->ob.truncated ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
+
+    if (g_timing) {
+        int64_t done = monotonic_ms();
+        int64_t recv = s->t_run_recv, sp = s->t_spawned, fo = s->t_first_out;
+        char fb[24], fd[24];
+        if (fo >= 0) {
+            snprintf(fb, sizeof fb, "%lld", (long long)(fo - sp));
+            snprintf(fd, sizeof fd, "%lld", (long long)(done - fo));
+        } else {
+            snprintf(fb, sizeof fb, "n/a");
+            snprintf(fd, sizeof fd, "n/a");
+        }
+        fprintf(stderr,
+            "[bridge timing] session=%s recv->spawned=%lldms spawned->firstByte=%sms firstByte->done=%sms total=%lldms\n",
+            s->session_id, (long long)(sp - recv), fb, fd, (long long)(done - recv));
+    }
 }
 
 // Bridge → server: step's fg process is blocked in a tty read. RUN stays in
@@ -840,14 +865,19 @@ static void ob_finish(edge_t *e, session_t *s) {
     }
 }
 
-static void forward_pty_output(edge_t *e, session_t *s) {
+// Returns the number of bytes read this call (0 on EAGAIN/no data), so the
+// caller can keep draining while a full buffer suggests more is pending.
+static long forward_pty_output(edge_t *e, session_t *s) {
     long n = bridge_pty_read(&s->pty, e->pty_buf, sizeof(e->pty_buf));
-    if (n <= 0) return;
+    if (n <= 0) return 0;
     s->last_active_ms = monotonic_ms();
+
+    if (g_timing && s->state == SESS_RUNNING && s->t_first_out < 0)
+        s->t_first_out = s->last_active_ms;
 
     if (s->state != SESS_RUNNING) {
         send_output_bytes(e, s, e->pty_buf, (size_t)n);
-        return;
+        return n;
     }
 
     // PTY echo is OFF on this session (set at spawn), so what we read is the
@@ -866,7 +896,7 @@ static void forward_pty_output(edge_t *e, session_t *s) {
             memmove(s->tail_buf, s->tail_buf + emit, s->tail_len - emit);
             s->tail_len -= emit;
         }
-        return;
+        return n;
     }
 
     // Strict result-line parse: require "<sentinel>:<int>\r?\n". Anything
@@ -914,7 +944,7 @@ static void forward_pty_output(edge_t *e, session_t *s) {
         s->tail_len -= skip;
         // Loop hint: caller will run again on next read; if more sentinel
         // candidates already in tail, they'll be discovered then.
-        return;
+        return n;
     }
 
     if (!has_code) {
@@ -928,7 +958,7 @@ static void forward_pty_output(edge_t *e, session_t *s) {
         size_t keep = s->tail_len - (size_t)found;
         memmove(s->tail_buf, s->tail_buf + (size_t)found, keep);
         s->tail_len = keep;
-        return;
+        return n;
     }
 
     // Success. Emit pre-sentinel bytes minus the injected separator.
@@ -941,7 +971,11 @@ static void forward_pty_output(edge_t *e, session_t *s) {
     (void)line_end;  // bytes after the sentinel line are silently dropped (they shouldn't exist).
     ob_finish(e, s);  // emit truncation notice + tail (no-op if nothing dropped)
     send_step_done(e, s, has_code, exit_code, /*timedOut=*/0);
+    // run_finish drops the run to SESS_IDLE, and for one-shot sessions also
+    // closes the PTY + clears s->active — so the caller's drain loop must
+    // re-check s->active before reading again.
     run_finish(s);
+    return n;
 }
 
 // ── Command dispatch ────────────────────────────────────────────────────────
@@ -959,6 +993,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
     #define IS(s) (type_len == sizeof(s) - 1 && memcmp(type, s, sizeof(s) - 1) == 0)
 
     if (IS("run")) {
+        int64_t t_recv = g_timing ? monotonic_ms() : 0;
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
         // Required fields: blockId, cmdB64. `sessionId` is optional — when
         // absent, the bridge spawns a one-shot PTY and auto-closes it on
@@ -1128,6 +1163,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->last_active_ms = monotonic_ms();
         s->last_pause_poll_ms = s->last_active_ms;
         s->pause_consec_ticks = 0;
+        if (g_timing) {
+            s->t_run_recv  = t_recv;
+            s->t_spawned   = s->last_active_ms;
+            s->t_first_out = -1;
+        }
 
         send_run_started(e, s, created);
 
@@ -1509,10 +1549,20 @@ static void service_sessions(edge_t *e) {
                 s->run_block_id, fg, pwd);
     }
 
-    // Drain PTY masters (non-blocking; returns 0 on EAGAIN).
+    // Drain PTY masters (non-blocking; returns 0 on EAGAIN). Drain each session
+    // until it stops yielding a full buffer, so large output doesn't trickle
+    // one BUF_SIZE chunk per loop tick (which, with the PTY fd in the pollset,
+    // would spin the loop). A per-session byte budget keeps one noisy session
+    // from starving others; leftover bytes are picked up next tick.
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
-        if (s->active) forward_pty_output(e, s);
+        size_t drained = 0;
+        // s->active can flip to 0 mid-drain (sentinel → run_finish), so re-check.
+        while (s->active && drained < 1u << 20) {
+            long n = forward_pty_output(e, s);
+            if (n <= 0) break;
+            drained += (size_t)n;
+        }
     }
 }
 
@@ -1579,9 +1629,34 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         return -1;
     }
 
+    // pfds[0] is always the WS fd; remaining slots are active sessions' PTY
+    // master fds so output wakes the loop immediately instead of waiting out
+    // the timeout. +1 for the WS slot.
+    struct pollfd *pfds = calloc((size_t)g_max_sessions + 1, sizeof *pfds);
+    if (!pfds) { fail(e, "out of memory allocating pollfds"); ws_close(&e->ws); noise_ws_wipe(&e->noise); return -1; }
+
     while (!e->done) {
-        struct pollfd pfd = { .fd = e->ws.fd, .events = POLLIN | (ws_want_write(&e->ws) ? POLLOUT : 0) };
-        int pr = poll(&pfd, 1, 50);
+        pfds[0].fd = e->ws.fd;
+        pfds[0].events = POLLIN | (ws_want_write(&e->ws) ? POLLOUT : 0);
+#ifdef _WIN32
+        ULONG nfds = 1;          // WSAPoll takes ULONG; nfds_t is POSIX-only
+#else
+        nfds_t nfds = 1;
+#endif
+        // Poll the PTY of every running session. The session index is recovered
+        // from the fd in service_sessions (it reads all active sessions anyway),
+        // so we only need the wakeup here — no per-fd bookkeeping.
+        for (int i = 0; i < g_max_sessions; i++) {
+            session_t *s = &e->sessions[i];
+            if (s->active && s->state == SESS_RUNNING) {
+                int fd = bridge_pty_pollfd(&s->pty);
+                if (fd >= 0) { pfds[nfds].fd = fd; pfds[nfds].events = POLLIN; nfds++; }
+            }
+        }
+        struct pollfd *pfd = &pfds[0];
+        // Keep a 50ms ceiling so the awaiting-input probe and deadline checks in
+        // service_sessions still tick when neither WS nor PTY has activity.
+        int pr = poll(pfds, nfds, 50);
 #ifdef _WIN32
         if (pr < 0) { fail(e, "poll failed (WSA %d)", WSAGetLastError()); break; }
 #else
@@ -1592,11 +1667,11 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         }
 #endif
         if (pr > 0) {
-            if (pfd.revents & (POLLERR | POLLNVAL)) {
-                fail(e, "socket error (revents=0x%x)", pfd.revents);
+            if (pfd->revents & (POLLERR | POLLNVAL)) {
+                fail(e, "socket error (revents=0x%x)", pfd->revents);
                 break;
             }
-            if (pfd.revents & (POLLIN | POLLHUP)) {
+            if (pfd->revents & (POLLIN | POLLHUP)) {
                 int rc = ws_io_in(&e->ws, on_ws_msg, e);
                 // Surface CLOSE frame metadata regardless of rc — a clean
                 // server-initiated close arrives via ws_io_in returning 0
@@ -1615,7 +1690,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                     break;
                 }
             }
-            if (pfd.revents & POLLOUT) {
+            if (pfd->revents & POLLOUT) {
                 if (ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
             }
         }
@@ -1636,6 +1711,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         // Drain any send queue produced by service_sessions / handle_command.
         if (ws_want_write(&e->ws) && ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
     }
+    free(pfds);
     ws_close(&e->ws);
     noise_ws_wipe(&e->noise);
     return e->rc;
@@ -1765,6 +1841,11 @@ int main(int argc, char **argv) {
         else cli_parse_error("todoforai-bridge", USAGE_MAIN, argc, argv, &opt, c);
     }
     // Select the credential profile before any load (env is last resort).
+    // When --host points at a local/dev backend but no --profile was given,
+    // default to the "dev" profile instead of "default": dev creds are minted
+    // against the local backend (own device id/secret + TOFU'd pubkey), so the
+    // prod-pinned default profile would otherwise fail the Noise handshake.
+    if (!profile && login_is_local_host(host)) profile = "dev";
     if (profile && login_set_profile(profile) < 0) return 2;
 
     // Load saved device credentials from `bridge login`
@@ -1834,6 +1915,7 @@ int main(int argc, char **argv) {
             host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
 
     g_max_sessions = resolve_max_sessions();
+    g_timing = getenv("BRIDGE_TIMING") != NULL;
     // Each session needs a master fd + a few transient pipes in the child
     // spawn path. Add headroom for the bridge's own fds (ws, stdio, etc.).
     bump_fd_limit(g_max_sessions + 64);

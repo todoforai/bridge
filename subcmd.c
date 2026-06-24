@@ -209,6 +209,9 @@ int cmd_login(int argc, char **argv) {
         else if (c == 'P') profile = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
+    // Mirror the daemon: a local --host with no explicit --profile logs into
+    // the "dev" profile so dev creds land in the same place the daemon reads.
+    if (!profile && login_is_local_host(host)) profile = "dev";
     if (profile && login_set_profile(profile) < 0) return 2;
     return bridge_login_run(device_name, token, host, port_s);
 }
