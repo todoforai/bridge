@@ -242,12 +242,6 @@ typedef struct {
 
     // Per-RUN output policy (head/tail cut + line cap). Reset on each RUN.
     out_policy_t ob;
-
-    // Timing markers (monotonic ms) for the RUN path. Populated only when
-    // g_timing is set; -1 = not yet stamped this RUN.
-    int64_t t_run_recv;
-    int64_t t_spawned;
-    int64_t t_first_out;
 } session_t;
 
 // 2 ticks × 250 ms ⇒ ~250-500 ms latency, FP rate ~1-2%.
@@ -293,9 +287,6 @@ typedef struct {
 // Runtime cap, set once in main() before edge_t is allocated. All loops over
 // sessions use this; never read directly before main() resolves it.
 static int g_max_sessions = DEFAULT_MAX_SESSIONS;
-// Timing instrumentation: when BRIDGE_TIMING is set, the RUN path logs a
-// per-command breakdown (recv→spawned→firstByte→done) to stderr. Read once.
-static int g_timing = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -659,22 +650,6 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
         jfield_raw(buf, sizeof buf, &u, "truncated", s->ob.truncated ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
-
-    if (g_timing) {
-        int64_t done = monotonic_ms();
-        int64_t recv = s->t_run_recv, sp = s->t_spawned, fo = s->t_first_out;
-        char fb[24], fd[24];
-        if (fo >= 0) {
-            snprintf(fb, sizeof fb, "%lld", (long long)(fo - sp));
-            snprintf(fd, sizeof fd, "%lld", (long long)(done - fo));
-        } else {
-            snprintf(fb, sizeof fb, "n/a");
-            snprintf(fd, sizeof fd, "n/a");
-        }
-        fprintf(stderr,
-            "[bridge timing] session=%s recv->spawned=%lldms spawned->firstByte=%sms firstByte->done=%sms total=%lldms\n",
-            s->session_id, (long long)(sp - recv), fb, fd, (long long)(done - recv));
-    }
 }
 
 // Bridge → server: step's fg process is blocked in a tty read. RUN stays in
@@ -872,9 +847,6 @@ static long forward_pty_output(edge_t *e, session_t *s) {
     if (n <= 0) return 0;
     s->last_active_ms = monotonic_ms();
 
-    if (g_timing && s->state == SESS_RUNNING && s->t_first_out < 0)
-        s->t_first_out = s->last_active_ms;
-
     if (s->state != SESS_RUNNING) {
         send_output_bytes(e, s, e->pty_buf, (size_t)n);
         return n;
@@ -993,7 +965,6 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
     #define IS(s) (type_len == sizeof(s) - 1 && memcmp(type, s, sizeof(s) - 1) == 0)
 
     if (IS("run")) {
-        int64_t t_recv = g_timing ? monotonic_ms() : 0;
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
         // Required fields: blockId, cmdB64. `sessionId` is optional — when
         // absent, the bridge spawns a one-shot PTY and auto-closes it on
@@ -1163,11 +1134,6 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->last_active_ms = monotonic_ms();
         s->last_pause_poll_ms = s->last_active_ms;
         s->pause_consec_ticks = 0;
-        if (g_timing) {
-            s->t_run_recv  = t_recv;
-            s->t_spawned   = s->last_active_ms;
-            s->t_first_out = -1;
-        }
 
         send_run_started(e, s, created);
 
@@ -1915,7 +1881,6 @@ int main(int argc, char **argv) {
             host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
 
     g_max_sessions = resolve_max_sessions();
-    g_timing = getenv("BRIDGE_TIMING") != NULL;
     // Each session needs a master fd + a few transient pipes in the child
     // spawn path. Add headroom for the bridge's own fds (ws, stdio, etc.).
     bump_fd_limit(g_max_sessions + 64);
