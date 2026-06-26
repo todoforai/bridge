@@ -65,9 +65,7 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
         setenv("TERM", "xterm-256color", 1);
         setenv("PS1", "", 1);
         setenv("PS2", "", 1);
-        // Make the managed tools binDir (~/.todoforai/tools/bin, mirroring the
-        // edge) and ~/.local/bin discoverable so agent commands find tools the
-        // bridge installed during scan_tools.
+        // Make HostDesktop-installed tools discoverable.
         char *tools_path = bridge_build_tools_path();
         if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
         char *argv[] = { (char *)shell, NULL };
