@@ -84,6 +84,16 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
         goto fail;
     }
 
+    // Bridge RUNs are automated even though they execute inside a ConPTY.
+    // Keep common CLIs from opening interactive pagers such as less(1),
+    // which otherwise park the step at "(END)" and require injected `q`.
+    SetEnvironmentVariableA("PAGER", "cat");
+    SetEnvironmentVariableA("GH_PAGER", "cat");
+    SetEnvironmentVariableA("GIT_PAGER", "cat");
+    SetEnvironmentVariableA("MANPAGER", "cat");
+    SetEnvironmentVariableA("SYSTEMD_PAGER", "cat");
+    SetEnvironmentVariableA("AWS_PAGER", "");
+
     const char *sh = resolve_shell(shell);
     char cmdline[MAX_PATH + 32];
     // Quoting: shell path may contain spaces. ConPTY child gets argv[0] = sh.
