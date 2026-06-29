@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  include <ws2tcpip.h>
@@ -42,6 +43,29 @@
        return f < 0 ? -1 : fcntl(s, F_SETFL, f | O_NONBLOCK);
    }
 #endif
+
+// Monotonic clock in ms for the liveness watchdog. We deliberately pick a clock
+// that DOES advance while the machine is suspended (CLOCK_BOOTTIME on Linux,
+// GetTickCount64 on Windows — both count sleep time). That way, when a laptop
+// resumes from hibernation onto a now-dead half-open socket, last_recv_ms is
+// already far in the past and the watchdog trips on the very next tick instead
+// of waiting out the full idle window in awake-time. Falls back to
+// CLOCK_MONOTONIC where BOOTTIME is unavailable (e.g. macOS), which still
+// detects the dead socket, just within the idle window of awake-time after wake.
+int64_t ws_monotonic_ms(void) {
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();  // includes suspend time
+#else
+    struct timespec ts;
+#  if defined(CLOCK_BOOTTIME)
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0)
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+#  else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#  endif
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
 
 static void ws_set_err(ws_t *ws, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -242,7 +266,9 @@ int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
             ws->rx_len = extra;
         }
     }
-    // Already non-blocking from tcp_connect. Done.
+    // Already non-blocking from tcp_connect. Seed the liveness clock so the
+    // watchdog measures idle time from a fresh connection. Done.
+    ws->last_recv_ms = ws_monotonic_ms();
     return 0;
 }
 
@@ -433,7 +459,33 @@ int ws_io_in(ws_t *ws, ws_recv_cb cb, void *ctx) {
             return -1;
         }
         ws->rx_len += (size_t)n;
+        ws->last_recv_ms = ws_monotonic_ms();
     }
 
     return drain_frames(ws, cb, ctx);
+}
+
+int ws_check_liveness(ws_t *ws, int idle_ms, int dead_ms) {
+    if (ws->closed || ws->last_recv_ms == 0) return 0;
+    int64_t now = ws_monotonic_ms();
+    int64_t idle = now - ws->last_recv_ms;
+
+    // Silent past the hard limit (incl. a PING that drew no PONG) → declare dead.
+    if (idle >= dead_ms) {
+        ws_set_err(ws, "no data for %llds — connection presumed dead (half-open?)",
+                   (long long)(idle / 1000));
+        ws->closed = 1;
+        return 1;
+    }
+
+    // Idle but not yet dead: poke the peer once with a PING. last_recv_ms moving
+    // (PONG or any frame) resets ping_sent_ms via the < comparison below.
+    if (idle >= idle_ms && ws->ping_sent_ms <= ws->last_recv_ms) {
+        // Only suppress further PINGs if this one actually made it onto the send
+        // queue; under tx backpressure we'll retry next tick rather than wait
+        // out the hard timeout.
+        if (ws_send_frame(ws, WS_OP_PING, NULL, 0) == 0)
+            ws->ping_sent_ms = now;
+    }
+    return 0;
 }

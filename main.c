@@ -1676,7 +1676,16 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                 fprintf(stderr, "✓ Authenticated\n");
         }
         service_sessions(e);
-        // Drain any send queue produced by service_sessions / handle_command.
+        // Liveness watchdog: catch a half-open socket the kernel never EOFs
+        // (e.g. surviving a hibernation, where last_recv_ms suddenly looks far
+        // in the past on wake). PING after WS_PING_IDLE_MS, presume dead after
+        // WS_DEAD_MS. ws_check_liveness no-ops until the handshake seeds the clock.
+        if (ws_check_liveness(&e->ws, WS_PING_IDLE_MS, WS_DEAD_MS)) {
+            fail(e, "%s", e->ws.err[0] ? e->ws.err : "connection liveness check failed");
+            break;
+        }
+        // Drain any send queue produced by service_sessions / handle_command
+        // (or the watchdog PING above).
         if (ws_want_write(&e->ws) && ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
     }
     free(pfds);

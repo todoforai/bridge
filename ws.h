@@ -40,6 +40,13 @@ typedef struct {
     int      have_close;
     char     close_reason[128];
 
+    // Liveness: monotonic ms of the last byte read off the socket, and of the
+    // last app-level PING we sent. Driven by the caller's watchdog so a
+    // half-open socket (hibernation, silent network drop) is surfaced even when
+    // the kernel never delivers an EOF.
+    int64_t  last_recv_ms;
+    int64_t  ping_sent_ms;
+
     char     err[160];
 } ws_t;
 
@@ -64,5 +71,20 @@ typedef void (*ws_recv_cb)(uint8_t opcode, const uint8_t *data, size_t len, void
 int ws_io_in(ws_t *ws, ws_recv_cb cb, void *ctx);
 
 static inline int ws_want_write(const ws_t *ws) { return ws->tx_len > 0; }
+
+// Monotonic milliseconds for the liveness watchdog. Uses a clock that counts
+// suspend time where available (CLOCK_BOOTTIME / GetTickCount64) so a resume
+// from hibernation immediately shows a large idle gap.
+int64_t ws_monotonic_ms(void);
+
+// Liveness watchdog. Call once per poll tick. If the socket has been silent for
+// `idle_ms`, enqueue an app-level PING (once). If still silent `dead_ms` after
+// connect-or-last-byte, mark the connection dead (sets ws->closed + ws->err) so
+// the caller breaks its loop and reconnects. Returns 1 if it just declared the
+// connection dead, else 0. Catches half-open sockets the kernel never EOFs
+// (e.g. surviving a hibernation), which TCP keepalive's ~2h defaults miss.
+#define WS_PING_IDLE_MS 30000   // silence before we poke the peer with a PING
+#define WS_DEAD_MS      45000   // silence before the connection is presumed dead
+int ws_check_liveness(ws_t *ws, int idle_ms, int dead_ms);
 
 #endif
