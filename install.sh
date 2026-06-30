@@ -111,40 +111,62 @@ WHERE="$PREFIX/todoforai-bridge"
 HINT=""
 
 # ── PATH setup ──────────────────────────────────────────────────────────────
-# 1) prefix already on PATH → done
-# 2) ~/.local/bin on PATH → symlink there (no rc mutation)
-# 3) fallback → append to active shell's rc file
+# An installer in a `curl | sh` pipe runs in a child process, so it can't
+# mutate the parent shell's PATH. To make `todoforai-bridge` work in the
+# SAME shell, we instead symlink the binary into a dir that's already on PATH.
+# 1) prefix already on PATH → bare name works
+# 2) writable dir already on PATH → symlink there → bare name works NOW
+# 3) fallback → append to active shell's rc file (only new shells get it)
+
+# Pick a writable dir already on PATH to symlink into. Prefer dirs under $HOME;
+# otherwise take the first writable one (e.g. Homebrew's /opt/homebrew/bin or
+# /usr/local/bin on macOS, which are user-writable and already on PATH).
+pick_link_dir() {
+    pref=""
+    IFS=:
+    for d in $PATH; do
+        [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] || continue
+        [ "$d" = "$PREFIX" ] && continue          # don't link into ourselves
+        case "$d" in
+            "$HOME"/*) unset IFS; printf '%s\n' "$d"; return 0 ;;  # home dirs first
+            *) [ -z "$pref" ] && pref="$d" ;;                      # else first writable
+        esac
+    done
+    unset IFS
+    [ -n "$pref" ] && { printf '%s\n' "$pref"; return 0; }
+    return 1
+}
+
 case ":$PATH:" in
     *":$PREFIX:"*)
         CMD=todoforai-bridge
         ;;
     *)
-        case ":$PATH:" in
-            *":$HOME/.local/bin:"*)
-                mkdir -p "$HOME/.local/bin"
-                ln -sf "$PREFIX/todoforai-bridge" "$HOME/.local/bin/todoforai-bridge"
-                CMD=todoforai-bridge
-                WHERE="$WHERE, linked into ~/.local/bin"
-                ;;
-            *)
-                line="export PATH=\"$PREFIX:\$PATH\""
-                case "${SHELL##*/}" in
-                    zsh)  rc="$HOME/.zshrc" ;;
-                    bash) rc="$HOME/.bashrc" ;;
-                    *)    rc="$HOME/.profile" ;;
-                esac
-                if ! grep -qsF "$line" "$rc" 2>/dev/null; then
-                    # ensure trailing newline before appending
-                    [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
-                    printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
-                    WHERE="$WHERE, added to PATH in ~/${rc#$HOME/}"
-                fi
-                # rc changes only apply to *new* shells; suggest the absolute
-                # path so the Start command works in this shell right now.
-                CMD="$BRIDGE"
-                HINT=" (new shells get it on PATH; this shell: run the full path below)"
-                ;;
-        esac
+        if link_dir=$(pick_link_dir); then
+            ln -sf "$PREFIX/todoforai-bridge" "$link_dir/todoforai-bridge"
+            CMD=todoforai-bridge
+            case "$link_dir" in
+                "$HOME"/*) WHERE="$WHERE, linked into ~/${link_dir#$HOME/}" ;;
+                *)         WHERE="$WHERE, linked into $link_dir" ;;
+            esac
+        else
+            line="export PATH=\"$PREFIX:\$PATH\""
+            case "${SHELL##*/}" in
+                zsh)  rc="$HOME/.zshrc" ;;
+                bash) rc="$HOME/.bashrc" ;;
+                *)    rc="$HOME/.profile" ;;
+            esac
+            if ! grep -qsF "$line" "$rc" 2>/dev/null; then
+                # ensure trailing newline before appending
+                [ -s "$rc" ] && [ -n "$(tail -c1 "$rc" 2>/dev/null)" ] && printf '\n' >>"$rc"
+                printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
+                WHERE="$WHERE, added to PATH in ~/${rc#$HOME/}"
+            fi
+            # rc changes only apply to *new* shells; suggest the absolute
+            # path so the Start command works in this shell right now.
+            CMD="$BRIDGE"
+            HINT=" (new shells get it on PATH; this shell: run the full path below)"
+        fi
         ;;
 esac
 ok "installed $WHERE$HINT"
