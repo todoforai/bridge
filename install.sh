@@ -139,8 +139,10 @@ case ":$PATH:" in
                     printf '\n# added by todoforai bridge installer\n%s\n' "$line" >>"$rc"
                     WHERE="$WHERE, added to PATH in ~/${rc#$HOME/}"
                 fi
-                CMD=todoforai-bridge
-                HINT=" (in a new shell, or: $line)"
+                # rc changes only apply to *new* shells; suggest the absolute
+                # path so the Start command works in this shell right now.
+                CMD="$BRIDGE"
+                HINT=" (new shells get it on PATH; this shell: run the full path below)"
                 ;;
         esac
         ;;
