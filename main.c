@@ -11,7 +11,7 @@
 //   (unless STEP_AWAITING_INPUT upgraded it to a persistent session).
 //     → {"type":"identity","data":{...}}
 //     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
-//     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool}
+//     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool,"cwd":"..."}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
 //     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool}
 //     → {"type":"step_done","sessionId":"uuid","blockId":"...","shellPid":N,"exitCode":N|null,"timedOut":bool}
@@ -203,6 +203,13 @@ typedef struct {
     // if the run hits STEP_AWAITING_INPUT — at that point the agent has the
     // minted sessionId and the session becomes persistent for resume.
     int one_shot;
+
+    // Working dir the PTY was spawned in (the explicit RUN `cwd` or the
+    // <tmpdir>/todoforai default from resolve_default_cwd). Echoed in
+    // RUN_STARTED so the backend/UI can show the real cwd — the bridge is
+    // the only side that knows the resolved default (it depends on remote
+    // $TMPDIR). Set once at spawn; persistent sessions keep their dir.
+    char cwd[1024];
 
     // Opaque echo label set from RunMessage.todoId. Bridge never interprets
     // it — just stashes it on the session and echoes it on every related
@@ -619,7 +626,10 @@ static void send_output_bytes(edge_t *e, session_t *s,
 #endif
 
 static void send_run_started(edge_t *e, session_t *s, int created) {
-    char buf[384]; size_t u = 0;
+    // cwd is up to 1023 bytes and JSON-escaping can expand control bytes 6x;
+    // size for the worst case so a valid path never drops the frame (losing
+    // RUN_STARTED would drop the live pid/cwd the UI needs for cancel/stdin).
+    char buf[8192]; size_t u = 0;
     char pid_buf[24]; snprintf(pid_buf, sizeof pid_buf, "%ld", SHELL_PID(s));
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
         jfield_str(buf, sizeof buf, &u, "type", "run_started", -1, 0) < 0 ||
@@ -628,7 +638,11 @@ static void send_run_started(edge_t *e, session_t *s, int created) {
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "shellPid", pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "created", created ? "true" : "false", 1) < 0 ||
-        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+        jfield_str(buf, sizeof buf, &u, "cwd", s->cwd, -1, 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) {
+        fprintf(stderr, "run_started serialization overflow for %s — frame dropped\n", s->session_id);
+        return;
+    }
     send_json(e, buf, u);
 }
 
@@ -1021,6 +1035,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", "failed to spawn PTY");
             }
             gen_uuid_v4(s->session_id);
+            snprintf(s->cwd, sizeof s->cwd, "%s", spawn_cwd);
             s->active = 1;
             s->state = SESS_IDLE;
             s->tail_len = 0;
