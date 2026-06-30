@@ -42,7 +42,7 @@
 
 #define VERSION_TIMEOUT_MS 5000
 #define STATUS_TIMEOUT_MS  10000
-#define OUT_CAP            200   // trim captured output (matches edge scanner)
+#define OUT_CAP            2048  // trim captured output — multi-account tools (e.g. zele whoami) need >200B
 #define VERSION_CAP        100
 
 // Run a shell command with a deadline. Captures up to `cap` bytes of combined
