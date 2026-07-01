@@ -1236,7 +1236,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (bridge_pty_write_all(&s->pty, decoded, dec_len) != 0) {
             fprintf(stderr, "PTY write error\n");
             return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "PTY_WRITE_FAILED", "PTY write failed; session may have died")
-                           : 0;
+                           : send_error(e, sid, sid_len, NULL, 0, "PTY_WRITE_FAILED", "PTY write failed; session may have died");
         }
         s->last_active_ms = monotonic_ms();
         // Stamp AFTER write_all (see RUN handler comment above).
