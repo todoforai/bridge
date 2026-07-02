@@ -283,13 +283,38 @@ void ws_close(ws_t *ws) {
 
 // Append a frame to the send queue. Client→server frames MUST be masked
 // (RFC 6455 §5.3). Mask key = 4 random bytes, XORed over the payload.
+// Worst-case frame overhead: 2 base + 8 ext len + 4 mask.
+#define WS_FRAME_HDR_MAX 14
+
+int ws_ensure_tx_room(ws_t *ws, size_t len) {
+    if (ws->closed) return -1;
+    if (len > WS_TX_MAX - WS_FRAME_HDR_MAX) return -1;
+    size_t frame = WS_FRAME_HDR_MAX + len;
+    if (ws->tx_cap - ws->tx_len >= frame) return 0;
+    // Queue is backed up — try to hand what we have to the kernel first.
+    if (ws_io_out(ws) < 0) return -1;
+    if (ws->tx_cap - ws->tx_len >= frame) return 0;
+    if (ws->tx_len > WS_TX_MAX - frame) return -1;
+    size_t need = ws->tx_len + frame;
+    size_t cap = ws->tx_cap;
+    while (cap < need) {
+        if (cap > WS_TX_MAX / 2) { cap = WS_TX_MAX; break; }
+        cap *= 2;
+    }
+    uint8_t *tx = realloc(ws->tx, cap);
+    if (!tx) return -1;
+    ws->tx = tx;
+    ws->tx_cap = cap;
+    return 0;
+}
+
 int ws_send_frame(ws_t *ws, uint8_t opcode, const void *data, size_t len) {
     if (ws->closed) return -1;
     // Header: 2..14 bytes (1 + 1 + ext_len up to 8 + mask 4).
     size_t hdr = 2 + 4;
     if (len > 65535) hdr += 8;
     else if (len > 125) hdr += 2;
-    if (ws->tx_len + hdr + len > ws->tx_cap) return -1;
+    if (ws->tx_len + hdr + len > ws->tx_cap && ws_ensure_tx_room(ws, len) != 0) return -1;
 
     uint8_t *p = ws->tx + ws->tx_len;
     p[0] = (uint8_t)(0x80 | (opcode & 0x0F));   // FIN=1

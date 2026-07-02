@@ -62,6 +62,15 @@ void ws_close(ws_t *ws);
 // Frame and enqueue. Caller drains via ws_io_out on POLLOUT.
 int ws_send_frame(ws_t *ws, uint8_t opcode, const void *data, size_t len);
 
+// Ensure the TX queue can accept a frame with `len` payload bytes (WebSocket
+// header/mask overhead is accounted for internally).
+// Tries a synchronous drain first, then grows the buffer up to WS_TX_MAX.
+// Returns 0 if room is guaranteed, -1 otherwise. Callers that pay a
+// non-replayable cost to build a frame (e.g. a Noise nonce) MUST call this
+// before building it, so a full queue never burns that cost.
+#define WS_TX_MAX (8u * 1024 * 1024)
+int ws_ensure_tx_room(ws_t *ws, size_t len);
+
 // Drain as much of the send queue as the kernel will accept.
 int ws_io_out(ws_t *ws);
 

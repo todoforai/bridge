@@ -1541,7 +1541,10 @@ static void service_sessions(edge_t *e) {
         session_t *s = &e->sessions[i];
         size_t drained = 0;
         // s->active can flip to 0 mid-drain (sentinel → run_finish), so re-check.
-        while (s->active && drained < 1u << 20) {
+        // Backpressure: leave PTY bytes in the kernel buffer while the WS TX
+        // queue is backed up (slow network) instead of ballooning it — the
+        // next tick picks them up after ws_io_out drains.
+        while (s->active && drained < 1u << 20 && e->ws.tx_len < 1u << 20) {
             long n = forward_pty_output(e, s);
             if (n <= 0) break;
             drained += (size_t)n;

@@ -37,6 +37,11 @@ int noise_ws_send(noise_ws_t *n, ws_t *w,
     if (!n->handshake_done) return -1;
     uint8_t ct[65 * 1024];
     if (pt_len + NOISE_TAG_LEN > sizeof(ct)) return -1;
+    // Reserve TX space BEFORE encrypting: noise_transport_write burns a
+    // nonce, so if ws_send_frame dropped the ciphertext afterwards the
+    // send cipher would desync from the server and every later frame
+    // would fail its auth tag ("Decrypt failed: invalid tag" → 4002).
+    if (ws_ensure_tx_room(w, pt_len + NOISE_TAG_LEN) != 0) return -1;
     int cn = noise_transport_write(&n->transport, ct, sizeof(ct), pt, pt_len);
     if (cn < 0) return -1;
     return ws_send_frame(w, WS_OP_BINARY, ct, (size_t)cn);
