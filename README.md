@@ -142,15 +142,18 @@ No new protocol messages, no in-binary HTTP client, no extra dependencies.
 ## Skills (`SKILL.md`)
 
 The TODOforAI agent discovers local skills on a bridge the same way it does on
-an edge — by walking two well-known locations and reading `SKILL.md` files:
+an edge — by walking well-known locations and reading `SKILL.md` files. Both
+`.agents/skills` and `.claude/skills` are scanned, per scope:
 
-| Scope  | Path                                  | Source                              |
-|--------|---------------------------------------|-------------------------------------|
-| `repo` | `<workspace-root>/.agents/skills/**`  | one per workspace root              |
-| `user` | `$HOME/.agents/skills/**`             | resolved on the bridge device       |
+| Scope  | Path                                                            | Source                        |
+|--------|----------------------------------------------------------------|-------------------------------|
+| `repo` | `<workspace-root>/{.agents,.claude}/skills/**`                  | one per workspace root        |
+| `user` | `$HOME/{.agents,.claude}/skills/**`                             | resolved on the bridge device |
 
 Discovery rules (mirror `edge/bun/src/skills.ts`):
 
+- Priority order: repo `.agents` → repo `.claude` → user; skills are deduped by
+  `name`, first match wins.
 - Walk depth: `find -maxdepth 6`; hidden entries (`.*`) are pruned.
 - Only files literally named `SKILL.md` are accepted.
 - Only the first 8 KiB of each file is read for metadata.
