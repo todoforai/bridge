@@ -27,11 +27,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c env_path.c \
+COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c update.c json.c ws.c env_path.c preview.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h json.h ws.h \
+HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h update.h json.h ws.h preview.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -113,6 +113,13 @@ TEST_DEPS = pty_posix.c env_path.c
 test-run: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-run test/test_run.c $(TEST_DEPS) -lutil
 	./build/test-run
+
+# Preview relay: local HTTP fetch + chunked response emission, no network.
+.PHONY: test-preview
+test-preview: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -o build/test-preview \
+	    test/test_preview.c preview.c json.c ws.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
+	./build/test-preview
 
 # Bridge-side RUN timing: spawn/warmup/run breakdown per command, no network.
 .PHONY: test-timing

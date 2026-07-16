@@ -27,6 +27,17 @@ int json_get_str(const char *buf, size_t len, const char *key,
 int json_get_str_decoded(const char *buf, size_t len, const char *key,
                          char *dst, size_t cap, size_t *out_len);
 
+// Iterate the key/value pairs of an object span (as returned by json_get_obj).
+// Init *pos = 0; returns 1 per pair (key/val span raw bytes, strings exclude
+// quotes but keep escapes), 0 when done or malformed.
+int json_obj_iter(const char *obj, size_t obj_len, size_t *pos,
+                  const char **key, size_t *key_len,
+                  const char **val, size_t *val_len, json_type_t *vtype);
+
+// Unescape a raw JSON string span into dst[cap], NUL-terminated.
+// Returns decoded length, or -1 on overflow/malformed escape.
+long json_unescape_span(const char *src, size_t src_len, char *dst, size_t dst_cap);
+
 // Value must be an object; *out spans `{...}` inclusive.
 int json_get_obj(const char *buf, size_t len, const char *key,
                  const char **out, size_t *out_len);

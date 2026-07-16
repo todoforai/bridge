@@ -76,6 +76,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "noise.h"     // noise_random
 #include "noise_ws.h"
 #include "ws.h"
+#include "preview.h"
 #include "pty.h"
 #include "subcmd.h"
 #include "tools.h"
@@ -966,6 +967,13 @@ static long forward_pty_output(edge_t *e, session_t *s) {
 
 // ── Command dispatch ────────────────────────────────────────────────────────
 
+// preview.c emit callback: Noise-encrypt + enqueue one chunk frame. The TX
+// queue absorbs a full 3.5MB response (~4.8MB base64 < WS_TX_MAX 8MB);
+// ws_ensure_tx_room inside noise_ws_send drains synchronously when full.
+static int preview_emit_json(void *ctx, const char *json, size_t len) {
+    return send_json((edge_t *)ctx, json, len);
+}
+
 static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
     const char *type = NULL; size_t type_len = 0;
     if (!json_get_str(msg, msg_len, "type", &type, &type_len)) return 0;
@@ -1438,12 +1446,45 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             #undef WFB_STAT
             #undef wfb_close
             #undef wfb_fstat
+        } else if (fn_len == 21 && memcmp(fn, "preview_register_port", 21) == 0) {
+            // live_preview: allow the relay to serve this local port (see
+            // preview.c). Probes first so the agent gets an immediate
+            // "nothing listening" error.
+            long port = 0;
+            if (!args || !json_get_long(args, args_len, "port", &port) || port < 1 || port > 65535) {
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                         "preview_register_port requires args.port (1-65535)");
+                return 0;
+            }
+            char perr[160];
+            if (bridge_preview_probe_port((int)port, perr, sizeof perr) != 0) {
+                char errmsg[224];
+                snprintf(errmsg, sizeof errmsg, "Nothing is listening on 127.0.0.1:%ld", port);
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
+                return 0;
+            }
+            bridge_preview_allow_port((int)port);
+            char result[64];
+            int rn = snprintf(result, sizeof result, "{\"port\":%ld,\"registered\":true}", port);
+            send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)rn);
+            fprintf(stderr, "preview: port %ld registered\n", port);
         } else {
-            char errmsg[128];
-            snprintf(errmsg, sizeof errmsg, "Unknown function: %.*s. Available: scan_tools, write_file_b64",
+            char errmsg[160];
+            snprintf(errmsg, sizeof errmsg,
+                     "Unknown function: %.*s. Available: scan_tools, write_file_b64, preview_register_port",
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
+    } else if (IS("preview:http_request")) {
+        // live_preview relay fetch. Payload-wrapped like FUNCTION_CALL_*:
+        // {"payload":{requestId, port, method, path, headers{}, bodyB64?}}.
+        // Responses stream back as preview:http_response_chunk frames (the
+        // Noise transport caps frames at 64KB — see preview.c).
+        const char *payload = NULL; size_t payload_len = 0;
+        if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len))
+            return send_error(e, NULL, 0, NULL, 0, "MISSING_PAYLOAD",
+                              "preview:http_request requires payload object");
+        bridge_preview_handle_request(payload, payload_len, preview_emit_json, e);
     }
 
     #undef IS

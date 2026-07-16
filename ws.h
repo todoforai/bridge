@@ -50,6 +50,12 @@ typedef struct {
     char     err[160];
 } ws_t;
 
+// Plain TCP connect with poll()-based deadline. Returns a NON-BLOCKING fd
+// with TCP_NODELAY set, or the platform invalid fd (-1 / INVALID_SOCKET)
+// with `err` filled. Also used by preview.c for the localhost HTTP client.
+ws_fd_t ws_tcp_connect(const char *host, uint16_t port, int timeout_ms,
+                       char *err, size_t err_cap);
+
 // TCP connect + HTTP Upgrade + verify 101 + set non-blocking + alloc rx/tx.
 // Does NOT validate Sec-WebSocket-Accept: Noise authenticates the server,
 // so a bogus 101 fails the handshake anyway (and avoids bundling SHA-1).

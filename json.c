@@ -182,6 +182,49 @@ int json_get_obj(const char *buf, size_t len, const char *key,
     return t == JT_OBJ;
 }
 
+int json_obj_iter(const char *obj, size_t obj_len, size_t *pos,
+                  const char **key, size_t *key_len,
+                  const char **val, size_t *val_len, json_type_t *vtype) {
+    const char *e = obj + obj_len;
+    const char *p;
+    if (*pos == 0) {
+        p = skip_ws(obj, e);
+        if (p >= e || *p != '{') return 0;
+        p = skip_ws(p + 1, e);
+        if (p < e && *p == '}') return 0;
+    } else {
+        p = skip_ws(obj + *pos, e);
+        if (p >= e || *p != ',') return 0;  // '}' or malformed ⇒ done
+        p = skip_ws(p + 1, e);
+    }
+    if (p >= e || *p != '"') return 0;
+    const char *ks = p + 1;
+    const char *kq = skip_string(p, e);
+    if (!kq) return 0;
+    *key = ks; *key_len = (size_t)(kq - 1 - ks);
+    p = skip_ws(kq, e);
+    if (p >= e || *p != ':') return 0;
+    p = skip_ws(p + 1, e);
+    if (p >= e) return 0;
+    const char *vs = p;
+    const char *ve = skip_value(p, e);
+    if (!ve) return 0;
+    char c = *vs;
+    json_type_t t;
+    if      (c == '"') t = JT_STR;
+    else if (c == '{') t = JT_OBJ;
+    else if (c == '[') t = JT_ARR;
+    else if (c == 't') t = JT_BOOL_T;
+    else if (c == 'f') t = JT_BOOL_F;
+    else if (c == 'n') t = JT_NULL;
+    else               t = JT_NUM;
+    if (t == JT_STR) { *val = vs + 1; *val_len = (size_t)(ve - vs) - 2; }
+    else             { *val = vs;     *val_len = (size_t)(ve - vs); }
+    *vtype = t;
+    *pos = (size_t)(ve - obj);
+    return 1;
+}
+
 int json_get_bool(const char *buf, size_t len, const char *key, int *out) {
     json_type_t t; const char *vp; size_t vl;
     if (!json_find(buf, len, key, &t, &vp, &vl)) return 0;
@@ -256,6 +299,10 @@ static long json_unescape(const char *src, size_t src_len, char *dst, size_t dst
     }
     dst[w] = '\0';
     return (long)w;
+}
+
+long json_unescape_span(const char *src, size_t src_len, char *dst, size_t dst_cap) {
+    return json_unescape(src, src_len, dst, dst_cap);
 }
 
 int json_get_str_decoded(const char *buf, size_t len, const char *key,

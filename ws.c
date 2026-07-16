@@ -75,8 +75,8 @@ static void ws_set_err(ws_t *ws, const char *fmt, ...) {
 
 // ── TCP connect with deadline ───────────────────────────────────────────────
 
-static ws_fd_t tcp_connect(const char *host, uint16_t port, int timeout_ms,
-                           char *err, size_t err_cap) {
+ws_fd_t ws_tcp_connect(const char *host, uint16_t port, int timeout_ms,
+                       char *err, size_t err_cap) {
 #ifdef _WIN32
     static int wsa_inited = 0;
     if (!wsa_inited) {
@@ -210,7 +210,7 @@ int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
     }
     ws->rx_cap = max_msg;
 
-    ws->fd = tcp_connect(host, port, connect_timeout_ms, ws->err, sizeof(ws->err));
+    ws->fd = ws_tcp_connect(host, port, connect_timeout_ms, ws->err, sizeof(ws->err));
     if (ws->fd == WS_INVALID) { ws_close(ws); return -1; }
 
     // Build Upgrade request. Sec-WebSocket-Key = base64(16 random bytes).
