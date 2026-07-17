@@ -1133,26 +1133,26 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
+        // TODOFORAI_TODO_ID doubles as the per-todo agent-browser session so
+        // parallel todos get isolated sockets (emit the id once, alias it).
         if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
-                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
                 s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
                 s->todo_id[0] ? s->todo_id : "",
-                s->todo_id[0] ? " AGENT_BROWSER_SESSION=" : "",
-                s->todo_id[0] ? s->todo_id : "",
+                s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
-                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s%s; "
+                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
                 "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
                 s->todo_id[0] ? s->todo_id : "",
-                s->todo_id[0] ? " AGENT_BROWSER_SESSION=" : "",
-                s->todo_id[0] ? s->todo_id : "",
+                s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
                 (int)cmd_len, cmd, s->sentinel);
         }
         free(cmd);
