@@ -171,6 +171,12 @@ analyze-scan-build: | build
 	    -o /tmp/_bridge_sb $(SRCS) $(LIBS) > build/analysis/scan-build.log 2>&1 || true
 	@grep -E 'bug(s)? found|No bugs found' build/analysis/scan-build.log | tail -1
 
+# Foreground dev run against a local backend (localhost → dev profile, port 4000).
+# Used by scripts/ecosystem.config.js (PM2 dev orchestrator).
+.PHONY: run-dev
+run-dev: build/todoforai-bridge
+	./build/todoforai-bridge --host localhost
+
 # Local dev: build + drop into ~/.todoforai/bin/ + ensure it's on PATH + print version.
 dev: build/todoforai-bridge
 	install -m755 $< $(HOME)/.todoforai/bin/todoforai-bridge
