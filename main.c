@@ -1214,6 +1214,21 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             fprintf(stderr, "subagent_token: missing or invalid 'token' field; ignoring\n");
         }
 
+    } else if (IS("ping")) {
+        // App-level keepalive over the Noise channel. The backend can't trust
+        // WS-layer PONG delivery (its `ws` lib may drop pong events on long-idle
+        // sockets), so it probes liveness with an encrypted `ping` and treats
+        // our decrypted `pong` (any inbound frame, really) as proof of life.
+        // Echo optional `requestId` so the backend can correlate if it wants.
+        const char *rid = NULL; size_t rid_len = 0;
+        json_get_str(msg, msg_len, "requestId", &rid, &rid_len);
+        char buf[128]; size_t u = 0;
+        if (json_emit_raw(buf, sizeof buf, &u, "{", 1) == 0 &&
+            jfield_str(buf, sizeof buf, &u, "type", "pong", -1, 0) == 0 &&
+            (!rid || jfield_str(buf, sizeof buf, &u, "requestId", rid, (long)rid_len, 1) == 0) &&
+            json_emit_raw(buf, sizeof buf, &u, "}", 1) == 0)
+            send_json(e, buf, u);
+
     } else if (IS("input")) {
         // Forward raw stdin bytes — used to resume a RUN awaiting input. The bridge
         // doesn't track which RUN consumes the bytes; the PTY/kernel/shell do.
