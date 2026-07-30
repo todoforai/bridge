@@ -65,6 +65,8 @@ static int test_shell_io(void) {
         return 1;
     }
 
+    fprintf(stderr, "diag: BRIDGE_SHELL=%s pid=%lu\n",
+            getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(unset)", pty.pid);
     bridge_pty_resize(&pty, 40, 100);
     wait_shell_ready(&pty);
 
@@ -79,20 +81,18 @@ static int test_shell_io(void) {
         return 1;
     }
 
-    // Drain until the shell exits or we time out, then strip ANSI and match.
+    // Drain for a fixed window (don't stop at reap — output may still be buffered
+    // in the ConPTY after the child exits).
     char output[65536] = {0};
     size_t used = 0;
     DWORD start = GetTickCount();
     while (GetTickCount() - start < 15000 && used + 1 < sizeof(output)) {
         long n = bridge_pty_read(&pty, output + used, sizeof(output) - used - 1);
         if (n > 0) { used += (size_t)n; output[used] = '\0'; }
-        else {
-            int code;
-            if (bridge_pty_reap(&pty, &code)) break;
-            Sleep(20);
-        }
+        else Sleep(20);
     }
     bridge_pty_close(&pty);
+    fprintf(stderr, "diag: captured %zu raw bytes\n", used);
     strip_ansi(output);
 
     // bash syntax executed (printf ran) AND the noninteractive env was inherited.
