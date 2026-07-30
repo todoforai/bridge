@@ -87,6 +87,11 @@ jobs:
         shell: bash
         run: |
           make test-pty-win
+          echo "=== default shell (auto-resolved) ==="
+          ./build/test-pty-win.exe || true
+          echo "=== forced cmd.exe (isolates ConPTY IO from bash) ==="
+          BRIDGE_SHELL=cmd.exe ./build/test-pty-win.exe || true
+          echo "=== default shell (authoritative result) ==="
           ./build/test-pty-win.exe
 
   # ── 2. Exercise the PowerShell installer end-to-end on Windows ──────────────
