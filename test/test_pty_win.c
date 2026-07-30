@@ -53,11 +53,7 @@ static int test_shell_io(void) {
         return 1;
     }
 
-    fprintf(stderr, "diag: pid=%lu shell=%s\n", pty.pid,
-            getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(auto)");
     bridge_pty_resize(&pty, 40, 100);
-    // Write IMMEDIATELY (no delay): if stdin were EOF the shell would have
-    // exited; feeding input right away is what the production RUN path does.
 
     // Mirror the production RUN path: write the command immediately after spawn
     // (bash reads its stdin pipe as soon as it is up) and scan output for the
@@ -86,13 +82,13 @@ static int test_shell_io(void) {
         } else Sleep(20);
     }
     bridge_pty_close(&pty);
-    strip_ansi(output);
-    fprintf(stderr, "diag: captured %zu raw bytes; stripped=[%s]\n", used, output);
 
     if (!ok) {
+        strip_ansi(output);
         fprintf(stderr,
-                "FAIL: default shell did not execute bash syntax or inherit "
-                "the noninteractive environment.\n");
+                "FAIL: default shell did not execute bash syntax or inherit the "
+                "noninteractive environment. Captured %zu bytes; stripped:\n%s\n",
+                used, output);
         return 1;
     }
 
