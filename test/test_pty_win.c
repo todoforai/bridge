@@ -33,18 +33,6 @@ static int wait_for_text(bridge_pty_t *pty, const char *needle,
     return -1;
 }
 
-// ConPTY + interactive bash needs a moment before it consumes stdin; writing
-// immediately can race shell startup and get dropped. Wait for the first
-// output (banner / initial escapes), then settle briefly.
-static void wait_shell_ready(bridge_pty_t *pty) {
-    char warm[4096];
-    DWORD start = GetTickCount();
-    while (GetTickCount() - start < 8000) {
-        if (bridge_pty_read(pty, warm, sizeof(warm)) > 0) break;
-        Sleep(50);
-    }
-    Sleep(300);
-}
 
 // ConPTY renders into a screen grid, so it emits cursor/mode escapes and can
 // wrap a printed line — strip everything except printable ASCII (and keep '=')
@@ -68,7 +56,7 @@ static int test_shell_io(void) {
     fprintf(stderr, "diag: BRIDGE_SHELL=%s pid=%lu\n",
             getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(unset)", pty.pid);
     bridge_pty_resize(&pty, 40, 100);
-    wait_shell_ready(&pty);
+    Sleep(500);   // let interactive bash reach its prompt before we type
 
     // Print each fact on its own line so ConPTY reflow can't merge two markers.
     const char *command =
@@ -81,8 +69,7 @@ static int test_shell_io(void) {
         return 1;
     }
 
-    // Drain for a fixed window (don't stop at reap — output may still be buffered
-    // in the ConPTY after the child exits).
+    // Drain continuously (banner + our output) for a fixed window.
     char output[65536] = {0};
     size_t used = 0;
     DWORD start = GetTickCount();
@@ -92,7 +79,8 @@ static int test_shell_io(void) {
         else Sleep(20);
     }
     bridge_pty_close(&pty);
-    fprintf(stderr, "diag: captured %zu raw bytes\n", used);
+    fprintf(stderr, "diag: captured %zu raw bytes; tail: %.200s\n",
+            used, used > 200 ? output + used - 200 : output);
     strip_ansi(output);
 
     // bash syntax executed (printf ran) AND the noninteractive env was inherited.
@@ -115,7 +103,7 @@ static int test_process_tree_termination(void) {
         return 1;
     }
 
-    wait_shell_ready(&pty);
+    Sleep(500);
 
     // Start a long-lived grandchild in the background and print a marker only
     // once it is running. Signalling before the child exists would prove
