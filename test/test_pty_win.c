@@ -56,7 +56,17 @@ static int test_shell_io(void) {
     fprintf(stderr, "diag: BRIDGE_SHELL=%s pid=%lu\n",
             getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(unset)", pty.pid);
     bridge_pty_resize(&pty, 40, 100);
-    Sleep(500);   // let interactive bash reach its prompt before we type
+
+    // Interactive login bash sources /etc/profile (~1s) before it reads stdin;
+    // typing too early is dropped. Wait until it emits its prompt (it sets the
+    // window title, ending with the BEL after the path) before sending input.
+    char warm[8192];
+    DWORD wstart = GetTickCount();
+    while (GetTickCount() - wstart < 10000) {
+        if (bridge_pty_read(&pty, warm, sizeof(warm)) > 0 && strchr(warm, '\x07')) break;
+        Sleep(50);
+    }
+    Sleep(800);
 
     // Print each fact on its own line so ConPTY reflow can't merge two markers.
     const char *command =
