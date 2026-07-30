@@ -1,0 +1,117 @@
+# Windows CI — proves the bridge actually builds, installs and runs on Windows.
+#
+# The release workflow cross-compiles the .exe on Linux with zig but never runs
+# it (a Windows PE can't execute on the Linux runner). This job closes that gap:
+# it runs the shipped binary and the PowerShell installer on a real
+# windows-latest host, plus a ConPTY smoke test that spawns Git Bash, sends a
+# command, reads its output and tears the process tree down.
+#
+# Triggers: pushes/PRs that touch Windows-relevant code, and manual dispatch.
+
+name: windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pty_win.c'
+      - 'env_path.c'
+      - 'main.c'
+      - 'install.ps1'
+      - 'Makefile'
+      - 'test/test_pty_win.c'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    paths:
+      - 'pty_win.c'
+      - 'env_path.c'
+      - 'main.c'
+      - 'install.ps1'
+      - 'Makefile'
+      - 'test/test_pty_win.c'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+jobs:
+  # ── 1. Build + run the bridge and ConPTY smoke test on real Windows ─────────
+  build-and-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+        with:
+          path: bridge
+          fetch-depth: 0   # `git describe --tags` for BRIDGE_VERSION
+
+      # c-core is a sibling repo (Makefile resolves CORE to ../todoforai-c-core).
+      - name: Checkout todoforai-c-core
+        uses: actions/checkout@v4
+        with:
+          repository: todoforai/todoforai-c-core
+          path: todoforai-c-core
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        timeout-minutes: 5
+        with:
+          version: 0.13.0
+
+      # Git for Windows ships bash but NOT GNU Make; install it explicitly so
+      # `make` is on PATH for the bash-shell steps below.
+      - name: Install make
+        run: choco install make --no-progress -y
+
+      - name: Build bridge (windows-x64)
+        working-directory: bridge
+        shell: bash
+        run: make release-windows-x64
+
+      # The core of the answer to "does it run on Windows": execute the shipped
+      # binary on Windows and assert it starts and reports its version.
+      - name: Run bridge --version / --help
+        working-directory: bridge
+        shell: pwsh
+        run: |
+          $exe = ".\build\todoforai-bridge-windows-x64.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "--version exited $LASTEXITCODE" }
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw "--help exited $LASTEXITCODE" }
+
+      # ConPTY smoke: spawn Git Bash inside a pseudo-console, run a command,
+      # read its output, resize, and kill the process tree. Proves pty_win.c.
+      # `make test-pty-win` cross-compiles then runs the .exe on this Windows host.
+      - name: Build + run ConPTY smoke test
+        working-directory: bridge
+        shell: bash
+        run: |
+          make test-pty-win
+          ./build/test-pty-win.exe
+
+  # ── 2. Exercise the PowerShell installer end-to-end on Windows ──────────────
+  # Installs the latest published release via install.ps1 (custom -Prefix that
+  # is pre-added to $env:PATH so the installer takes the non-persistent branch
+  # and never mutates the runner's user PATH), then runs the installed exe.
+  # This is the real "is it installable and runnable on Windows?" check: it
+  # downloads the shipped release, verifies its sha256, and executes it — a
+  # SmartScreen/cert/AV block or a bad binary would surface here.
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+
+      - name: Run install.ps1 (custom prefix, latest release)
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'tfa-bin'
+          New-Item -ItemType Directory -Force -Path $prefix | Out-Null
+          # Pre-add prefix to the session PATH → installer skips persistent PATH edit.
+          $env:Path = "$prefix;$env:Path"
+          .\install.ps1 -Prefix $prefix
+          $exe = Join-Path $prefix 'todoforai-bridge.exe'
+          if (-not (Test-Path $exe)) { throw "installer did not place $exe" }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "installed bridge --version exited $LASTEXITCODE" }

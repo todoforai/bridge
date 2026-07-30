@@ -107,6 +107,20 @@ release-windows-x64: | build
 # PTY helpers used by the test harnesses (pty_posix.c calls into env_path.c).
 TEST_DEPS = pty_posix.c env_path.c
 
+# Windows ConPTY smoke test. Cross-compiles from Linux/macOS with `zig`, but
+# the produced .exe must be RUN on a real Windows host (windows-latest in CI)
+# to prove ConPTY spawn, Git Bash discovery, I/O, resize and tree-kill work.
+# Same zig flags as release-windows-x64 so the test exercises the shipped ABI.
+.PHONY: test-pty-win
+test-pty-win: | build
+	zig cc -target x86_64-windows-gnu \
+	    -U_WIN32_WINNT -UNTDDI_VERSION -UWINVER \
+	    -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006 -DWINVER=0x0A00 \
+	    -Wno-macro-redefined \
+	    $(CFLAGS) -I. \
+	    -o build/test-pty-win.exe test/test_pty_win.c pty_win.c env_path.c \
+	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
+
 # Sentinel-scanner smoke test: spawns a real PTY with echo off, runs a few
 # wrapped commands, asserts the bridge's emit/parse logic matches.
 .PHONY: test-run
