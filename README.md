@@ -122,16 +122,19 @@ existing RUN channel (see `DeviceService.updateBridge` in the backend):
 the server sends a shell command that re-runs the sha256-verified
 installer over the running binary (`rename()` over a running binary is
 fine on POSIX) with `--service` — so a systemd/launchd supervisor is
-idempotently ensured — then kills the bridge; the supervisor relaunches
-it on the new binary.
+ensured; the installer exits nonzero when none is available, stopping
+the chain before the kill — then kills the bridge; the supervisor
+relaunches it on the new binary.
 
-Command the server sends — note `$PPID` (the bridge) is the reliable way
-to find the executable; inside the RUN shell, `$0` is the shell itself:
+Command shape (authoritative version lives in `DeviceService.updateBridge`) —
+note `$PPID` (the bridge) is the reliable way to find the executable;
+inside the RUN shell, `$0` is the shell itself:
 
 ```sh
-trap '' HUP
-exe=$(readlink -f /proc/$PPID/exe 2>/dev/null || readlink -f "$(command -v todoforai-bridge)") \
-  && curl -fsSL https://todofor.ai/bridge | sh -s -- --prefix "$(dirname "$exe")" --service \
+exe=$(readlink -f /proc/$PPID/exe 2>/dev/null || readlink -f "$(command -v todoforai-bridge)" 2>/dev/null || command -v todoforai-bridge) \
+  && [ -x "$exe" ] \
+  && i=$(mktemp) && curl -fsSL https://todofor.ai/bridge -o "$i" \
+  && sh "$i" --prefix "$(dirname "$exe")" --service \
   && kill $PPID
 ```
 

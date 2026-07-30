@@ -193,10 +193,6 @@ install_systemd_user() {
 Description=TODOforAI Bridge
 After=network-online.target
 Wants=network-online.target
-# Never give up restarting: during an update a freshly-started instance can
-# fail on the per-device flock until the old bridge exits; the default start
-# limit (5 in 10s) would otherwise wedge the unit in "failed".
-StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -231,9 +227,15 @@ install_launchd() {
 </dict>
 </plist>
 EOF
-    launchctl unload "$plist" 2>/dev/null || true
-    launchctl load -w "$plist"
-    ok "launchd agent loaded"
+    # Never unload a loaded agent: unload kills the running bridge before this
+    # script can report success (the self-update flow kills it afterwards, and
+    # KeepAlive restarts it on the new binary at the same path).
+    if launchctl list ai.todofor.todoforai-bridge >/dev/null 2>&1; then
+        ok "launchd agent already loaded"
+    else
+        launchctl load -w "$plist"
+        ok "launchd agent loaded"
+    fi
 }
 
 if [ "$DO_SERVICE" = 1 ]; then
@@ -245,7 +247,8 @@ if [ "$DO_SERVICE" = 1 ]; then
     else
         # --service is a contract: exiting 0 tells callers (e.g. the backend's
         # bridge self-update, which kills the old bridge afterwards) that a
-        # supervisor now owns the bridge. No supervisor → fail loudly.
+        # supervisor is installed and will (re)start the bridge. No supervisor
+        # → fail loudly so the caller doesn't kill the only running bridge.
         die "no supervisor available (need systemd user manager or launchd); run manually: nohup $BRIDGE >/tmp/todoforai-bridge.log 2>&1 &"
     fi
 fi
