@@ -56,10 +56,8 @@ static int test_shell_io(void) {
     fprintf(stderr, "diag: pid=%lu shell=%s\n", pty.pid,
             getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(auto)");
     bridge_pty_resize(&pty, 40, 100);
-    Sleep(300);
-    int rc0;
-    if (bridge_pty_reap(&pty, &rc0))
-        fprintf(stderr, "diag: child ALREADY EXITED code=%d before input\n", rc0);
+    // Write IMMEDIATELY (no delay): if stdin were EOF the shell would have
+    // exited; feeding input right away is what the production RUN path does.
 
     // Mirror the production RUN path: write the command immediately after spawn
     // (bash reads its stdin pipe as soon as it is up) and scan output for the
