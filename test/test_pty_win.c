@@ -56,7 +56,7 @@ static int test_shell_io(void) {
     fprintf(stderr, "diag: BRIDGE_SHELL=%s pid=%lu\n",
             getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(unset)", pty.pid);
     bridge_pty_resize(&pty, 40, 100);
-    Sleep(1500);  // let interactive bash reach its prompt before we type
+    Sleep(500);   // let interactive bash reach its prompt before we type
 
     // Print each fact on its own line so ConPTY reflow can't merge two markers.
     const char *command =

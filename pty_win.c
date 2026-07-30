@@ -25,12 +25,25 @@
 #include <string.h>
 
 // Resolve the shell path. Caller may pass NULL.
+// True if `path` lives in System32 — i.e. the WSL launcher (…\System32\bash.exe).
+// That stub is NOT a POSIX shell: with no WSL distro installed it just prints a
+// notice and exits, and even with one it runs a Linux userland the bridge's
+// Windows tool paths don't match. RUN wrappers are Git-Bash semantics, so skip
+// it and prefer Git for Windows bash.
+static int is_wsl_stub(const char *path) {
+    char sysdir[MAX_PATH];
+    UINT n = GetSystemDirectoryA(sysdir, sizeof(sysdir));   // e.g. C:\Windows\System32
+    if (n == 0 || n >= sizeof(sysdir)) return 0;
+    return _strnicmp(path, sysdir, n) == 0;
+}
+
 static const char *resolve_shell(const char *shell) {
     static char buf[MAX_PATH];
     if (shell && *shell) { snprintf(buf, sizeof(buf), "%s", shell); return buf; }
     const char *env = getenv("BRIDGE_SHELL");
     if (env && *env) { snprintf(buf, sizeof(buf), "%s", env); return buf; }
-    if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0) return buf;
+
+    // Git for Windows bash first — it's the shell RUN/tool catalog assume.
     const char *fallbacks[] = {
         "C:\\Program Files\\Git\\bin\\bash.exe",
         "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
@@ -42,6 +55,10 @@ static const char *resolve_shell(const char *shell) {
             return buf;
         }
     }
+    // Then a PATH bash.exe, but never the System32 WSL launcher.
+    if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf))
+        return buf;
+
     snprintf(buf, sizeof(buf), "cmd.exe");
     return buf;
 }
