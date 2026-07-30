@@ -33,6 +33,18 @@ static int wait_for_text(bridge_pty_t *pty, const char *needle,
     return -1;
 }
 
+// ConPTY renders into a screen grid, so it emits cursor/mode escapes and can
+// wrap a printed line — strip everything except printable ASCII (and keep '=')
+// so a marker like FOO=cat still matches after reflow. In-place squeeze.
+static void strip_ansi(char *s) {
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        unsigned char c = (unsigned char)*r;
+        if (c >= 32 && c < 127) *w++ = (char)c;
+    }
+    *w = '\0';
+}
+
 static int test_shell_io(void) {
     bridge_pty_t pty;
     if (bridge_pty_spawn(&pty, NULL, NULL, 1) != 0) {
@@ -42,8 +54,11 @@ static int test_shell_io(void) {
 
     bridge_pty_resize(&pty, 40, 100);
 
+    // Print each fact on its own line so ConPTY reflow can't merge two markers.
+    // Wait for the shell to be ready (it prints a prompt / banner first).
     const char *command =
-        "printf '__TFA_CONPTY_OK__|%s|%s\\n' \"$PAGER\" \"$GIT_PAGER\"\n"
+        "printf 'TFAokPAGER=%s\\n' \"$PAGER\"\n"
+        "printf 'TFAokGITPAGER=%s\\n' \"$GIT_PAGER\"\n"
         "exit\n";
     if (bridge_pty_write_all(&pty, command, strlen(command)) != 0) {
         fprintf(stderr, "FAIL: could not write to ConPTY session\n");
@@ -51,15 +66,27 @@ static int test_shell_io(void) {
         return 1;
     }
 
-    char output[16384] = {0};
-    int failed = wait_for_text(&pty, "__TFA_CONPTY_OK__|cat|cat", output,
-                               sizeof(output), 10000);
+    // Drain until the shell exits or we time out, then strip ANSI and match.
+    char output[65536] = {0};
+    size_t used = 0;
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < 15000 && used + 1 < sizeof(output)) {
+        long n = bridge_pty_read(&pty, output + used, sizeof(output) - used - 1);
+        if (n > 0) { used += (size_t)n; output[used] = '\0'; }
+        else {
+            int code;
+            if (bridge_pty_reap(&pty, &code)) break;
+            Sleep(20);
+        }
+    }
     bridge_pty_close(&pty);
+    strip_ansi(output);
 
-    if (failed) {
+    // bash syntax executed (printf ran) AND the noninteractive env was inherited.
+    if (!strstr(output, "TFAokPAGER=cat") || !strstr(output, "TFAokGITPAGER=cat")) {
         fprintf(stderr,
                 "FAIL: default shell did not execute bash syntax or inherit "
-                "the noninteractive environment. Output:\n%s\n",
+                "the noninteractive environment. Stripped output:\n%s\n",
                 output);
         return 1;
     }
