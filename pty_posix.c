@@ -12,6 +12,7 @@
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 
@@ -99,7 +100,18 @@ int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
     while (written < len) {
         ssize_t n = write(p->master_fd, b + written, len - written);
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Master is O_NONBLOCK and the PTY input buffer is full (child
+                // stopped / not reading stdin). Wait for writability with a
+                // deadline instead of spinning — a wedged child must fail the
+                // write, not freeze the whole single-threaded bridge.
+                struct pollfd pf = { .fd = p->master_fd, .events = POLLOUT };
+                int pr = poll(&pf, 1, 5000);
+                if (pr > 0 && (pf.revents & POLLOUT)) continue;
+                errno = ETIMEDOUT;
+                return -1;
+            }
             return -1;
         }
         written += (size_t)n;
