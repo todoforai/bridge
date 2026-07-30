@@ -193,6 +193,10 @@ install_systemd_user() {
 Description=TODOforAI Bridge
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting: during an update a freshly-started instance can
+# fail on the per-device flock until the old bridge exits; the default start
+# limit (5 in 10s) would otherwise wedge the unit in "failed".
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -239,7 +243,10 @@ if [ "$DO_SERVICE" = 1 ]; then
     elif [ "$os" = darwin ]; then
         install_launchd
     else
-        info "no supervisor detected; run manually: nohup $BRIDGE >/tmp/todoforai-bridge.log 2>&1 &"
+        # --service is a contract: exiting 0 tells callers (e.g. the backend's
+        # bridge self-update, which kills the old bridge afterwards) that a
+        # supervisor now owns the bridge. No supervisor → fail loudly.
+        die "no supervisor available (need systemd user manager or launchd); run manually: nohup $BRIDGE >/tmp/todoforai-bridge.log 2>&1 &"
     fi
 fi
 

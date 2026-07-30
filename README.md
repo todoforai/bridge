@@ -50,7 +50,7 @@ Server side: `backend/src/api/ws/handlers/BridgeHandler.ts`.
 | `pty.c` / `pty.h`     | `forkpty` session: read/write/resize/signal         |
 | `identity.c` / `.h`   | Host identity gathering (`uname`, `pwd`, cwd)       |
 | `tools.c` / `.h`      | Probe installed CLI tools via `scan_tools` function-call |
-| `update.c` / `.h`     | Self-update: startup swap of staged `<exe>.new`     |
+
 | `ws.c` / `ws.h`       | RFC 6455 WebSocket client (sync connect, poll loop) |
 | `json.c` / `json.h`   | Minimal JSON parser/writer + base64                 |
 | `noise/`              | Vendored `noise.c` + `monocypher` (BLAKE2b)         |
@@ -118,23 +118,21 @@ deployments (sandbox init, systemd units, CI).
 ## Updates
 
 The bridge has no HTTP/download logic of its own. Updates ride on the
-existing `exec` channel: the server sends a shell command that fetches
-the new binary, verifies it, stages it next to the bridge as `<exe>.new`,
-and kills the bridge. A supervisor (systemd / launchd / shell loop)
-restarts it, and `update.c` swaps the staged binary in at startup (using
-`/proc/self/exe` to resolve the real path).
+existing RUN channel (see `DeviceService.updateBridge` in the backend):
+the server sends a shell command that re-runs the sha256-verified
+installer over the running binary (`rename()` over a running binary is
+fine on POSIX) with `--service` — so a systemd/launchd supervisor is
+idempotently ensured — then kills the bridge; the supervisor relaunches
+it on the new binary.
 
-Example `exec` payload the server sends — note `$PPID` (the bridge) is
-the reliable way to find the executable; inside the shell, `$0` is the
-shell itself:
+Command the server sends — note `$PPID` (the bridge) is the reliable way
+to find the executable; inside the RUN shell, `$0` is the shell itself:
 
 ```sh
-EXE=$(readlink -f /proc/$PPID/exe) \
-  && curl -fsSL https://github.com/todoforai/bridge/releases/latest/download/todoforai-bridge-linux-x64 -o "$EXE.tmp" \
-  && echo "<sha256>  $EXE.tmp" | sha256sum -c - \
-  && chmod +x "$EXE.tmp" \
-  && mv "$EXE.tmp" "$EXE.new" \
-  && kill -TERM $PPID
+trap '' HUP
+exe=$(readlink -f /proc/$PPID/exe 2>/dev/null || readlink -f "$(command -v todoforai-bridge)") \
+  && curl -fsSL https://todofor.ai/bridge | sh -s -- --prefix "$(dirname "$exe")" --service \
+  && kill $PPID
 ```
 
 No new protocol messages, no in-binary HTTP client, no extra dependencies.

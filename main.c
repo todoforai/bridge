@@ -80,7 +80,6 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "pty.h"
 #include "subcmd.h"
 #include "tools.h"
-#include "update.h"
 #include "login.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
@@ -1858,9 +1857,6 @@ static int acquire_device_lock(const char *device_id) {
 #endif
 
 int main(int argc, char **argv) {
-    // Swap in any binary staged by a prior `exec` update. See update.h.
-    bridge_update_swap_on_start(argv[0]);
-
     // Subcommand dispatch before option parsing so `bridge login -h` works.
     if (argc >= 2 && strcmp(argv[1], "login") == 0) {
         int rc = cmd_login(argc - 1, argv + 1);
