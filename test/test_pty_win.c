@@ -53,22 +53,13 @@ static int test_shell_io(void) {
         return 1;
     }
 
-    fprintf(stderr, "diag: BRIDGE_SHELL=%s pid=%lu\n",
-            getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(unset)", pty.pid);
+    fprintf(stderr, "diag: pid=%lu\n", pty.pid);
     bridge_pty_resize(&pty, 40, 100);
+    Sleep(300);
 
-    // Interactive login bash sources /etc/profile (~1s) before it reads stdin;
-    // typing too early is dropped. Wait until it emits its prompt (it sets the
-    // window title, ending with the BEL after the path) before sending input.
-    char warm[8192];
-    DWORD wstart = GetTickCount();
-    while (GetTickCount() - wstart < 10000) {
-        if (bridge_pty_read(&pty, warm, sizeof(warm)) > 0 && strchr(warm, '\x07')) break;
-        Sleep(50);
-    }
-    Sleep(800);
-
-    // Print each fact on its own line so ConPTY reflow can't merge two markers.
+    // Mirror the production RUN path: write the command immediately after spawn
+    // (bash reads its stdin pipe as soon as it is up) and scan output for the
+    // markers. Each fact on its own line so ConPTY reflow can't merge them.
     const char *command =
         "printf 'TFAokPAGER=%s\\n' \"$PAGER\"\n"
         "printf 'TFAokGITPAGER=%s\\n' \"$GIT_PAGER\"\n"
@@ -79,25 +70,27 @@ static int test_shell_io(void) {
         return 1;
     }
 
-    // Drain continuously (banner + our output) for a fixed window.
+    // Drain continuously (banner + our output) until both markers seen or timeout.
     char output[65536] = {0};
     size_t used = 0;
     DWORD start = GetTickCount();
-    while (GetTickCount() - start < 15000 && used + 1 < sizeof(output)) {
+    int ok = 0;
+    while (GetTickCount() - start < 20000 && used + 1 < sizeof(output)) {
         long n = bridge_pty_read(&pty, output + used, sizeof(output) - used - 1);
-        if (n > 0) { used += (size_t)n; output[used] = '\0'; }
-        else Sleep(20);
+        if (n > 0) {
+            used += (size_t)n; output[used] = '\0';
+            char scan[65536]; memcpy(scan, output, used + 1); strip_ansi(scan);
+            if (strstr(scan, "TFAokPAGER=cat") && strstr(scan, "TFAokGITPAGER=cat")) { ok = 1; break; }
+        } else Sleep(20);
     }
     bridge_pty_close(&pty);
     strip_ansi(output);
     fprintf(stderr, "diag: captured %zu raw bytes; stripped=[%s]\n", used, output);
 
-    // bash syntax executed (printf ran) AND the noninteractive env was inherited.
-    if (!strstr(output, "TFAokPAGER=cat") || !strstr(output, "TFAokGITPAGER=cat")) {
+    if (!ok) {
         fprintf(stderr,
                 "FAIL: default shell did not execute bash syntax or inherit "
-                "the noninteractive environment. Stripped output:\n%s\n",
-                output);
+                "the noninteractive environment.\n");
         return 1;
     }
 
