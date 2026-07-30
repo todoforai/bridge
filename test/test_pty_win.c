@@ -33,6 +33,19 @@ static int wait_for_text(bridge_pty_t *pty, const char *needle,
     return -1;
 }
 
+// ConPTY + interactive bash needs a moment before it consumes stdin; writing
+// immediately can race shell startup and get dropped. Wait for the first
+// output (banner / initial escapes), then settle briefly.
+static void wait_shell_ready(bridge_pty_t *pty) {
+    char warm[4096];
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < 8000) {
+        if (bridge_pty_read(pty, warm, sizeof(warm)) > 0) break;
+        Sleep(50);
+    }
+    Sleep(300);
+}
+
 // ConPTY renders into a screen grid, so it emits cursor/mode escapes and can
 // wrap a printed line — strip everything except printable ASCII (and keep '=')
 // so a marker like FOO=cat still matches after reflow. In-place squeeze.
@@ -53,9 +66,9 @@ static int test_shell_io(void) {
     }
 
     bridge_pty_resize(&pty, 40, 100);
+    wait_shell_ready(&pty);
 
     // Print each fact on its own line so ConPTY reflow can't merge two markers.
-    // Wait for the shell to be ready (it prints a prompt / banner first).
     const char *command =
         "printf 'TFAokPAGER=%s\\n' \"$PAGER\"\n"
         "printf 'TFAokGITPAGER=%s\\n' \"$GIT_PAGER\"\n"
@@ -101,6 +114,8 @@ static int test_process_tree_termination(void) {
         fprintf(stderr, "FAIL: could not create termination test session\n");
         return 1;
     }
+
+    wait_shell_ready(&pty);
 
     // Start a long-lived grandchild in the background and print a marker only
     // once it is running. Signalling before the child exists would prove
