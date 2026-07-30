@@ -87,6 +87,17 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     // STARTUPINFOEX with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE.
     STARTUPINFOEXA si = {0};
     si.StartupInfo.cb = sizeof(si);
+    // Force the child onto the pseudoconsole ONLY. Without STARTF_USESTDHANDLES
+    // (and NULL std handles), CreateProcess with bInheritHandles=FALSE
+    // duplicates the PARENT's std handles into the child — so in a headless /
+    // service / CI context (no interactive console) the child bypasses the
+    // ConPTY, writes to the parent's real console, sees stdin EOF and exits
+    // immediately. Setting this with NULL handles makes the pcon attribute the
+    // sole source of the child's stdio. See MS "Creating a Pseudoconsole session".
+    si.StartupInfo.dwFlags   = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput  = NULL;
+    si.StartupInfo.hStdOutput = NULL;
+    si.StartupInfo.hStdError  = NULL;
 
     SIZE_T attr_size = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
