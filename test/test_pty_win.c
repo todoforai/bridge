@@ -56,7 +56,7 @@ static int test_shell_io(void) {
     fprintf(stderr, "diag: BRIDGE_SHELL=%s pid=%lu\n",
             getenv("BRIDGE_SHELL") ? getenv("BRIDGE_SHELL") : "(unset)", pty.pid);
     bridge_pty_resize(&pty, 40, 100);
-    Sleep(500);   // let interactive bash reach its prompt before we type
+    Sleep(1500);  // let interactive bash reach its prompt before we type
 
     // Print each fact on its own line so ConPTY reflow can't merge two markers.
     const char *command =
@@ -79,9 +79,8 @@ static int test_shell_io(void) {
         else Sleep(20);
     }
     bridge_pty_close(&pty);
-    fprintf(stderr, "diag: captured %zu raw bytes; tail: %.200s\n",
-            used, used > 200 ? output + used - 200 : output);
     strip_ansi(output);
+    fprintf(stderr, "diag: captured %zu raw bytes; stripped=[%s]\n", used, output);
 
     // bash syntax executed (printf ran) AND the noninteractive env was inherited.
     if (!strstr(output, "TFAokPAGER=cat") || !strstr(output, "TFAokGITPAGER=cat")) {
