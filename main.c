@@ -171,6 +171,13 @@ static char *bridge_expand_tilde(const char *p) {
 // read of slack so a single append never overflows before we trim.
 #define OB_TAIL_CAP     (OB_STREAM_LAST + BUF_SIZE)
 
+// ── OUTPUT frame coalescing ──
+// Batch PTY bytes into fewer, larger OUTPUT frames (see send_output_bytes).
+// The main loop already ticks at ≤50ms, so the age check is free.
+#define OUT_FLUSH_BYTES (16 * 1024)
+#define OUT_FLUSH_MS    100
+#define OUT_BUF_CAP     (OUT_FLUSH_BYTES + BUF_SIZE)  // one read of slack past the trigger
+
 typedef struct {
     size_t head_limit;   // min(firstLimit, hardCap); stream live until reached
     size_t last_limit;   // min(lastLimit, hardCap - head_limit); rolling tail
@@ -249,6 +256,12 @@ typedef struct {
 
     // Per-RUN output policy (head/tail cut + line cap). Reset on each RUN.
     out_policy_t ob;
+
+    // OUTPUT coalescing (see send_output_bytes/flush_output). Bytes wait here
+    // until OUT_FLUSH_BYTES or OUT_FLUSH_MS, or until a terminal frame flushes.
+    uint8_t obuf[OUT_BUF_CAP];
+    size_t  obuf_len;
+    int64_t obuf_since_ms;  // 0 = empty; else when the oldest byte was queued
 } session_t;
 
 // 2 ticks × 250 ms ⇒ ~250-500 ms latency, FP rate ~1-2%.
@@ -287,7 +300,7 @@ typedef struct {
 
     session_t *sessions;     // heap, length = g_max_sessions
     uint8_t  pty_buf[BUF_SIZE];
-    char     b64_buf[BUF_SIZE * 2];
+
     uint8_t  msg_buf[MAX_MSG];
 } edge_t;
 
@@ -441,6 +454,7 @@ static session_t *free_slot(edge_t *e) {
 
 // Forward decls used by evict_lru_idle().
 static void send_exit(edge_t *e, session_t *s, int code);
+static void flush_output(edge_t *e, session_t *s);
 
 // LRU eviction: when the array is full and a RUN needs a slot, SIGKILL the
 // oldest SESS_IDLE session and reclaim it synchronously. SESS_RUNNING is
@@ -584,6 +598,7 @@ static int send_function_call_error(edge_t *e,
 }
 
 static void send_exit(edge_t *e, session_t *s, int code) {
+    flush_output(e, s);  // queued bytes must not arrive after EXIT
     char buf[384]; size_t u = 0;
     char code_buf[32]; snprintf(code_buf, sizeof code_buf, "%d", code);
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
@@ -597,25 +612,59 @@ static void send_exit(edge_t *e, session_t *s, int code) {
     fprintf(stderr, "PTY exited: %s code=%d\n", s->session_id, code);
 }
 
-// Emit OUTPUT for `len` bytes of PTY stream. blockId is included only while
-// a RUN is in flight (echoed from the RUN frame for backend correlation).
-static void send_output_bytes(edge_t *e, session_t *s,
+// Emit one OUTPUT frame for `len` bytes. blockId is included only while a RUN
+// is in flight (echoed from the RUN frame for backend correlation). The base64
+// buffer is sized per call: the tail emitted at ob_finish() is up to
+// OB_STREAM_LAST bytes, which a fixed BUF_SIZE-scaled buffer could not hold
+// (b64_encode would return 0 and the frame would vanish silently).
+static void emit_output_frame(edge_t *e, session_t *s,
                               const uint8_t *data, size_t len) {
     if (len == 0) return;
-    size_t bn = b64_encode(data, len, e->b64_buf, sizeof(e->b64_buf));
-    if (bn == 0) return;
+    size_t b64_cap = ((len + 2) / 3) * 4 + 1;
+    char *b64 = malloc(b64_cap);
+    if (!b64) return;
+    size_t bn = b64_encode(data, len, b64, b64_cap);
+    if (bn == 0) { free(b64); return; }
     size_t cap = bn + 256;
     char *msg = malloc(cap);
-    if (!msg) return;
+    if (!msg) { free(b64); return; }
     size_t u = 0;
     if (json_emit_raw(msg, cap, &u, "{", 1) == 0 &&
         jfield_str(msg, cap, &u, "type", "output", -1, 0) == 0 &&
         jfield_str(msg, cap, &u, "sessionId", s->session_id, -1, 1) == 0 &&
         emit_todo_id(msg, cap, &u, s) == 0 &&
         (!(s->state == SESS_RUNNING && s->run_block_id_len > 0) || jfield_str(msg, cap, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) == 0) &&
-        jfield_str(msg, cap, &u, "data", e->b64_buf, (long)bn, 1) == 0 &&
+        jfield_str(msg, cap, &u, "data", b64, (long)bn, 1) == 0 &&
         json_emit_raw(msg, cap, &u, "}", 1) == 0) send_json(e, msg, u);
     free(msg);
+    free(b64);
+}
+
+// Ship whatever is queued for this session now. No-op when nothing is pending.
+// Every terminal frame (STEP_DONE / STEP_AWAITING_INPUT / EXIT) calls this
+// first, so the tail can never arrive after the frame that closes the step.
+static void flush_output(edge_t *e, session_t *s) {
+    if (s->obuf_len == 0) { s->obuf_since_ms = 0; return; }
+    size_t n = s->obuf_len;
+    s->obuf_len = 0;
+    s->obuf_since_ms = 0;
+    emit_output_frame(e, s, s->obuf, n);
+}
+
+// Queue OUTPUT bytes. One PTY read (BUF_SIZE) used to become one WS frame, so a
+// verbose command pushed thousands of frames/s into the backend's serial
+// per-socket processor → head-of-line blocking. Coalesce into ≤OUT_FLUSH_BYTES
+// batches, flushed by size here and by OUT_FLUSH_MS age in service_sessions().
+static void send_output_bytes(edge_t *e, session_t *s,
+                              const uint8_t *data, size_t len) {
+    if (len == 0) return;
+    // Single emission bigger than the whole buffer: keep ordering, send as-is.
+    if (len > sizeof s->obuf) { flush_output(e, s); emit_output_frame(e, s, data, len); return; }
+    if (len > sizeof s->obuf - s->obuf_len) flush_output(e, s);
+    memcpy(s->obuf + s->obuf_len, data, len);
+    s->obuf_len += len;
+    if (s->obuf_since_ms == 0) s->obuf_since_ms = monotonic_ms();
+    if (s->obuf_len >= OUT_FLUSH_BYTES) flush_output(e, s);
 }
 
 // Portable accessor for the shell's OS pid (the PTY child).
@@ -650,6 +699,7 @@ static void send_run_started(edge_t *e, session_t *s, int created) {
 // frame follows; backend doesn't need a separate `alive` flag on STEP_DONE.
 static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
                            int timed_out) {
+    flush_output(e, s);  // the step's tail must precede its terminal frame
     char buf[512]; size_t u = 0;
     char rc[24]; snprintf(rc, sizeof rc, has_code ? "%d" : "null", exit_code);
     char pid_buf[24]; snprintf(pid_buf, sizeof pid_buf, "%ld", SHELL_PID(s));
@@ -670,6 +720,7 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
 // flight; backend resolves the promise with awaitingInput:true so the agent
 // can resume via INPUT on the same sessionId. `passwordPrompt` ⇔ ECHO off.
 static void send_step_awaiting_input(edge_t *e, session_t *s, int password_prompt) {
+    flush_output(e, s);  // the prompt itself is usually the last queued chunk
     char buf[512]; size_t u = 0;
     char shell_pid_buf[24]; snprintf(shell_pid_buf, sizeof shell_pid_buf, "%ld", SHELL_PID(s));
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
@@ -1043,6 +1094,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             }
             gen_uuid_v4(s->session_id);
             snprintf(s->cwd, sizeof s->cwd, "%s", spawn_cwd);
+            // Slots are recycled: drop anything a previous session left queued
+            // so it can't be shipped under this session's id.
+            s->obuf_len = 0;
+            s->obuf_since_ms = 0;
             s->active = 1;
             s->state = SESS_IDLE;
             s->tail_len = 0;
@@ -1612,6 +1667,16 @@ static void service_sessions(edge_t *e) {
             if (n <= 0) break;
             drained += (size_t)n;
         }
+    }
+
+    // Age-based half of the OUTPUT coalescer: ship a partial batch once it has
+    // waited OUT_FLUSH_MS, so a slow trickle (progress bar, tail -f) still
+    // streams live. Runs after the drain so this tick's bytes can join it.
+    int64_t after_drain = monotonic_ms();
+    for (int i = 0; i < g_max_sessions; i++) {
+        session_t *s = &e->sessions[i];
+        if (!s->active || s->obuf_len == 0) continue;
+        if (after_drain - s->obuf_since_ms >= OUT_FLUSH_MS) flush_output(e, s);
     }
 }
 

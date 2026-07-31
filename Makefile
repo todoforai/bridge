@@ -141,6 +141,16 @@ test-timing: | build
 	$(CC) -O0 -g -Wall -I. -o build/test-timing test/test_timing.c $(TEST_DEPS) -lutil
 	./build/test-timing
 
+# OUTPUT frame coalescing: verbose RUN ships few, byte-exact frames, all before
+# step_done. Includes main.c with the Noise send shimmed (no network).
+.PHONY: test-coalesce
+test-coalesce: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
+	    test/test_coalesce.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c \
+	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-coalesce
+
 # A/B proof of the poll-loop fix: PTY fd out of vs in the pollset (50ms → ~1ms).
 .PHONY: test-pollfix
 test-pollfix: | build
