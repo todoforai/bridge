@@ -73,8 +73,15 @@ fi
 
 # ── resolve release tag (default: latest) ──────────────────────────────────
 if [ -z "$TAG" ]; then
-    TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-        | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    # Resolve latest via the github.com redirect (not the rate-limited api.github.com):
+    # /releases/latest → 302 → /releases/tag/<TAG>
+    latest_url="https://github.com/$REPO/releases/latest"
+    if command -v curl >/dev/null 2>&1; then
+        TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null | sed 's#.*/tag/##')
+    else
+        TAG=$(wget -qS --max-redirect=0 "$latest_url" -O /dev/null 2>&1 \
+            | sed -n 's#.*[Ll]ocation: .*/tag/##p' | tr -d '\r')
+    fi
     [ -z "$TAG" ] && die "could not determine latest release (see https://github.com/$REPO/releases)"
 fi
 url="https://github.com/$REPO/releases/download/$TAG/$asset"

@@ -56,10 +56,15 @@ $asset = "todoforai-bridge-windows-$arch.exe"
 
 # ── resolve release tag (default: latest) ───────────────────────────────────
 if (-not $Tag) {
+    # Resolve latest via the github.com redirect (not the rate-limited api.github.com):
+    # /releases/latest → 302 → /releases/tag/<TAG>
     try {
-        $Tag = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
+        $resp = Invoke-WebRequest "https://github.com/$Repo/releases/latest" -MaximumRedirection 0 -ErrorAction SilentlyContinue
+        $loc = $resp.Headers.Location
+        if (-not $loc) { $loc = $resp.BaseResponse.ResponseUri.AbsoluteUri }
+        $Tag = ($loc -replace '.*/tag/', '')
     } catch { Die "could not determine latest release (see https://github.com/$Repo/releases)" }
-    if (-not $Tag) { Die "could not determine latest release" }
+    if (-not $Tag) { Die "could not determine latest release (see https://github.com/$Repo/releases)" }
 }
 $url    = "https://github.com/$Repo/releases/download/$Tag/$asset"
 $shaUrl = "$url.sha256"
