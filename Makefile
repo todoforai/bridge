@@ -128,6 +128,12 @@ test-run: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-run test/test_run.c $(TEST_DEPS) -lutil
 	./build/test-run
 
+# Tool scan + custom_tools.json overlay: hidden/override/non-catalog probing.
+.PHONY: test-tools
+test-tools: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-tools test/test_tools.c tools.c json.c env_path.c -lpthread
+	./build/test-tools
+
 # Preview relay: local HTTP fetch + chunked response emission, no network.
 .PHONY: test-preview
 test-preview: | build

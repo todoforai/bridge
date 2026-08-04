@@ -19,6 +19,7 @@
 #include "json.h"
 #include "env_path.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -296,6 +297,107 @@ static int parse_entry(const char *line, size_t line_len,
     return 1;
 }
 
+// ── User custom tools (~/.todoforai/custom_tools.json) ──────────────────────
+// Same file format as the edge client: {"<name>": {"enabled"?, "description"?,
+// "label"?}}. Hides catalog tools (enabled:false), overrides description/label,
+// and advertises non-catalog binaries (probed via `command -v`). Missing or
+// malformed file ⇒ no customs (silent).
+
+// CUSTOM_MAX × (DESC+LABEL, JSON-escaped ≤ 2×) must leave room for the
+// catalog states in the 64 KiB result buffer (MAX_MSG in main.c).
+#define CUSTOM_MAX       32
+#define CUSTOM_FILE_CAP  65536
+#define CUSTOM_DESC_CAP  600
+#define CUSTOM_LABEL_CAP 128
+
+typedef struct {
+    char key[64];
+    int  enabled;                     // 0 = hidden
+    char desc[CUSTOM_DESC_CAP];      // "" = none
+    char label[CUSTOM_LABEL_CAP];    // "" = none
+    int  matched;                     // set when a catalog probe claimed it
+} custom_tool_t;
+
+// Names are interpolated into `command -v <name>` — restrict to plain
+// binary-name tokens (alnum start, then alnum/_/./-, max 63 = key buf - 1).
+static int custom_name_safe(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 63) return 0;
+    if (!isalnum((unsigned char)s[0])) return 0;
+    for (size_t i = 1; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!isalnum(c) && c != '_' && c != '.' && c != '-') return 0;
+    }
+    return 1;
+}
+
+// Read $HOME/.todoforai/custom_tools.json (≤ CUSTOM_FILE_CAP). Heap-allocated
+// custom_tool_t[]; *out_n receives count. NULL when absent/unreadable/empty.
+static custom_tool_t *load_custom_tools(int *out_n) {
+    *out_n = 0;
+#ifdef _WIN32
+    // USERPROFILE first — matches the edge's os.homedir(); Git/MSYS may set
+    // HOME elsewhere.
+    const char *home = getenv("USERPROFILE");
+    if (!home || !*home) home = getenv("HOME");
+#else
+    const char *home = getenv("HOME");
+#endif
+    if (!home || !*home) return NULL;
+
+    char path[1024];
+    int pn = snprintf(path, sizeof(path), "%s/.todoforai/custom_tools.json", home);
+    if (pn <= 0 || (size_t)pn >= sizeof(path)) return NULL;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char *buf = malloc(CUSTOM_FILE_CAP);
+    if (!buf) { fclose(f); return NULL; }
+    size_t len = fread(buf, 1, CUSTOM_FILE_CAP, f);
+    fclose(f);
+    if (len == 0 || len >= CUSTOM_FILE_CAP) { free(buf); return NULL; } // empty or oversized
+
+    custom_tool_t *customs = calloc(CUSTOM_MAX, sizeof(*customs));
+    if (!customs) { free(buf); return NULL; }
+
+    int n = 0;
+    size_t pos = 0;
+    const char *k, *v; size_t kl, vl; json_type_t vt;
+    while (n < CUSTOM_MAX &&
+           json_obj_iter(buf, len, &pos, &k, &kl, &v, &vl, &vt)) {
+        if (vt != JT_OBJ) continue;
+        custom_tool_t *c = &customs[n];
+        if (json_unescape_span(k, kl, c->key, sizeof(c->key)) <= 0) continue;
+        if (!custom_name_safe(c->key)) continue;
+        // Duplicate key: last value wins (JSON.parse semantics, edge parity).
+        custom_tool_t *slot = c;
+        for (int i = 0; i < n; i++) {
+            if (strcmp(customs[i].key, c->key) == 0) { slot = &customs[i]; break; }
+        }
+        slot->enabled = 1;
+        slot->desc[0] = slot->label[0] = '\0';
+        json_get_bool(v, vl, "enabled", &slot->enabled);
+        size_t dl;
+        json_get_str_decoded(v, vl, "description", slot->desc,  sizeof(slot->desc),  &dl);
+        json_get_str_decoded(v, vl, "label",       slot->label, sizeof(slot->label), &dl);
+        if (slot == c) n++;
+    }
+    // All-or-nothing (edge JSON.parse parity): a malformed file must not be
+    // partially applied. After a full iteration, only `}` + whitespace may
+    // remain; `pos` past the last value only moves via well-formed pairs.
+    if (n > 0 && n < CUSTOM_MAX) {
+        const char *p = buf + pos, *e = buf + len;
+        while (p < e && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++;
+        int ok = (p < e && *p == '}');
+        if (ok) { p++; while (p < e && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++; ok = (p == e); }
+        if (!ok) n = 0;
+    }
+    free(buf);
+    if (n == 0) { free(customs); return NULL; }
+    *out_n = n;
+    return customs;
+}
+
 // One catalog entry: input cmds + post-probe results.
 typedef struct {
     char key[64];
@@ -305,6 +407,8 @@ typedef struct {
     char status_out[OUT_CAP + 1];
     int  v_exit, s_exit;
     int  installed, authed;
+    int  synthetic;             // non-catalog custom (command -v presence probe)
+    const custom_tool_t *cust;  // user override for this key, or NULL
 } probe_t;
 
 // Run versionCmd + statusCmd. Pure: no shared state.
@@ -346,6 +450,22 @@ static int probe_append_json(const probe_t *p, int first,
             if (json_emit_str(out, out_cap, used, p->status_out, -1) < 0) return -1;
         }
     }
+    // User overrides from custom_tools.json (description/label) ride on the
+    // state — same shape the edge's applyCustomTools produces.
+    if (p->installed && p->cust) {
+        if (p->cust->desc[0] != '\0') {
+            if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
+            if (json_emit_str(out, out_cap, used, "description", -1) < 0) return -1;
+            if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
+            if (json_emit_str(out, out_cap, used, p->cust->desc, -1) < 0) return -1;
+        }
+        if (p->cust->label[0] != '\0') {
+            if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
+            if (json_emit_str(out, out_cap, used, "label", -1) < 0) return -1;
+            if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
+            if (json_emit_str(out, out_cap, used, p->cust->label, -1) < 0) return -1;
+        }
+    }
     if (json_emit_raw(out, out_cap, used, "}", 1) < 0) return -1;
     return 0;
 }
@@ -371,11 +491,15 @@ static void *worker_main(void *arg) {
 }
 #endif
 
-// Parse all catalog lines into a heap-allocated probe_t[]. *out_n receives count.
+// Parse all catalog lines into a heap-allocated probe_t[], folding in user
+// custom tools: disabled customs drop their catalog probe, matching customs
+// attach description/label overrides, and non-catalog customs get a synthetic
+// `command -v <name>` presence probe appended. *out_n receives count.
 // Returns NULL on alloc failure. Skips malformed lines.
-static probe_t *parse_catalog(const char *entries, size_t entries_len, int *out_n) {
-    // Upper bound: number of newlines + 1.
-    int cap = 1;
+static probe_t *parse_catalog(const char *entries, size_t entries_len, int *out_n,
+                              custom_tool_t *customs, int n_cust) {
+    // Upper bound: number of newlines + 1, plus one slot per custom tool.
+    int cap = 1 + n_cust;
     for (size_t i = 0; i < entries_len; i++) if (entries[i] == '\n') cap++;
     probe_t *probes = calloc((size_t)cap, sizeof(*probes));
     if (!probes) { *out_n = 0; return NULL; }
@@ -390,9 +514,29 @@ static probe_t *parse_catalog(const char *entries, size_t entries_len, int *out_
                         e->key, sizeof(e->key),
                         e->vcmd, sizeof(e->vcmd), &e->have_v,
                         e->scmd, sizeof(e->scmd), &e->have_s)) {
-            n++;
+            int drop = 0;
+            for (int c = 0; c < n_cust; c++) {
+                if (strcmp(customs[c].key, e->key) != 0) continue;
+                customs[c].matched = 1;
+                if (customs[c].enabled) e->cust = &customs[c];
+                else drop = 1;  // hidden catalog tool — don't probe
+                break;
+            }
+            if (!drop) n++;
         }
         p = line_end + 1;
+    }
+    // Non-catalog customs: synthesize a `command -v <name>` presence probe
+    // (exit 0 + non-empty stdout ⇒ installed; no statusCmd ⇒ authenticated).
+    for (int c = 0; c < n_cust && n < cap; c++) {
+        if (customs[c].matched || !customs[c].enabled) continue;
+        probe_t *e = &probes[n];
+        snprintf(e->key,  sizeof(e->key),  "%s", customs[c].key);
+        snprintf(e->vcmd, sizeof(e->vcmd), "command -v %s", customs[c].key);
+        e->have_v = 1;
+        e->synthetic = 1;
+        e->cust = &customs[c];
+        n++;
     }
     *out_n = n;
     return probes;
@@ -405,9 +549,12 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
         stats->installed = stats->authenticated = stats->auth_applicable = 0;
     }
 
+    int n_cust = 0;
+    custom_tool_t *customs = load_custom_tools(&n_cust);
+
     int n = 0;
-    probe_t *probes = parse_catalog(entries, entries_len, &n);
-    if (!probes) return -1;
+    probe_t *probes = parse_catalog(entries, entries_len, &n, customs, n_cust);
+    if (!probes) { free(customs); return -1; }
 
 #ifdef _WIN32
     for (int i = 0; i < n; i++) probe_run(&probes[i]);
@@ -432,10 +579,14 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
 
     // Assemble JSON object (just the {<key>:{...},...} dict, no envelope).
     size_t used = 0;
-    if (json_emit_raw(out, out_cap, &used, "{", 1) < 0) { free(probes); return -1; }
+    if (json_emit_raw(out, out_cap, &used, "{", 1) < 0) { free(probes); free(customs); return -1; }
 
+    int emitted = 0;
     for (int i = 0; i < n; i++) {
         probe_t *p = &probes[i];
+        // Non-catalog customs are only advertised when actually found on
+        // PATH (edge parity): a missing binary is not a tool, drop it.
+        if (p->synthetic && !p->installed) continue;
         if (stats) {
             if (p->installed)                            stats->installed++;
             // Auth only applies to tools that define a statusCmd (`have_s`).
@@ -446,12 +597,14 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
                 if (p->authed) stats->authenticated++;
             }
         }
-        if (probe_append_json(p, i == 0, out, out_cap, &used) < 0) {
-            free(probes); return -1;
+        if (probe_append_json(p, emitted == 0, out, out_cap, &used) < 0) {
+            free(probes); free(customs); return -1;
         }
+        emitted++;
     }
 
     free(probes);
+    free(customs);
     if (json_emit_raw(out, out_cap, &used, "}", 1) < 0) return -1;
     if (used >= out_cap) return -1;
     out[used] = '\0';
