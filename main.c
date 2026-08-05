@@ -1022,9 +1022,9 @@ static long forward_pty_output(edge_t *e, session_t *s) {
 // ── Command dispatch ────────────────────────────────────────────────────────
 
 // ── Off-loop jobs ───────────────────────────────────────────────────────────
-// Bodies run in a forked child (POSIX) / worker thread (Windows) and may only
-// produce JSON via `emit` — never touch WS or Noise state. The main loop
-// forwards the frames in jobs_poll_cb below.
+// Bodies run in a re-executed worker process (`<self> __job <kind>`) and may
+// only produce JSON via `emit` — never touch WS or Noise state. The main loop
+// forwards the frames in jobs_frame_cb below.
 
 // Backend waits 240s for the scan result; die a little earlier so a wedged
 // probe surfaces as our error rather than the backend's timeout.
@@ -1058,6 +1058,16 @@ static int preview_job_body(const char *payload, size_t payload_len,
     // so reaching the end means the protocol completed.
     bridge_preview_handle_request(payload, payload_len, emit, ctx);
     return 0;
+}
+
+// Worker entry: `<self> __job <kind>`. Runs before any daemon setup, so a
+// worker never opens a socket, loads credentials or touches the WS state.
+static int cmd_job_worker(const char *kind_s) {
+    switch (atoi(kind_s)) {
+        case BRIDGE_JOB_SCAN:    return bridge_job_worker_main(scan_job_body);
+        case BRIDGE_JOB_PREVIEW: return bridge_job_worker_main(preview_job_body);
+        default:                 return 2;
+    }
 }
 
 // Terminal preview error frame, built parent-side when a job can't even start
@@ -1480,7 +1490,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 return 0;
             }
             int started = bridge_job_start(&e->jobs, BRIDGE_JOB_SCAN, buf, entries_len,
-                                           scan_job_body, monotonic_ms(), SCAN_JOB_TIMEOUT_MS,
+                                           monotonic_ms(), SCAN_JOB_TIMEOUT_MS,
                                            req, req_len, aid, aid_len, eid, eid_len);
             free(buf);
             if (started != 0)
@@ -1651,7 +1661,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         const char *prid = NULL; size_t prid_len = 0;
         json_get_str(payload, payload_len, "requestId", &prid, &prid_len);
         if (bridge_job_start(&e->jobs, BRIDGE_JOB_PREVIEW, payload, payload_len,
-                             preview_job_body, monotonic_ms(), PREVIEW_JOB_TIMEOUT_MS,
+                             monotonic_ms(), PREVIEW_JOB_TIMEOUT_MS,
                              prid, prid_len, NULL, 0, NULL, 0) != 0 && prid_len)
             send_preview_error(e, prid, prid_len,
                                bridge_jobs_count(&e->jobs, BRIDGE_JOB_PREVIEW) >= BRIDGE_JOB_MAX
@@ -2022,6 +2032,12 @@ static int acquire_device_lock(const char *device_id) {
 #endif
 
 int main(int argc, char **argv) {
+    // Off-loop worker: dispatch first and hard-return, so a worker can never
+    // fall through into daemon startup. Hidden from --help; not a user command.
+    if (argc >= 3 && strcmp(argv[1], "__job") == 0) return cmd_job_worker(argv[2]);
+    // Resolve our own path while argv0 and the cwd are still trustworthy.
+    bridge_jobs_init_self(argv[0]);
+
     // Subcommand dispatch before option parsing so `bridge login -h` works.
     if (argc >= 2 && strcmp(argv[1], "login") == 0) {
         int rc = cmd_login(argc - 1, argv + 1);

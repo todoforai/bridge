@@ -7,13 +7,11 @@
 // Noise encryption + sending itself, so the transport stays single-writer
 // (the send nonce must advance in one place only).
 //
-// POSIX: fork(). The child gets a COW snapshot of the payload, so the parent
-//        can free its copy immediately and a cancel is just close+SIGKILL.
-// Windows: no fork, so a worker thread writes into an anonymous pipe. Cancel
-//        closes the read end and DETACHES the thread — there is no safe way to
-//        kill it (TerminateThread would leak its locks). It unwinds at its next
-//        emit, so a worker wedged inside a fetch or a probe can outlive the
-//        connection; it owns its payload, so nothing is freed underneath it.
+// A worker is this same binary re-executed as `<self> __job <kind>`: payload
+// in on stdin, frames out on stdout. One spawn path on every platform, and a
+// worker that can always be killed outright — a thread cannot (TerminateThread
+// leaks whatever lock it held), and a fork child would inherit a process image
+// full of locks and descriptors it has no use for.
 #ifndef BRIDGE_JOBS_H
 #define BRIDGE_JOBS_H
 
@@ -26,8 +24,12 @@
 // a multi-MB response along briskly, small enough that eight busy jobs can't
 // starve the WS/PTY work in the same tick.
 #define BRIDGE_JOB_DRAIN_MAX  (256 * 1024)
+// Payload cap, enforced on both sides: the caller's messages are bounded well
+// below this, so anything larger is a bug rather than a request.
+#define BRIDGE_JOB_PAYLOAD_MAX (1024 * 1024)
 
-// Kinds are opaque to this module — the caller routes results by them.
+// Kinds are opaque to this module — the caller maps them to bodies and routes
+// results by them. They travel to the worker as the `__job` argument.
 #define BRIDGE_JOB_SCAN     1
 #define BRIDGE_JOB_PREVIEW  2
 
@@ -36,7 +38,7 @@
 // Signature-compatible with preview_emit_fn so preview.c plugs in unchanged.
 typedef int (*bridge_job_emit_fn)(void *ctx, const char *data, size_t len);
 
-// The actual work, executed in the child/thread. Must not touch WS or Noise.
+// The actual work, executed in the worker process. Must not touch WS or Noise.
 // Return 0 when the job said everything it meant to say, -1 otherwise: only
 // a 0 makes the worker write the end-of-stream marker, which is what lets the
 // parent tell "finished" apart from "died mid-stream" (a crash, or a preview
@@ -55,12 +57,17 @@ typedef struct {
     char     aid[80]; size_t aid_len;
     char     eid[80]; size_t eid_len;
 #ifdef _WIN32
-    void    *rd;                  // HANDLE, read end
-    void    *th;                  // HANDLE, worker thread
+    void    *rd;                  // HANDLE, frames from the worker
+    void    *wr;                  // HANDLE, payload to the worker
+    void    *proc;                // HANDLE, worker process
+    void    *job;                 // HANDLE, job object (kills the whole tree)
 #else
-    int      rfd;
+    int      rfd, wfd;
     int      pid;
 #endif
+    // Payload is handed over a pipe a chunk at a time, so a large one can
+    // never block the loop waiting for the worker to read.
+    char    *pl; size_t pl_len, pl_off;
     uint8_t *acc; size_t acc_len, acc_cap;   // partial-frame reassembly
 } bridge_job_t;
 
@@ -78,11 +85,17 @@ typedef int (*bridge_job_frame_cb)(void *ctx, const bridge_job_t *j,
 typedef void (*bridge_job_done_cb)(void *ctx, const bridge_job_t *j,
                                    int ok, const char *err);
 
+// Record how to re-execute ourselves. Call once at startup, before any job.
+void bridge_jobs_init_self(const char *argv0);
+
+// Worker entry point: read the payload from stdin, run `body`, frame whatever
+// it emits onto stdout. Returns a process exit code.
+int bridge_job_worker_main(bridge_job_body_fn body);
+
 // Spawn a job. `payload` is copied. rid/aid/eid may be NULL/0.
 // Returns 0, or -1 if no slot is free or the spawn failed.
 int bridge_job_start(bridge_jobs_t *p, int kind,
                      const char *payload, size_t payload_len,
-                     bridge_job_body_fn body,
                      int64_t now_ms, int timeout_ms,
                      const char *rid, size_t rid_len,
                      const char *aid, size_t aid_len,
