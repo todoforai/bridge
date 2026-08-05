@@ -5,8 +5,10 @@
 // Simplicity rules:
 //   - shell does the heavy lifting (every cmd is already `sh -c`-ready)
 //   - each cmd runs with a wall-clock deadline via fork + waitpid + kill
-//   - POSIX: pthread pool of PARALLEL_WORKERS drains a shared job queue
-//     (fork-from-thread is safe; child only calls async-signal-safe libc).
+//   - POSIX: pthread pool of PARALLEL_WORKERS drains a shared job queue.
+//     The PATH is exported once up front so the fork children only call
+//     async-signal-safe libc (dup2/setpgid/execl) — anything else could
+//     deadlock on a lock another probe thread held at fork time.
 //     Windows path stays serial.
 //   - "installed" = versionCmd exited 0 with non-empty stdout,
 //                   OR (no versionCmd AND statusCmd exited 0)
@@ -177,15 +179,17 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
     if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
 
     if (pid == 0) {
-        // Child: redirect stdout+stderr to pipe, detach from controlling TTY.
+        // Between fork() and exec() in a threaded process, only async-signal-
+        // safe calls are legal: another probe thread can hold the malloc or
+        // environ lock at the instant we fork, and the child inherits it
+        // locked with no thread left to release it. So everything unsafe
+        // (building PATH, setenv) happens once in the parent — see
+        // bridge_scan_tools — and this child only rearranges fds and execs.
         dup2(pipefd[1], 1);
         dup2(pipefd[1], 2);
         close(pipefd[0]); close(pipefd[1]);
         // New process group so we can kill the whole shell pipeline on timeout.
         setpgid(0, 0);
-        // Make HostDesktop-installed tools visible to probes.
-        char *tools_path = bridge_build_tools_path();
-        if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -559,6 +563,15 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
 #ifdef _WIN32
     for (int i = 0; i < n; i++) probe_run(&probes[i]);
 #else
+    // Export the tools PATH once, here, while we're still single-threaded:
+    // every probe wants the same value, and doing it in each fork child would
+    // mean calling malloc/setenv after a fork from a threaded process (see
+    // run_shell). Children inherit it for free. The scan runs in its own
+    // process (jobs.c), so this cannot disturb the bridge's own environment.
+    {
+        char *tools_path = bridge_build_tools_path();
+        if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
+    }
     int nworkers = n < PARALLEL_WORKERS ? n : PARALLEL_WORKERS;
     if (nworkers <= 1) {
         for (int i = 0; i < n; i++) probe_run(&probes[i]);
