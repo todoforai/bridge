@@ -145,7 +145,7 @@ test-jobs: | build
 .PHONY: test-preview
 test-preview: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -o build/test-preview \
-	    test/test_preview.c preview.c json.c ws.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
+	    test/test_preview.c preview.c jobs.c json.c ws.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
 	./build/test-preview
 
 # Bridge-side RUN timing: spawn/warmup/run breakdown per command, no network.

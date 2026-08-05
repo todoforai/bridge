@@ -22,6 +22,10 @@ typedef int (*preview_emit_fn)(void *ctx, const char *json, size_t len);
 // Allowlist a port for 24h (re-registering refreshes the TTL).
 void bridge_preview_allow_port(int port);
 
+// Whether `port` is currently registered. The allowlist is process-local, so
+// the daemon must check this before handing a request to a worker process.
+int bridge_preview_port_allowed(int port);
+
 // TCP-probe 127.0.0.1:port so registration fails fast when nothing listens.
 // Returns 0 if something accepted the connection, -1 with `err` filled.
 int bridge_preview_probe_port(int port, char *err, size_t err_cap);

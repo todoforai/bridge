@@ -73,7 +73,7 @@ void bridge_preview_allow_port(int port) {
     g_allowed[slot].expiry_ms = now + PORT_TTL_MS;
 }
 
-static int port_allowed(int port) {
+int bridge_preview_port_allowed(int port) {
     int64_t now = ws_monotonic_ms();
     for (int i = 0; i < MAX_ALLOWED_PORTS; i++)
         if (g_allowed[i].port == port && g_allowed[i].expiry_ms > now) return 1;
@@ -332,11 +332,9 @@ void bridge_preview_handle_request(const char *payload, size_t payload_len,
     const char *headers = NULL; size_t headers_len = 0;
     json_get_obj(payload, payload_len, "headers", &headers, &headers_len);
 
-    if (!port_allowed((int)port)) {
-        char msg[96];
-        snprintf(msg, sizeof msg, "Port %ld is not registered for preview on this device", port);
-        FAIL(msg);
-    }
+    // No allowlist check here: the registration lives in the daemon, and this
+    // runs in a worker process that never saw it. The caller authorizes the
+    // port before starting the job — see bridge_preview_port_allowed.
 
     size_t body_len = 0;
     {

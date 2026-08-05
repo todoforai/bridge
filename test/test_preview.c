@@ -5,6 +5,7 @@
 //   3. large body (100KB) → multiple chunks, reassembles byte-exact
 //   4. set-cookie headers → setCookie array, stripped from headers
 //   5. connection refused → error chunk
+//   6. the real thing: a fetch driven through an off-loop job worker
 // Build+run: make test-preview
 
 #include <arpa/inet.h>
@@ -18,6 +19,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "../jobs.h"
 #include "../json.h"
 #include "../preview.h"
 
@@ -100,26 +102,52 @@ static void run_req(const char *payload) {
     bridge_preview_handle_request(payload, strlen(payload), collect, NULL);
 }
 
-int main(void) {
+// ── Job worker plumbing (case 6) ────────────────────────────────────────────
+
+static int preview_job_body(const char *p, size_t n, bridge_job_emit_fn emit, void *ctx) {
+    bridge_preview_handle_request(p, n, emit, ctx);
+    return 0;
+}
+
+static int  g_job_frames, g_job_dones, g_job_oks;
+static char g_job_first[512];
+
+static int job_on_frame(void *c, const bridge_job_t *j, const char *d, size_t l) {
+    (void)c; (void)j;
+    if (g_job_frames == 0) {
+        size_t k = l < sizeof g_job_first - 1 ? l : sizeof g_job_first - 1;
+        memcpy(g_job_first, d, k); g_job_first[k] = '\0';
+    }
+    g_job_frames++;
+    return 0;
+}
+
+static void job_on_done(void *c, const bridge_job_t *j, int ok, const char *e) {
+    (void)c; (void)j; (void)e;
+    g_job_dones++; g_job_oks += ok;
+}
+
+int main(int argc, char **argv) {
+    // Job workers are this same binary, re-executed.
+    if (argc >= 3 && strcmp(argv[1], "__job") == 0)
+        return bridge_job_worker_main(preview_job_body);
+    bridge_jobs_init_self(argv[0]);
+
     signal(SIGPIPE, SIG_IGN);
     g_srv_port = start_server();
     char payload[512];
 
-    // 1: unregistered port → single terminal error chunk
+    // 1: the allowlist gates requests. It's consulted by the caller rather
+    // than by handle_request, because the fetch runs in a worker process that
+    // never saw the registration — so this is where the check has to hold.
     snprintf(payload, sizeof payload,
              "{\"requestId\":\"r1\",\"port\":%d,\"method\":\"GET\",\"path\":\"/\",\"headers\":{}}", g_srv_port);
-    run_req(payload);
-    assert(g_nchunks == 1);
-    {
-        const char *p; size_t plen; chunk_payload(0, &p, &plen);
-        const char *err; size_t elen;
-        assert(json_get_str(p, plen, "error", &err, &elen));
-        assert(memmem(err, elen, "not registered", 14));
-        int done; assert(json_get_bool(p, plen, "done", &done) && done);
-    }
-    printf("ok 1 unregistered port rejected\n");
-
+    assert(!bridge_preview_port_allowed(g_srv_port));
+    assert(!bridge_preview_port_allowed(g_srv_port + 1));
     bridge_preview_allow_port(g_srv_port);
+    assert(bridge_preview_port_allowed(g_srv_port));
+    assert(!bridge_preview_port_allowed(g_srv_port + 1));
+    printf("ok 1 allowlist admits only registered ports\n");
 
     // 2: small response
     g_srv_response_len = (size_t)snprintf(g_srv_response, sizeof g_srv_response,
@@ -207,6 +235,30 @@ int main(void) {
         assert(memmem(err, elen, "Nothing is listening", 20));
     }
     printf("ok 5 connection refused\n");
+
+    // 6: end-to-end through a worker process. The cases above all run the
+    // fetch in-process, which is exactly how a worker-only failure (state the
+    // daemon holds but a fresh process doesn't) slips through unnoticed.
+    {
+        g_srv_response_len = (size_t)snprintf(g_srv_response, sizeof g_srv_response,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nvia-worker");
+        snprintf(payload, sizeof payload,
+                 "{\"requestId\":\"r6\",\"port\":%d,\"method\":\"GET\",\"path\":\"/\",\"headers\":{}}",
+                 g_srv_port);
+        bridge_jobs_t jobs;
+        memset(&jobs, 0, sizeof jobs);
+        assert(bridge_job_start(&jobs, BRIDGE_JOB_PREVIEW, payload, strlen(payload),
+                                0, 20000, "r6", 2, NULL, 0, NULL, 0) == 0);
+        for (int i = 0; i < 4000 && g_job_dones == 0; i++) {
+            bridge_jobs_poll(&jobs, i * 5, job_on_frame, job_on_done, NULL);
+            usleep(5000);
+        }
+        assert(g_job_dones == 1 && g_job_oks == 1);
+        assert(g_job_frames == 2);
+        assert(strstr(g_job_first, "\"status\":200"));
+        bridge_jobs_shutdown(&jobs);
+    }
+    printf("ok 6 fetch through an off-loop worker process\n");
 
     printf("all preview tests passed\n");
     return 0;
