@@ -1,6 +1,8 @@
 // See jobs.h for the model. Wire format on the pipe: repeated
-// [u32 little-endian length][length bytes of JSON]. A length above
-// BRIDGE_JOB_FRAME_MAX means a corrupt stream and fails the job.
+// [u32 little-endian length][length bytes of JSON], then a zero-length frame
+// as the end-of-stream marker. A bare EOF without that marker means the
+// worker died mid-stream. A length above BRIDGE_JOB_FRAME_MAX means a corrupt
+// stream and fails the job.
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -56,15 +58,26 @@ static int sink_write_all(int w, const void *buf, size_t n) {
 }
 #endif
 
-// bridge_job_emit_fn passed to the body. A failing write means the parent
-// closed the pipe (cancel/teardown) — return -1 so the body unwinds.
-static int worker_emit(void *ctx, const char *data, size_t len) {
-    worker_sink_t *s = ctx;
-    if (len == 0 || len > BRIDGE_JOB_FRAME_MAX) return -1;
+static int sink_frame(worker_sink_t *s, const char *data, size_t len) {
     uint8_t hdr[4] = { (uint8_t)len, (uint8_t)(len >> 8),
                        (uint8_t)(len >> 16), (uint8_t)(len >> 24) };
     if (sink_write_all(s->w, hdr, 4) != 0) return -1;
-    return sink_write_all(s->w, data, len) != 0 ? -1 : 0;
+    return len && sink_write_all(s->w, data, len) != 0 ? -1 : 0;
+}
+
+// bridge_job_emit_fn passed to the body. A failing write means the parent
+// closed the pipe (cancel/teardown) — return -1 so the body unwinds.
+static int worker_emit(void *ctx, const char *data, size_t len) {
+    if (len == 0 || len > BRIDGE_JOB_FRAME_MAX) return -1;
+    return sink_frame(ctx, data, len);
+}
+
+// Run the body and, only if it completed, write the end-of-stream marker.
+static void worker_run(bridge_job_body_fn body,
+                       const char *payload, size_t payload_len,
+                       worker_sink_t *sink) {
+    if (body(payload, payload_len, worker_emit, sink) == 0)
+        (void)sink_frame(sink, NULL, 0);
 }
 
 #ifdef _WIN32
@@ -78,7 +91,7 @@ typedef struct {
 static DWORD WINAPI win_worker_main(LPVOID arg) {
     win_worker_t *a = arg;
     worker_sink_t sink = { .w = a->w };
-    a->body(a->payload, a->payload_len, worker_emit, &sink);
+    worker_run(a->body, a->payload, a->payload_len, &sink);
     CloseHandle(a->w);          // EOF for the parent
     free(a->payload);
     free(a);
@@ -97,7 +110,12 @@ static void job_close(bridge_job_t *j) {
 #else
     if (j->rfd >= 0) { close(j->rfd); j->rfd = -1; }
     if (j->pid > 0) {
-        kill(j->pid, SIGKILL);
+        // Kill the whole group, not just the supervisor: a tool scan has up to
+        // 16 probe shells in flight, and orphaning them would leave nobody to
+        // enforce their per-probe timeouts. The child setpgid()s itself, and
+        // we repeat it here so the group exists no matter who won the race.
+        setpgid(j->pid, j->pid);
+        if (kill(-j->pid, SIGKILL) != 0) kill(j->pid, SIGKILL);
         // Targeted reap: the PTY code waits on its own pids, so no wildcard.
         while (waitpid(j->pid, NULL, 0) < 0 && errno == EINTR) {}
         j->pid = 0;
@@ -153,22 +171,37 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
 #else
     int fds[2];
     if (pipe(fds) != 0) return -1;
+    // CLOEXEC on both ends: the worker shells out (tool probes), and an
+    // inherited write end would hold the pipe open past the body's exit,
+    // stalling our EOF until the last grandchild died.
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0) {
+        close(fds[0]); close(fds[1]); return -1;
+    }
+    // Checked, because a blocking read end would park the event loop — the
+    // one thing this whole module exists to prevent.
+    int fl = fcntl(fds[0], F_GETFL, 0);
+    if (fl < 0 || fcntl(fds[0], F_SETFL, fl | O_NONBLOCK) != 0) {
+        close(fds[0]); close(fds[1]); return -1;
+    }
 
     pid_t pid = fork();
     if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
     if (pid == 0) {
         close(fds[0]);
+        // Own process group so cancellation can sweep the probe subprocesses
+        // this body spawns (see job_close).
+        setpgid(0, 0);
         // A dead parent must not kill us via SIGPIPE — the failing write is
         // the cancel signal the body already handles.
         signal(SIGPIPE, SIG_IGN);
         worker_sink_t sink = { .w = fds[1] };
-        body(payload, payload_len, worker_emit, &sink);
+        worker_run(body, payload, payload_len, &sink);
         close(fds[1]);
         _exit(0);
     }
     close(fds[1]);
-    fcntl(fds[0], F_SETFL, O_NONBLOCK);
-    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    setpgid(pid, pid);          // race-free: both sides do it
     j->rfd = fds[0];
     j->pid = pid;
 #endif
@@ -179,19 +212,24 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
 }
 
 // Parse as many complete frames as `acc` holds, handing each to on_frame.
-static void job_drain_acc(bridge_jobs_t *p, bridge_job_t *j,
-                          bridge_job_frame_cb on_frame, void *ctx,
-                          int *fatal) {
-    (void)p;
+// `err` is set when the stream is corrupt or a frame could not be delivered.
+static void job_drain_acc(bridge_job_t *j, bridge_job_frame_cb on_frame,
+                          void *ctx, const char **err) {
     size_t off = 0;
-    while (j->acc_len - off >= 4) {
+    while (j->acc_len - off >= 4 && !*err) {
         const uint8_t *h = j->acc + off;
         size_t len = (size_t)h[0] | ((size_t)h[1] << 8) |
                      ((size_t)h[2] << 16) | ((size_t)h[3] << 24);
-        if (len == 0 || len > BRIDGE_JOB_FRAME_MAX) { *fatal = 1; return; }
-        if (j->acc_len - off - 4 < len) break;          // incomplete tail
+        if (len > BRIDGE_JOB_FRAME_MAX) { *err = "worker sent an oversized frame"; break; }
+        if (len == 0) { j->clean = 1; off += 4; break; }   // end-of-stream
+        if (j->acc_len - off - 4 < len) break;             // incomplete tail
+        // Count only what actually reached the backend, so a job can never
+        // report success for frames the transport dropped.
+        if (on_frame && on_frame(ctx, j, (const char *)(h + 4), len) != 0) {
+            *err = "failed to deliver frame";
+            break;
+        }
         j->frames++;
-        if (on_frame) on_frame(ctx, j, (const char *)(h + 4), len);
         off += 4 + len;
     }
     if (off) {
@@ -200,10 +238,16 @@ static void job_drain_acc(bridge_jobs_t *p, bridge_job_t *j,
     }
 }
 
+// Unparsed bytes never legitimately exceed one max frame plus its header —
+// anything more means a corrupt stream, so the buffer stays bounded.
+#define JOB_ACC_MAX (BRIDGE_JOB_FRAME_MAX + 4)
+
 static int job_acc_reserve(bridge_job_t *j, size_t extra) {
     if (j->acc_cap - j->acc_len >= extra) return 0;
+    if (j->acc_len + extra > JOB_ACC_MAX) return -1;
     size_t cap = j->acc_cap ? j->acc_cap : 8192;
     while (cap - j->acc_len < extra) cap *= 2;
+    if (cap > JOB_ACC_MAX) cap = JOB_ACC_MAX;
     uint8_t *n = realloc(j->acc, cap);
     if (!n) return -1;
     j->acc = n; j->acc_cap = cap;
@@ -217,50 +261,48 @@ void bridge_jobs_poll(bridge_jobs_t *p, int64_t now_ms,
         bridge_job_t *j = &p->slots[i];
         if (!j->active) continue;
 
-        int eof = 0, fatal = 0;
+        int eof = 0;
+        const char *err = NULL;
         size_t drained = 0;
-        while (drained < BRIDGE_JOB_DRAIN_MAX) {
-            if (job_acc_reserve(j, 8192) != 0) { fatal = 1; break; }
+        // Parse as we go: bounded reassembly means complete frames must leave
+        // the buffer before the next read can refill it.
+        while (drained < BRIDGE_JOB_DRAIN_MAX && !err) {
+            size_t want = BRIDGE_JOB_DRAIN_MAX - drained;
+            if (want > 8192) want = 8192;
+            if (job_acc_reserve(j, want) != 0) { err = "worker stream overflow"; break; }
+            size_t room = j->acc_cap - j->acc_len;
+            if (room < want) want = room;
 #ifdef _WIN32
             DWORD avail = 0;
             if (!PeekNamedPipe((HANDLE)j->rd, NULL, 0, NULL, &avail, NULL)) { eof = 1; break; }
             if (avail == 0) break;
-            DWORD want = (DWORD)(j->acc_cap - j->acc_len);
             if (avail < want) want = avail;
             DWORD got = 0;
-            if (!ReadFile((HANDLE)j->rd, j->acc + j->acc_len, want, &got, NULL) || got == 0) { eof = 1; break; }
+            if (!ReadFile((HANDLE)j->rd, j->acc + j->acc_len, (DWORD)want, &got, NULL) || got == 0) { eof = 1; break; }
             j->acc_len += got; drained += got;
 #else
-            ssize_t n = read(j->rfd, j->acc + j->acc_len, j->acc_cap - j->acc_len);
-            if (n > 0) { j->acc_len += (size_t)n; drained += (size_t)n; continue; }
+            ssize_t n = read(j->rfd, j->acc + j->acc_len, want);
             if (n == 0) { eof = 1; break; }
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            fatal = 1; break;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                err = "worker stream error"; break;
+            }
+            j->acc_len += (size_t)n; drained += (size_t)n;
 #endif
+            job_drain_acc(j, on_frame, ctx, &err);
         }
+        if (!err) job_drain_acc(j, on_frame, ctx, &err);
 
-        job_drain_acc(p, j, on_frame, ctx, &fatal);
+        if (!err && eof && !j->clean)
+            err = "worker exited without finishing its result";
+        if (!err && !eof && j->deadline_ms > 0 && now_ms >= j->deadline_ms)
+            err = "timed out";
 
-        if (fatal) {
+        if (err || eof) {
             bridge_job_t snap = *j;
             job_close(j);
-            if (on_done) on_done(ctx, &snap, 0, "worker stream error");
-            continue;
-        }
-        if (eof) {
-            bridge_job_t snap = *j;
-            int ok = snap.frames > 0 && snap.acc_len == 0;
-            job_close(j);
-            if (on_done) on_done(ctx, &snap, ok,
-                                 ok ? NULL : "worker exited without a complete result");
-            continue;
-        }
-        if (j->deadline_ms > 0 && now_ms >= j->deadline_ms) {
-            bridge_job_t snap = *j;
-            job_close(j);
-            if (on_done) on_done(ctx, &snap, 0, "timed out");
-            continue;
+            if (on_done) on_done(ctx, &snap, err ? 0 : 1, err);
         }
     }
 }

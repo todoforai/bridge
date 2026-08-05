@@ -10,8 +10,10 @@
 // POSIX: fork(). The child gets a COW snapshot of the payload, so the parent
 //        can free its copy immediately and a cancel is just close+SIGKILL.
 // Windows: no fork, so a worker thread writes into an anonymous pipe. Cancel
-//        closes the read end (the worker's next write fails and it unwinds);
-//        the payload is owned by the worker so detaching can't leak or race.
+//        closes the read end and DETACHES the thread — there is no safe way to
+//        kill it (TerminateThread would leak its locks). It unwinds at its next
+//        emit, so a worker wedged inside a fetch or a probe can outlive the
+//        connection; it owns its payload, so nothing is freed underneath it.
 #ifndef BRIDGE_JOBS_H
 #define BRIDGE_JOBS_H
 
@@ -20,9 +22,10 @@
 
 #define BRIDGE_JOB_MAX        8
 #define BRIDGE_JOB_FRAME_MAX  (64 * 1024)
-// Per-job bytes drained per tick: enough for a multi-MB preview to finish in
-// a couple of ticks, small enough that one job can't monopolize the loop.
-#define BRIDGE_JOB_DRAIN_MAX  (1024 * 1024)
+// Per-job bytes drained per tick. A few preview chunks' worth: enough to move
+// a multi-MB response along briskly, small enough that eight busy jobs can't
+// starve the WS/PTY work in the same tick.
+#define BRIDGE_JOB_DRAIN_MAX  (256 * 1024)
 
 // Kinds are opaque to this module — the caller routes results by them.
 #define BRIDGE_JOB_SCAN     1
@@ -34,14 +37,19 @@
 typedef int (*bridge_job_emit_fn)(void *ctx, const char *data, size_t len);
 
 // The actual work, executed in the child/thread. Must not touch WS or Noise.
-typedef void (*bridge_job_body_fn)(const char *payload, size_t payload_len,
-                                   bridge_job_emit_fn emit, void *emit_ctx);
+// Return 0 when the job said everything it meant to say, -1 otherwise: only
+// a 0 makes the worker write the end-of-stream marker, which is what lets the
+// parent tell "finished" apart from "died mid-stream" (a crash, or a preview
+// that emitted chunks but never its terminal frame).
+typedef int (*bridge_job_body_fn)(const char *payload, size_t payload_len,
+                                  bridge_job_emit_fn emit, void *emit_ctx);
 
 typedef struct {
     int      active;
     int      kind;
     int64_t  deadline_ms;
-    int      frames;              // frames forwarded so far (preview seq)
+    int      frames;              // frames successfully forwarded so far
+    int      clean;               // end-of-stream marker seen
     // Routing echoed back on completion (requestId / agentId / edgeId).
     char     rid[80]; size_t rid_len;
     char     aid[80]; size_t aid_len;
@@ -60,11 +68,13 @@ typedef struct {
     bridge_job_t slots[BRIDGE_JOB_MAX];
 } bridge_jobs_t;
 
-// One complete JSON message from a worker — send it as-is.
-typedef void (*bridge_job_frame_cb)(void *ctx, const bridge_job_t *j,
-                                    const char *data, size_t len);
-// Worker finished. ok=1 means it produced at least one frame and exited
-// cleanly; otherwise `err` explains the failure.
+// One complete JSON message from a worker — send it as-is. Return -1 if it
+// could not be delivered (WS/Noise failure): the job then stops and fails,
+// instead of reporting success for bytes that never reached the backend.
+typedef int (*bridge_job_frame_cb)(void *ctx, const bridge_job_t *j,
+                                   const char *data, size_t len);
+// Worker finished. ok=1 means it ran to completion and every frame was
+// delivered; otherwise `err` explains the failure.
 typedef void (*bridge_job_done_cb)(void *ctx, const bridge_job_t *j,
                                    int ok, const char *err);
 

@@ -1029,28 +1029,35 @@ static long forward_pty_output(edge_t *e, session_t *s) {
 // Backend waits 240s for the scan result; die a little earlier so a wedged
 // probe surfaces as our error rather than the backend's timeout.
 #define SCAN_JOB_TIMEOUT_MS     230000
-// preview.c bounds its own fetch at 20s; this is the outer safety net.
-#define PREVIEW_JOB_TIMEOUT_MS  30000
+// preview.c bounds its own fetch at 20s; this is the outer safety net. Kept
+// under the backend's 30s relay timeout so a wedged worker surfaces as our
+// error frame rather than the backend's TIMEOUT.
+#define PREVIEW_JOB_TIMEOUT_MS  26000
 
-static void scan_job_body(const char *payload, size_t payload_len,
-                          bridge_job_emit_fn emit, void *ctx) {
+static int scan_job_body(const char *payload, size_t payload_len,
+                         bridge_job_emit_fn emit, void *ctx) {
     char *result = malloc(MAX_MSG);
-    if (!result) return;
+    if (!result) return -1;
     bridge_scan_stats_t stats;
     int n = bridge_scan_tools(payload, payload_len, result, MAX_MSG, &stats);
+    int rc = -1;
     if (n > 0) {
         // Stats are the worker's to log — it's the side that measured them.
         fprintf(stderr, "✓ Probed CLI tools: %d installed, %d/%d authenticated (of tools with auth)\n",
                 stats.installed, stats.authenticated, stats.auth_applicable);
-        emit(ctx, result, (size_t)n);
+        rc = emit(ctx, result, (size_t)n);
     }
     free(result);
+    return rc;
 }
 
-static void preview_job_body(const char *payload, size_t payload_len,
-                             bridge_job_emit_fn emit, void *ctx) {
+static int preview_job_body(const char *payload, size_t payload_len,
+                            bridge_job_emit_fn emit, void *ctx) {
     // preview_emit_fn and bridge_job_emit_fn share a signature by design.
+    // handle_request always ends the stream (terminal chunk or error frame),
+    // so reaching the end means the protocol completed.
     bridge_preview_handle_request(payload, payload_len, emit, ctx);
+    return 0;
 }
 
 // Terminal preview error frame, built parent-side when a job can't even start
@@ -1072,16 +1079,17 @@ static void send_preview_error(edge_t *e, const char *rid, size_t rid_len,
 // One frame from a worker: already a complete JSON message, so Noise-encrypt
 // and enqueue as-is. The TX queue absorbs a full 3.5MB preview response
 // (~4.8MB base64 < WS_TX_MAX 8MB); ws_ensure_tx_room drains when full.
-static void jobs_frame_cb(void *ctx, const bridge_job_t *j,
-                          const char *data, size_t len) {
+// Returning -1 on a failed send stops the job, so we never claim success for
+// bytes the transport dropped.
+static int jobs_frame_cb(void *ctx, const bridge_job_t *j,
+                         const char *data, size_t len) {
     edge_t *e = ctx;
     if (j->kind == BRIDGE_JOB_SCAN) {
         // The scan emits the bare result object; wrap it in the RPC envelope.
-        send_function_call_result(e, j->rid, j->rid_len, j->aid, j->aid_len,
-                                  j->eid, j->eid_len, data, len);
-        return;
+        return send_function_call_result(e, j->rid, j->rid_len, j->aid, j->aid_len,
+                                         j->eid, j->eid_len, data, len);
     }
-    send_json(e, data, len);
+    return send_json(e, data, len);
 }
 
 static void jobs_done_cb(void *ctx, const bridge_job_t *j, int ok, const char *err) {
@@ -1095,9 +1103,10 @@ static void jobs_done_cb(void *ctx, const bridge_job_t *j, int ok, const char *e
         fprintf(stderr, "CLI tool probe failed: %s\n", err ? err : "unknown");
         return;
     }
-    // Preview: only synthesize an error if the worker never got to send its
-    // own terminal frame — otherwise the backend would see a second `done`.
-    if (j->frames == 0 && j->rid_len) {
+    // Preview: the worker always ends its own stream, so an unclean finish
+    // means the terminal frame never made it — the backend is still waiting
+    // and needs one from us, even if earlier chunks did get through.
+    if (j->rid_len) {
         char msg[192];
         snprintf(msg, sizeof msg, "preview: fetch failed (%s)", err ? err : "unknown");
         send_preview_error(e, j->rid, j->rid_len, msg);
@@ -1644,7 +1653,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (bridge_job_start(&e->jobs, BRIDGE_JOB_PREVIEW, payload, payload_len,
                              preview_job_body, monotonic_ms(), PREVIEW_JOB_TIMEOUT_MS,
                              prid, prid_len, NULL, 0, NULL, 0) != 0 && prid_len)
-            send_preview_error(e, prid, prid_len, "preview: too many concurrent requests");
+            send_preview_error(e, prid, prid_len,
+                               bridge_jobs_count(&e->jobs, BRIDGE_JOB_PREVIEW) >= BRIDGE_JOB_MAX
+                                   ? "preview: too many concurrent requests"
+                                   : "preview: failed to start worker");
     }
 
     #undef IS
