@@ -134,6 +134,13 @@ test-tools: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-tools test/test_tools.c tools.c json.c env_path.c -lpthread
 	./build/test-tools
 
+# Off-loop jobs: the loop keeps ticking while a slow worker runs; frame
+# reassembly, deadlines, slot cap and teardown reaping.
+.PHONY: test-jobs
+test-jobs: | build
+	$(CC) -O1 -g -Wall -Wextra -I. -o build/test-jobs test/test_jobs.c jobs.c
+	./build/test-jobs
+
 # Preview relay: local HTTP fetch + chunked response emission, no network.
 .PHONY: test-preview
 test-preview: | build
