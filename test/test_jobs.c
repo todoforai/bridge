@@ -42,6 +42,7 @@ static void sleep_ms(long ms) {
 #define K_TRUNCATED  15
 #define K_HANG       16
 #define K_SPAWNER    17
+#define K_FDCOUNT    18
 
 static int slow_body(const char *p, size_t n, bridge_job_emit_fn emit, void *ctx) {
     (void)p; (void)n;
@@ -109,6 +110,19 @@ static int spawner_body(const char *p, size_t n, bridge_job_emit_fn emit, void *
     return 0;
 }
 
+// Reports how many descriptors above stderr it can still see. The daemon's
+// socket and PTY masters live up there, so anything but 0 means a worker (and
+// every tool it shells out to) inherited them.
+static int fdcount_body(const char *p, size_t n, bridge_job_emit_fn emit, void *ctx) {
+    (void)p; (void)n;
+    int open_fds = 0;
+    for (int fd = 3; fd < 256; fd++)
+        if (fcntl(fd, F_GETFD) != -1) open_fds++;
+    char buf[64];
+    int k = snprintf(buf, sizeof buf, "{\"fds\":%d}", open_fds);
+    return emit(ctx, buf, (size_t)k);
+}
+
 static int run_worker(int kind) {
     switch (kind) {
         case K_SLOW:      return bridge_job_worker_main(slow_body);
@@ -118,6 +132,7 @@ static int run_worker(int kind) {
         case K_TRUNCATED: return bridge_job_worker_main(truncated_body);
         case K_HANG:      return bridge_job_worker_main(hang_body);
         case K_SPAWNER:   return bridge_job_worker_main(spawner_body);
+        case K_FDCOUNT:   return bridge_job_worker_main(fdcount_body);
         default:          return 2;
     }
 }
@@ -324,6 +339,25 @@ int main(int argc, char **argv) {
         printf("ok 12 undispatched worker refuses to run (exit %d)\n", WEXITSTATUS(st));
     }
 
+    // A worker must not inherit the daemon's descriptors: it shells out to
+    // arbitrary tools, and those would otherwise hold the live backend socket
+    // and every active PTY master. exec alone doesn't close them.
+    reset();
+    {
+        // Stand-ins for the daemon's long-lived fds, deliberately not CLOEXEC.
+        int spare[8];
+        for (int i = 0; i < 8; i++) {
+            spare[i] = open("/dev/null", O_RDONLY);
+            assert(spare[i] > 2);
+        }
+        assert(start(&jobs, K_FDCOUNT, "", 0, 5000, "fd") == 0);
+        pump(&jobs, 5000, &gap);
+        assert(oks == 1);
+        assert(strcmp(last, "{\"fds\":0}") == 0);
+        for (int i = 0; i < 8; i++) close(spare[i]);
+    }
+    printf("ok 13 worker inherits none of the daemon's descriptors\n");
+
     // Self-update: the bridge is a long-lived daemon whose binary gets
     // replaced under it. Spawning by resolved pathname would then exec the
     // NEW build (or fail outright, the path having become "... (deleted)"),
@@ -350,7 +384,7 @@ int main(int argc, char **argv) {
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
         remove(copy);
         assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
-        printf("ok 13 jobs still spawn after the binary is replaced\n");
+        printf("ok 14 jobs still spawn after the binary is replaced\n");
     }
 
     printf("all job tests passed\n");

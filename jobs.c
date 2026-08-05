@@ -24,6 +24,7 @@
 #  include <errno.h>
 #  include <fcntl.h>
 #  include <signal.h>
+#  include <sys/syscall.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
 #endif
@@ -72,11 +73,14 @@ void bridge_jobs_init_self(const char *argv0) {
 #ifndef _WIN32
     if (!strchr(argv0, '/')) {
         const char *path = getenv("PATH");
-        if (path) for (const char *p = path; *p; ) {
+        if (path) for (const char *p = path; ; ) {
             const char *end = strchr(p, ':');
             size_t dlen = end ? (size_t)(end - p) : strlen(p);
-            if (dlen && dlen + strlen(argv0) + 2 < sizeof g_self) {
-                snprintf(g_self, sizeof g_self, "%.*s/%s", (int)dlen, p, argv0);
+            // An empty component means the current directory, same as execvp.
+            const char *dir = dlen ? p : ".";
+            if (!dlen) dlen = 1;
+            if (dlen + strlen(argv0) + 2 < sizeof g_self) {
+                snprintf(g_self, sizeof g_self, "%.*s/%s", (int)dlen, dir, argv0);
                 if (access(g_self, X_OK) == 0) return;
             }
             if (!end) break;
@@ -155,6 +159,17 @@ int bridge_job_worker_main(bridge_job_body_fn body) {
     sink_fd_t out = GetStdHandle(STD_OUTPUT_HANDLE);
 #else
     unsetenv(JOB_DEPTH_ENV);
+    // Everything above stderr belongs to the daemon, not to us: exec only
+    // clears descriptors marked close-on-exec, so without this a worker (and
+    // every tool probe it shells out to) would hold the live backend socket
+    // and every active PTY master. Doing it here covers them wholesale,
+    // including any the daemon grows later.
+#  if defined(__linux__) && defined(SYS_close_range)
+    if (syscall(SYS_close_range, 3, ~0U, 0) != 0)   // glibc <2.34 lacks the wrapper
+#  endif
+    {
+        for (int fd = 3; fd < 256; fd++) close(fd);
+    }
     sink_fd_t in = 0, out = 1;
     // The parent vanishing must surface as a failed write, not as a signal.
     signal(SIGPIPE, SIG_IGN);
@@ -256,14 +271,17 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
     snprintf(kind_s, sizeof kind_s, "%d", kind);
 
 #ifdef _WIN32
-    // Explicit buffer size: job_feed subtracts the bytes still queued from it
-    // to decide how much it can write without blocking.
+    // Size the payload pipe to hold the whole payload. Windows has no
+    // non-blocking write and no way to ask a write handle for free space
+    // (PeekNamedPipe needs a read handle), so the only way to keep job_feed
+    // off the blocking path is to guarantee the buffer is big enough. Payloads
+    // are capped at BRIDGE_JOB_PAYLOAD_MAX, so this is bounded.
     #define JOB_PIPE_CAP 65536
-    // Child ends inheritable, our ends not — otherwise the worker would hold
-    // its own stdin writer open and never see the payload end.
     SECURITY_ATTRIBUTES sa = { .nLength = sizeof sa, .bInheritHandle = TRUE };
     HANDLE in_rd = NULL, in_wr = NULL, out_rd = NULL, out_wr = NULL;
-    if (!CreatePipe(&in_rd, &in_wr, &sa, JOB_PIPE_CAP)) { free(j->pl); j->pl = NULL; return -1; }
+    // Child ends inheritable, our ends not — otherwise the worker would hold
+    // its own stdin writer open and never see the payload end.
+    if (!CreatePipe(&in_rd, &in_wr, &sa, (DWORD)j->pl_len)) { free(j->pl); j->pl = NULL; return -1; }
     if (!CreatePipe(&out_rd, &out_wr, &sa, JOB_PIPE_CAP) ||
         !SetHandleInformation(in_wr,  HANDLE_FLAG_INHERIT, 0) ||
         !SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0)) {
@@ -297,14 +315,42 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
         free(j->pl); j->pl = NULL; return -1;
     }
 
-    // Inherited by the worker; see JOB_DEPTH_ENV. Restored on every path
-    // below, so a failed spawn can't leave the daemon marked as a worker.
-    SetEnvironmentVariableA(JOB_DEPTH_ENV, "1");
+    // Our environment plus the worker marker, as a block passed to this child
+    // alone. Mutating the process environment around CreateProcess instead
+    // would leave the daemon marked as a worker whenever a spawn fails
+    // between the set and the restore.
+    char *env_block = NULL;
+    {
+        char *parent_env = GetEnvironmentStringsA();
+        if (!parent_env) {
+            CloseHandle(wjob);
+            CloseHandle(in_rd); CloseHandle(in_wr);
+            CloseHandle(out_rd); CloseHandle(out_wr);
+            free(j->pl); j->pl = NULL; return -1;
+        }
+        size_t env_len = 0;                        // block ends with "\0\0"
+        while (parent_env[env_len] || parent_env[env_len + 1]) env_len++;
+        env_len += 2;
+        const char marker[] = JOB_DEPTH_ENV "=1";
+        env_block = malloc(env_len + sizeof marker);
+        if (!env_block) {
+            FreeEnvironmentStringsA(parent_env);
+            CloseHandle(wjob);
+            CloseHandle(in_rd); CloseHandle(in_wr);
+            CloseHandle(out_rd); CloseHandle(out_wr);
+            free(j->pl); j->pl = NULL; return -1;
+        }
+        memcpy(env_block, parent_env, env_len - 1);            // drop final NUL
+        memcpy(env_block + env_len - 1, marker, sizeof marker);
+        env_block[env_len - 1 + sizeof marker] = '\0';         // terminate block
+        FreeEnvironmentStringsA(parent_env);
+    }
+
     PROCESS_INFORMATION pi = {0};
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
                              CREATE_SUSPENDED | CREATE_NO_WINDOW,
-                             NULL, NULL, &si, &pi);
-    SetEnvironmentVariableA(JOB_DEPTH_ENV, NULL);
+                             env_block, NULL, &si, &pi);
+    free(env_block);
     CloseHandle(in_rd); CloseHandle(out_wr);        // child owns its ends now
     if (!ok) {
         CloseHandle(wjob);
@@ -323,7 +369,6 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
     CloseHandle(pi.hThread);
 
     j->rd = out_rd; j->wr = in_wr; j->proc = pi.hProcess; j->job = wjob;
-    j->pipe_cap = JOB_PIPE_CAP;
 #else
     int in_fds[2], out_fds[2];
     if (pipe(in_fds) != 0) { free(j->pl); j->pl = NULL; return -1; }
@@ -391,8 +436,10 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
     }
     free(child_env);
     close(in_fds[0]); close(out_fds[1]);
-    // Both sides call it so the group exists whoever wins the race; ESRCH
-    // just means the child got there first (or already exited).
+    // Both sides call it so the group exists whoever wins the race. EACCES
+    // means the child already execed (it set its own group first); ESRCH that
+    // it's gone already, which surfaces as EOF on the next poll. Anything else
+    // means no group, so nothing to sweep the worker's own children with.
     if (setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH) {
         // No group means job_close couldn't sweep the tree — don't pretend.
         kill(pid, SIGKILL);
@@ -429,31 +476,25 @@ static void job_feed(bridge_job_t *j, const char **err) {
 #else
     if (j->wfd < 0) return;
 #endif
+#ifdef _WIN32
+    // One write, all of it. The pipe was created large enough for the whole
+    // payload and nothing else is ever written to it, so the buffer has room
+    // and the call returns without waiting for the worker to read. That
+    // matters because Windows has no non-blocking write and no way to ask a
+    // write handle for free space (PeekNamedPipe needs a read handle) — the
+    // room has to be bought up front rather than checked.
+    DWORD wrote = 0;
+    if (!WriteFile((HANDLE)j->wr, j->pl, (DWORD)j->pl_len, &wrote, NULL) ||
+        wrote != (DWORD)j->pl_len) {
+        *err = "failed to send payload to worker";
+        job_close_wr(j);
+        return;
+    }
+    j->pl_off = j->pl_len;
+#else
     while (j->pl_off < j->pl_len) {
         size_t n = j->pl_len - j->pl_off;
         if (n > 8192) n = 8192;
-#ifdef _WIN32
-        // Anonymous pipes have no non-blocking mode, so ask first: only write
-        // what provably fits, or the loop would park here (which is the one
-        // thing this module exists to prevent).
-        DWORD avail = 0;
-        if (!PeekNamedPipe((HANDLE)j->wr, NULL, 0, NULL, &avail, NULL)) {
-            // Peek on a write handle reports the pipe's state, not readable
-            // bytes; a failure means the pipe is gone.
-            *err = "failed to send payload to worker";
-            job_close_wr(j);
-            return;
-        }
-        DWORD room = j->pipe_cap > avail ? j->pipe_cap - avail : 0;
-        if (room == 0) return;                  // full — retry next tick
-        if (n > room) n = room;
-        DWORD wrote = 0;
-        if (!WriteFile((HANDLE)j->wr, j->pl + j->pl_off, (DWORD)n, &wrote, NULL) || wrote == 0) {
-            *err = "failed to send payload to worker";
-            job_close_wr(j);
-            return;
-        }
-#else
         ssize_t wrote = write(j->wfd, j->pl + j->pl_off, n);
         if (wrote < 0) {
             if (errno == EINTR) continue;
@@ -463,9 +504,9 @@ static void job_feed(bridge_job_t *j, const char **err) {
             return;
         }
         if (wrote == 0) { *err = "failed to send payload to worker"; job_close_wr(j); return; }
-#endif
         j->pl_off += (size_t)wrote;
     }
+#endif
     job_close_wr(j);        // EOF: the worker has the whole payload
 }
 

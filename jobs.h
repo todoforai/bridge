@@ -61,7 +61,6 @@ typedef struct {
     void    *wr;                  // HANDLE, payload to the worker
     void    *proc;                // HANDLE, worker process
     void    *job;                 // HANDLE, job object (kills the whole tree)
-    unsigned pipe_cap;            // payload pipe buffer size, for room checks
 #else
     int      rfd, wfd;
     int      pid;
