@@ -170,6 +170,12 @@ test-pollfix: | build
 	$(CC) -O0 -g -Wall -I. -o build/test-pollfix test/test_pollfix.c $(TEST_DEPS) -lutil
 	./build/test-pollfix
 
+# Blocked-on-stdin detection: `read` prompts and /dev/tty getpass (sudo's path).
+.PHONY: test-probe
+test-probe: | build
+	$(CC) -O0 -g -Wall -I. -o build/test-probe test/test_probe.c $(TEST_DEPS) -lutil
+	./build/test-probe
+
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
 BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c
