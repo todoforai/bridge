@@ -1,6 +1,6 @@
 // Preview relay smoke test: spins a tiny HTTP server on a random port, then
 // drives bridge_preview_handle_request() and checks the emitted chunk frames.
-//   1. unregistered port → terminal error chunk
+//   1. the daemon-side gate: only registered ports get served
 //   2. small HTML response → seq0 (status/headers) + seq1 (body, done)
 //   3. large body (100KB) → multiple chunks, reassembles byte-exact
 //   4. set-cookie headers → setCookie array, stripped from headers
@@ -137,17 +137,29 @@ int main(int argc, char **argv) {
     g_srv_port = start_server();
     char payload[512];
 
-    // 1: the allowlist gates requests. It's consulted by the caller rather
-    // than by handle_request, because the fetch runs in a worker process that
-    // never saw the registration — so this is where the check has to hold.
+    // 1: the gate the daemon applies before starting a worker. It can't live
+    // in handle_request any more — that runs in a worker process which never
+    // saw the registration — so this is the only thing standing between a
+    // backend request and an arbitrary loopback fetch.
     snprintf(payload, sizeof payload,
              "{\"requestId\":\"r1\",\"port\":%d,\"method\":\"GET\",\"path\":\"/\",\"headers\":{}}", g_srv_port);
-    assert(!bridge_preview_port_allowed(g_srv_port));
-    assert(!bridge_preview_port_allowed(g_srv_port + 1));
-    bridge_preview_allow_port(g_srv_port);
-    assert(bridge_preview_port_allowed(g_srv_port));
-    assert(!bridge_preview_port_allowed(g_srv_port + 1));
-    printf("ok 1 allowlist admits only registered ports\n");
+    {
+        char err[128];
+        assert(bridge_preview_authorize(payload, strlen(payload), err, sizeof err) != 0);
+        assert(strstr(err, "not registered"));
+
+        bridge_preview_allow_port(g_srv_port);
+        assert(bridge_preview_authorize(payload, strlen(payload), err, sizeof err) == 0);
+
+        // A different port stays refused, and a malformed one too.
+        char other[512];
+        snprintf(other, sizeof other,
+                 "{\"requestId\":\"r1\",\"port\":%d,\"method\":\"GET\",\"path\":\"/\",\"headers\":{}}",
+                 g_srv_port + 1);
+        assert(bridge_preview_authorize(other, strlen(other), err, sizeof err) != 0);
+        assert(bridge_preview_authorize("{\"requestId\":\"x\"}", 17, err, sizeof err) != 0);
+    }
+    printf("ok 1 only registered ports are authorized\n");
 
     // 2: small response
     g_srv_response_len = (size_t)snprintf(g_srv_response, sizeof g_srv_response,

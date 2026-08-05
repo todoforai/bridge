@@ -73,10 +73,24 @@ void bridge_preview_allow_port(int port) {
     g_allowed[slot].expiry_ms = now + PORT_TTL_MS;
 }
 
-int bridge_preview_port_allowed(int port) {
+static int port_allowed(int port) {
     int64_t now = ws_monotonic_ms();
     for (int i = 0; i < MAX_ALLOWED_PORTS; i++)
         if (g_allowed[i].port == port && g_allowed[i].expiry_ms > now) return 1;
+    return 0;
+}
+
+int bridge_preview_authorize(const char *payload, size_t payload_len,
+                             char *err, size_t err_cap) {
+    long port = 0;
+    if (!json_get_long(payload, payload_len, "port", &port) || port < 1 || port > 65535) {
+        snprintf(err, err_cap, "preview: invalid port");
+        return -1;
+    }
+    if (!port_allowed((int)port)) {
+        snprintf(err, err_cap, "Port %ld is not registered for preview on this device", port);
+        return -1;
+    }
     return 0;
 }
 

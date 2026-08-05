@@ -1662,15 +1662,9 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         json_get_str(payload, payload_len, "requestId", &prid, &prid_len);
         // Authorize here, not in the worker: the allowlist is registered in
         // this process and a worker starts with an empty one.
-        long pport = 0;
-        if (!json_get_long(payload, payload_len, "port", &pport) ||
-            !bridge_preview_port_allowed((int)pport)) {
-            if (prid_len) {
-                char perr[96];
-                snprintf(perr, sizeof perr,
-                         "Port %ld is not registered for preview on this device", pport);
-                send_preview_error(e, prid, prid_len, perr);
-            }
+        char perr[128];
+        if (bridge_preview_authorize(payload, payload_len, perr, sizeof perr) != 0) {
+            if (prid_len) send_preview_error(e, prid, prid_len, perr);
             return 0;
         }
         if (bridge_job_start(&e->jobs, BRIDGE_JOB_PREVIEW, payload, payload_len,
