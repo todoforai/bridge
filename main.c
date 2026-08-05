@@ -76,6 +76,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "noise.h"     // noise_random
 #include "noise_ws.h"
 #include "ws.h"
+#include "jobs.h"
 #include "preview.h"
 #include "pty.h"
 #include "subcmd.h"
@@ -297,6 +298,9 @@ typedef struct {
     int      got_close_frame;
     char     close_reason[128];
     char     err_msg[160];
+
+    // Off-loop workers (tool scan, preview fetch) — see jobs.h.
+    bridge_jobs_t jobs;
 
     session_t *sessions;     // heap, length = g_max_sessions
     uint8_t  pty_buf[BUF_SIZE];
@@ -1017,11 +1021,87 @@ static long forward_pty_output(edge_t *e, session_t *s) {
 
 // ── Command dispatch ────────────────────────────────────────────────────────
 
-// preview.c emit callback: Noise-encrypt + enqueue one chunk frame. The TX
-// queue absorbs a full 3.5MB response (~4.8MB base64 < WS_TX_MAX 8MB);
-// ws_ensure_tx_room inside noise_ws_send drains synchronously when full.
-static int preview_emit_json(void *ctx, const char *json, size_t len) {
-    return send_json((edge_t *)ctx, json, len);
+// ── Off-loop jobs ───────────────────────────────────────────────────────────
+// Bodies run in a forked child (POSIX) / worker thread (Windows) and may only
+// produce JSON via `emit` — never touch WS or Noise state. The main loop
+// forwards the frames in jobs_poll_cb below.
+
+// Backend waits 240s for the scan result; die a little earlier so a wedged
+// probe surfaces as our error rather than the backend's timeout.
+#define SCAN_JOB_TIMEOUT_MS     230000
+// preview.c bounds its own fetch at 20s; this is the outer safety net.
+#define PREVIEW_JOB_TIMEOUT_MS  30000
+
+static void scan_job_body(const char *payload, size_t payload_len,
+                          bridge_job_emit_fn emit, void *ctx) {
+    char *result = malloc(MAX_MSG);
+    if (!result) return;
+    bridge_scan_stats_t stats;
+    int n = bridge_scan_tools(payload, payload_len, result, MAX_MSG, &stats);
+    if (n > 0) {
+        // Stats are the worker's to log — it's the side that measured them.
+        fprintf(stderr, "✓ Probed CLI tools: %d installed, %d/%d authenticated (of tools with auth)\n",
+                stats.installed, stats.authenticated, stats.auth_applicable);
+        emit(ctx, result, (size_t)n);
+    }
+    free(result);
+}
+
+static void preview_job_body(const char *payload, size_t payload_len,
+                             bridge_job_emit_fn emit, void *ctx) {
+    // preview_emit_fn and bridge_job_emit_fn share a signature by design.
+    bridge_preview_handle_request(payload, payload_len, emit, ctx);
+}
+
+// Terminal preview error frame, built parent-side when a job can't even start
+// (or dies) — same shape preview.c emits for in-fetch failures.
+static void send_preview_error(edge_t *e, const char *rid, size_t rid_len,
+                               const char *message) {
+    char buf[512]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "preview:http_response_chunk", -1, 0) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, ",\"payload\":{", 12) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "requestId", rid, (long)rid_len, 0) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "seq", "0", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "done", "true", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "error", message, -1, 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}}", 2) < 0) return;
+    send_json(e, buf, u);
+}
+
+// One frame from a worker: already a complete JSON message, so Noise-encrypt
+// and enqueue as-is. The TX queue absorbs a full 3.5MB preview response
+// (~4.8MB base64 < WS_TX_MAX 8MB); ws_ensure_tx_room drains when full.
+static void jobs_frame_cb(void *ctx, const bridge_job_t *j,
+                          const char *data, size_t len) {
+    edge_t *e = ctx;
+    if (j->kind == BRIDGE_JOB_SCAN) {
+        // The scan emits the bare result object; wrap it in the RPC envelope.
+        send_function_call_result(e, j->rid, j->rid_len, j->aid, j->aid_len,
+                                  j->eid, j->eid_len, data, len);
+        return;
+    }
+    send_json(e, data, len);
+}
+
+static void jobs_done_cb(void *ctx, const bridge_job_t *j, int ok, const char *err) {
+    edge_t *e = ctx;
+    if (ok) return;
+    if (j->kind == BRIDGE_JOB_SCAN) {
+        char msg[192];
+        snprintf(msg, sizeof msg, "scan_tools failed (%s)", err ? err : "unknown");
+        send_function_call_error(e, j->rid, j->rid_len, j->aid, j->aid_len,
+                                 j->eid, j->eid_len, msg);
+        fprintf(stderr, "CLI tool probe failed: %s\n", err ? err : "unknown");
+        return;
+    }
+    // Preview: only synthesize an error if the worker never got to send its
+    // own terminal frame — otherwise the backend would see a second `done`.
+    if (j->frames == 0 && j->rid_len) {
+        char msg[192];
+        snprintf(msg, sizeof msg, "preview: fetch failed (%s)", err ? err : "unknown");
+        send_preview_error(e, j->rid, j->rid_len, msg);
+    }
 }
 
 static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
@@ -1381,26 +1461,22 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                                          "scan_tools: malformed args.entries");
                 return 0;
             }
-
-            char *result = malloc(MAX_MSG);
-            if (!result) {
+            // The scan shells out to ~57 tools (seconds of wall time), so it
+            // runs off-loop; the result comes back through jobs_poll. One at a
+            // time: the backend only ever scans on connect or explicit request.
+            if (bridge_jobs_count(&e->jobs, BRIDGE_JOB_SCAN) > 0) {
                 free(buf);
-                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, "out of memory");
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                         "scan_tools already running");
                 return 0;
             }
-            bridge_scan_stats_t stats;
-            int n = bridge_scan_tools(buf, entries_len, result, MAX_MSG, &stats);
+            int started = bridge_job_start(&e->jobs, BRIDGE_JOB_SCAN, buf, entries_len,
+                                           scan_job_body, monotonic_ms(), SCAN_JOB_TIMEOUT_MS,
+                                           req, req_len, aid, aid_len, eid, eid_len);
             free(buf);
-            if (n > 0) {
-                send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)n);
-                fprintf(stderr, "✓ Probed CLI tools: %d installed, %d/%d authenticated (of tools with auth)\n",
-                        stats.installed, stats.authenticated, stats.auth_applicable);
-            } else {
+            if (started != 0)
                 send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
-                                         "scan_tools failed (overflow or empty catalog)");
-                fprintf(stderr, "CLI tool probe failed (overflow or empty)\n");
-            }
-            free(result);
+                                         "scan_tools: failed to start worker");
         } else if (fn_len == 14 && memcmp(fn, "write_file_b64", 14) == 0) {
             // args: {path, dataB64, offset?: N|-1, truncate?: bool}
             //   offset = 0 / omitted → write from start (truncate default=true)
@@ -1561,7 +1637,14 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len))
             return send_error(e, NULL, 0, NULL, 0, "MISSING_PAYLOAD",
                               "preview:http_request requires payload object");
-        bridge_preview_handle_request(payload, payload_len, preview_emit_json, e);
+        // The fetch blocks on a local socket for up to 20s, so it runs
+        // off-loop and its chunk frames are forwarded from jobs_poll.
+        const char *prid = NULL; size_t prid_len = 0;
+        json_get_str(payload, payload_len, "requestId", &prid, &prid_len);
+        if (bridge_job_start(&e->jobs, BRIDGE_JOB_PREVIEW, payload, payload_len,
+                             preview_job_body, monotonic_ms(), PREVIEW_JOB_TIMEOUT_MS,
+                             prid, prid_len, NULL, 0, NULL, 0) != 0 && prid_len)
+            send_preview_error(e, prid, prid_len, "preview: too many concurrent requests");
     }
 
     #undef IS
@@ -1822,6 +1905,9 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                 fprintf(stderr, "✓ Authenticated\n");
         }
         service_sessions(e);
+        // Forward anything the off-loop workers produced (tool scan results,
+        // preview chunks). Never blocks; sending stays on this thread.
+        bridge_jobs_poll(&e->jobs, monotonic_ms(), jobs_frame_cb, jobs_done_cb, e);
         // Liveness watchdog: catch a half-open socket the kernel never EOFs
         // (e.g. surviving a hibernation, where last_recv_ms suddenly looks far
         // in the past on wake). PING after WS_PING_IDLE_MS, presume dead after
@@ -1835,6 +1921,8 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         if (ws_want_write(&e->ws) && ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
     }
     free(pfds);
+    // Workers outlive nothing: their requestIds die with this connection.
+    bridge_jobs_shutdown(&e->jobs);
     ws_close(&e->ws);
     noise_ws_wipe(&e->noise);
     return e->rc;
