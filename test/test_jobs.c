@@ -12,6 +12,8 @@
 #include "../jobs.h"
 
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,8 +173,22 @@ static int start(bridge_jobs_t *jobs, int kind, const char *pl, size_t pl_len,
                             rid, strlen(rid), NULL, 0, NULL, 0);
 }
 
+// Child half of case 13: unlink our own binary, then run a job anyway.
+static int selfupdate_child(char **argv) {
+    reset();
+    bridge_jobs_init_self(argv[0]);
+    if (remove(argv[0]) != 0) return 2;          // the "upgrade"
+    bridge_jobs_t jobs;
+    memset(&jobs, 0, sizeof jobs);
+    if (start(&jobs, K_ECHO, "{\"after\":1}", 11, 5000, "up") != 0) return 3;
+    int64_t gap;
+    pump(&jobs, 5000, &gap);
+    return (oks == 1 && strcmp(last, "{\"after\":1}") == 0) ? 0 : 4;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "__job") == 0) return run_worker(atoi(argv[2]));
+    if (argc >= 2 && strcmp(argv[1], "__selfupdate") == 0) return selfupdate_child(argv);
     bridge_jobs_init_self(argv[0]);
 
     bridge_jobs_t jobs;
@@ -290,13 +306,51 @@ int main(int argc, char **argv) {
     // Re-exec's sharp edge: a binary that forgets to dispatch on `__job`
     // would restart its normal startup path, spawn a job, and recurse — a
     // fork bomb. The marker in the worker's environment must stop it dead.
+    // Spawned without a shell: no quoting to get wrong, and /proc/self/exe
+    // keeps meaning this binary rather than whatever /bin/sh happens to be.
     {
-        char cmd[1200];
-        snprintf(cmd, sizeof cmd,
-                 "TODOFORAI_JOB_WORKER=1 %s >/dev/null 2>&1", argv[0]);
-        int rc = system(cmd);
-        assert(WIFEXITED(rc) && WEXITSTATUS(rc) == 70);
-        printf("ok 12 undispatched worker refuses to run (exit %d)\n", WEXITSTATUS(rc));
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+            setenv("TODOFORAI_JOB_WORKER", "1", 1);
+            execl("/proc/self/exe", "test-jobs", (char *)NULL);
+            _exit(127);
+        }
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        assert(WIFEXITED(st) && WEXITSTATUS(st) == 70);
+        printf("ok 12 undispatched worker refuses to run (exit %d)\n", WEXITSTATUS(st));
+    }
+
+    // Self-update: the bridge is a long-lived daemon whose binary gets
+    // replaced under it. Spawning by resolved pathname would then exec the
+    // NEW build (or fail outright, the path having become "... (deleted)"),
+    // so a job must still start after the file it came from is gone.
+    {
+        char self[512];
+        ssize_t sn = readlink("/proc/self/exe", self, sizeof self - 1);
+        assert(sn > 0);
+        self[sn] = '\0';
+        char copy[600];
+        snprintf(copy, sizeof copy, "%s.upgrade-test", self);
+        char cp[1300];
+        snprintf(cp, sizeof cp, "cp '%s' '%s'", self, copy);
+        assert(system(cp) == 0);
+
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            // Runs as the copy, deletes itself, then proves it can still spawn.
+            execl(copy, copy, "__selfupdate", (char *)NULL);
+            _exit(127);
+        }
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        remove(copy);
+        assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        printf("ok 13 jobs still spawn after the binary is replaced\n");
     }
 
     printf("all job tests passed\n");

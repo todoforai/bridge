@@ -2,7 +2,11 @@
 // [u32 little-endian length][length bytes of JSON], then a zero-length frame
 // as the end-of-stream marker. A bare EOF without that marker means the
 // worker died mid-stream. A length above BRIDGE_JOB_FRAME_MAX means a corrupt
-// stream and fails the job. The payload travels the other way, on stdin.
+// stream and fails the job.
+//
+// The payload travels the other way on stdin, length-prefixed the same way:
+// EOF alone can't distinguish "that was all of it" from "the parent died
+// halfway", and a body must never run on half a request.
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -46,13 +50,43 @@ void bridge_jobs_init_self(const char *argv0) {
         exit(70);
     }
 #ifdef _WIN32
-    if (GetModuleFileNameA(NULL, g_self, sizeof g_self)) return;
+    DWORD n = GetModuleFileNameA(NULL, g_self, sizeof g_self);
+    // A return of exactly the buffer size means the path was truncated.
+    if (n > 0 && n < sizeof g_self) return;
+    g_self[0] = '\0';
 #else
-    ssize_t n = readlink("/proc/self/exe", g_self, sizeof g_self - 1);
-    if (n <= 0) n = readlink("/proc/curproc/file", g_self, sizeof g_self - 1);  // BSD
-    if (n > 0) { g_self[n] = '\0'; return; }
+    // The magic link itself, not its target: it keeps pointing at the running
+    // inode, so an upgrade that replaces the file mid-run still spawns THIS
+    // build rather than a newer one that may speak a different job protocol
+    // (or nothing at all, if the path now reads "... (deleted)").
+    if (access("/proc/self/exe", X_OK) == 0) {
+        snprintf(g_self, sizeof g_self, "%s", "/proc/self/exe");
+        return;
+    }
+    ssize_t n = readlink("/proc/curproc/file", g_self, sizeof g_self - 1);  // BSD
+    if (n > 0 && (size_t)n < sizeof g_self - 1) { g_self[n] = '\0'; return; }
 #endif
-    snprintf(g_self, sizeof g_self, "%s", argv0 ? argv0 : "");
+    // Fall back to argv[0]. A bare name means we were found through PATH and
+    // exec would not repeat that search, so resolve it the same way.
+    if (!argv0 || !*argv0) { g_self[0] = '\0'; return; }
+#ifndef _WIN32
+    if (!strchr(argv0, '/')) {
+        const char *path = getenv("PATH");
+        if (path) for (const char *p = path; *p; ) {
+            const char *end = strchr(p, ':');
+            size_t dlen = end ? (size_t)(end - p) : strlen(p);
+            if (dlen && dlen + strlen(argv0) + 2 < sizeof g_self) {
+                snprintf(g_self, sizeof g_self, "%.*s/%s", (int)dlen, p, argv0);
+                if (access(g_self, X_OK) == 0) return;
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+        g_self[0] = '\0';
+        return;
+    }
+#endif
+    snprintf(g_self, sizeof g_self, "%s", argv0);
 }
 
 // ── Worker side ─────────────────────────────────────────────────────────────
@@ -94,43 +128,53 @@ static int worker_emit(void *ctx, const char *data, size_t len) {
     return sink_frame(*(sink_fd_t *)ctx, data, len);
 }
 
-int bridge_job_worker_main(bridge_job_body_fn body) {
+// Read exactly n bytes or fail; a short read means the parent went away.
+static int read_exactly(sink_fd_t r, void *buf, size_t n) {
+    char *p = buf;
+    while (n) {
 #ifdef _WIN32
+        DWORD got = 0;
+        if (!ReadFile(r, p, (DWORD)n, &got, NULL) || got == 0) return -1;
+#else
+        ssize_t got = read(r, p, n);
+        if (got < 0) { if (errno == EINTR) continue; return -1; }
+        if (got == 0) return -1;
+#endif
+        p += got; n -= (size_t)got;
+    }
+    return 0;
+}
+
+int bridge_job_worker_main(bridge_job_body_fn body) {
+    // The guard has done its job by getting here, so drop it before the body
+    // runs: bodies shell out (tool probes), and every descendant would
+    // otherwise inherit a marker that makes our own binary refuse to start.
+#ifdef _WIN32
+    SetEnvironmentVariableA(JOB_DEPTH_ENV, NULL);
     sink_fd_t in  = GetStdHandle(STD_INPUT_HANDLE);
     sink_fd_t out = GetStdHandle(STD_OUTPUT_HANDLE);
 #else
+    unsetenv(JOB_DEPTH_ENV);
     sink_fd_t in = 0, out = 1;
     // The parent vanishing must surface as a failed write, not as a signal.
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    // Slurp the payload: the parent closes its end when done, so EOF is the
-    // terminator. Bounded, so a bogus stream can't exhaust memory.
-    size_t cap = 8192, len = 0;
-    char *payload = malloc(cap);
+    // Read exactly the announced payload: anything short means the parent
+    // died mid-hand-off, and running the body on a truncated request would
+    // turn a delivery failure into a plausible-looking wrong answer.
+    uint8_t hdr[4];
+    if (read_exactly(in, hdr, 4) != 0) return 1;
+    size_t want = (size_t)hdr[0] | ((size_t)hdr[1] << 8) |
+                  ((size_t)hdr[2] << 16) | ((size_t)hdr[3] << 24);
+    if (want > BRIDGE_JOB_PAYLOAD_MAX) return 1;
+
+    char *payload = malloc(want ? want : 1);
     if (!payload) return 1;
-    for (;;) {
-        if (len == cap) {
-            if (cap >= BRIDGE_JOB_PAYLOAD_MAX) { free(payload); return 1; }
-            size_t ncap = cap * 2;
-            if (ncap > BRIDGE_JOB_PAYLOAD_MAX) ncap = BRIDGE_JOB_PAYLOAD_MAX;
-            char *n = realloc(payload, ncap);
-            if (!n) { free(payload); return 1; }
-            payload = n; cap = ncap;
-        }
-#ifdef _WIN32
-        DWORD got = 0;
-        if (!ReadFile(in, payload + len, (DWORD)(cap - len), &got, NULL) || got == 0) break;
-#else
-        ssize_t got = read(in, payload + len, cap - len);
-        if (got < 0) { if (errno == EINTR) continue; break; }
-        if (got == 0) break;
-#endif
-        len += (size_t)got;
-    }
+    if (want && read_exactly(in, payload, want) != 0) { free(payload); return 1; }
 
     // Only a body that ran to completion earns the end-of-stream marker.
-    int rc = body(payload, len, worker_emit, &out);
+    int rc = body(payload, want, worker_emit, &out);
     if (rc == 0) (void)sink_frame(out, NULL, 0);
     free(payload);
     return rc == 0 ? 0 : 1;
@@ -198,27 +242,36 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
     job_set_id(j->aid, &j->aid_len, sizeof j->aid, aid, aid_len);
     job_set_id(j->eid, &j->eid_len, sizeof j->eid, eid, eid_len);
 
-    if (payload_len) {
-        j->pl = malloc(payload_len);
-        if (!j->pl) return -1;
-        memcpy(j->pl, payload, payload_len);
-        j->pl_len = payload_len;
-    }
+    // Buffer the length prefix with the payload so the feeder is one blob.
+    j->pl = malloc(4 + payload_len);
+    if (!j->pl) return -1;
+    j->pl[0] = (char)(payload_len & 0xff);
+    j->pl[1] = (char)((payload_len >> 8) & 0xff);
+    j->pl[2] = (char)((payload_len >> 16) & 0xff);
+    j->pl[3] = (char)((payload_len >> 24) & 0xff);
+    if (payload_len) memcpy(j->pl + 4, payload, payload_len);
+    j->pl_len = 4 + payload_len;
 
     char kind_s[16];
     snprintf(kind_s, sizeof kind_s, "%d", kind);
 
 #ifdef _WIN32
+    // Explicit buffer size: job_feed subtracts the bytes still queued from it
+    // to decide how much it can write without blocking.
+    #define JOB_PIPE_CAP 65536
     // Child ends inheritable, our ends not — otherwise the worker would hold
-    // its own read end open and never see EOF.
+    // its own stdin writer open and never see the payload end.
     SECURITY_ATTRIBUTES sa = { .nLength = sizeof sa, .bInheritHandle = TRUE };
     HANDLE in_rd = NULL, in_wr = NULL, out_rd = NULL, out_wr = NULL;
-    if (!CreatePipe(&in_rd, &in_wr, &sa, 0)) { free(j->pl); j->pl = NULL; return -1; }
-    if (!CreatePipe(&out_rd, &out_wr, &sa, 0)) {
-        CloseHandle(in_rd); CloseHandle(in_wr); free(j->pl); j->pl = NULL; return -1;
+    if (!CreatePipe(&in_rd, &in_wr, &sa, JOB_PIPE_CAP)) { free(j->pl); j->pl = NULL; return -1; }
+    if (!CreatePipe(&out_rd, &out_wr, &sa, JOB_PIPE_CAP) ||
+        !SetHandleInformation(in_wr,  HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(in_rd); CloseHandle(in_wr);
+        if (out_rd) CloseHandle(out_rd);
+        if (out_wr) CloseHandle(out_wr);
+        free(j->pl); j->pl = NULL; return -1;
     }
-    SetHandleInformation(in_wr,  HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
 
     char cmdline[1200];
     snprintf(cmdline, sizeof cmdline, "\"%s\" __job %s", g_self, kind_s);
@@ -228,35 +281,49 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
     si.hStdInput  = in_rd;
     si.hStdOutput = out_wr;
     si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);   // worker logs to our stderr
-    // Inherited by the worker; see JOB_DEPTH_ENV.
-    SetEnvironmentVariableA(JOB_DEPTH_ENV, "1");
 
-    // Job object: the Windows answer to a process group. Killed as one tree,
-    // which is what makes a wedged worker cancellable at all.
+    // Job object: the Windows answer to a process group, and the only thing
+    // that makes a wedged worker killable. Without it we'd be back to the
+    // detached-thread behaviour this whole change exists to remove, so a
+    // failure to set one up fails the spawn.
     HANDLE wjob = CreateJobObjectA(NULL, NULL);
-    if (wjob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(wjob, JobObjectExtendedLimitInformation, &jeli, sizeof jeli);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!wjob || !SetInformationJobObject(wjob, JobObjectExtendedLimitInformation,
+                                          &jeli, sizeof jeli)) {
+        if (wjob) CloseHandle(wjob);
+        CloseHandle(in_rd); CloseHandle(in_wr);
+        CloseHandle(out_rd); CloseHandle(out_wr);
+        free(j->pl); j->pl = NULL; return -1;
     }
 
+    // Inherited by the worker; see JOB_DEPTH_ENV. Restored on every path
+    // below, so a failed spawn can't leave the daemon marked as a worker.
+    SetEnvironmentVariableA(JOB_DEPTH_ENV, "1");
     PROCESS_INFORMATION pi = {0};
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
                              CREATE_SUSPENDED | CREATE_NO_WINDOW,
                              NULL, NULL, &si, &pi);
+    SetEnvironmentVariableA(JOB_DEPTH_ENV, NULL);
     CloseHandle(in_rd); CloseHandle(out_wr);        // child owns its ends now
     if (!ok) {
-        if (wjob) CloseHandle(wjob);
+        CloseHandle(wjob);
         CloseHandle(in_wr); CloseHandle(out_rd);
         free(j->pl); j->pl = NULL;
         return -1;
     }
-    SetEnvironmentVariableA(JOB_DEPTH_ENV, NULL);     // ours again
-    if (wjob && !AssignProcessToJobObject(wjob, pi.hProcess)) { CloseHandle(wjob); wjob = NULL; }
-    ResumeThread(pi.hThread);
+    // Suspended until it's in the job, so it cannot spawn anything outside it.
+    if (!AssignProcessToJobObject(wjob, pi.hProcess) || ResumeThread(pi.hThread) == (DWORD)-1) {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(wjob);
+        CloseHandle(in_wr); CloseHandle(out_rd);
+        free(j->pl); j->pl = NULL;
+        return -1;
+    }
     CloseHandle(pi.hThread);
 
     j->rd = out_rd; j->wr = in_wr; j->proc = pi.hProcess; j->job = wjob;
+    j->pipe_cap = JOB_PIPE_CAP;
 #else
     int in_fds[2], out_fds[2];
     if (pipe(in_fds) != 0) { free(j->pl); j->pl = NULL; return -1; }
@@ -305,17 +372,35 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
     if (pid == 0) {
         // Nothing here may allocate or take a lock: exec is immediate, and the
         // only state that matters is the three descriptors.
-        dup2(in_fds[0], 0);
-        dup2(out_fds[1], 1);
-        close(in_fds[0]); close(in_fds[1]);
-        close(out_fds[0]); close(out_fds[1]);
-        setpgid(0, 0);              // own group, so cancel can sweep the tree
+        // The guards matter when stdin/stdout were closed before the spawn, in
+        // which case a pipe end can *be* fd 0 or 1 and the close would undo
+        // the dup2 we just did.
+        // (-Wanalyzer-fd-leak fires on these paths; every one of them ends in
+        // _exit, which takes the descriptors with it.)
+        if (dup2(in_fds[0], 0) < 0) _exit(127);
+        if (dup2(out_fds[1], 1) < 0) _exit(127);
+        if (in_fds[0]  > 1) close(in_fds[0]);
+        if (in_fds[1]  > 1) close(in_fds[1]);
+        if (out_fds[0] > 1) close(out_fds[0]);
+        if (out_fds[1] > 1) close(out_fds[1]);
+        // Own group, so cancellation can sweep the probes the worker spawns.
+        // Without it a wedged tool probe would survive the job's death.
+        if (setpgid(0, 0) != 0) _exit(127);
         execle(g_self, g_self, "__job", kind_s, (char *)NULL, child_env);
         _exit(127);
     }
     free(child_env);
     close(in_fds[0]); close(out_fds[1]);
-    setpgid(pid, pid);              // race-free: both sides do it
+    // Both sides call it so the group exists whoever wins the race; ESRCH
+    // just means the child got there first (or already exited).
+    if (setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH) {
+        // No group means job_close couldn't sweep the tree — don't pretend.
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        close(in_fds[1]); close(out_fds[0]);
+        free(j->pl); j->pl = NULL;
+        return -1;
+    }
     j->rfd = out_fds[0];
     j->wfd = in_fds[1];
     j->pid = pid;
@@ -326,9 +411,19 @@ int bridge_job_start(bridge_jobs_t *p, int kind,
     return 0;
 }
 
-// Push what fits of the payload without blocking, then close the write end so
-// the worker sees EOF and starts working.
-static void job_feed(bridge_job_t *j) {
+static void job_close_wr(bridge_job_t *j) {
+#ifdef _WIN32
+    if (j->wr) { CloseHandle((HANDLE)j->wr); j->wr = NULL; }
+#else
+    if (j->wfd >= 0) { close(j->wfd); j->wfd = -1; }
+#endif
+    free(j->pl); j->pl = NULL;
+}
+
+// Push as much of the payload as the pipe takes right now, never blocking.
+// Sets *err if the hand-off failed: the worker would otherwise be left
+// waiting for bytes that will never arrive, until its deadline.
+static void job_feed(bridge_job_t *j, const char **err) {
 #ifdef _WIN32
     if (!j->wr) return;
 #else
@@ -338,27 +433,40 @@ static void job_feed(bridge_job_t *j) {
         size_t n = j->pl_len - j->pl_off;
         if (n > 8192) n = 8192;
 #ifdef _WIN32
-        // A pipe write can still block once the buffer fills; keep chunks
-        // small and stop as soon as the worker stops draining.
+        // Anonymous pipes have no non-blocking mode, so ask first: only write
+        // what provably fits, or the loop would park here (which is the one
+        // thing this module exists to prevent).
+        DWORD avail = 0;
+        if (!PeekNamedPipe((HANDLE)j->wr, NULL, 0, NULL, &avail, NULL)) {
+            // Peek on a write handle reports the pipe's state, not readable
+            // bytes; a failure means the pipe is gone.
+            *err = "failed to send payload to worker";
+            job_close_wr(j);
+            return;
+        }
+        DWORD room = j->pipe_cap > avail ? j->pipe_cap - avail : 0;
+        if (room == 0) return;                  // full — retry next tick
+        if (n > room) n = room;
         DWORD wrote = 0;
-        if (!WriteFile((HANDLE)j->wr, j->pl + j->pl_off, (DWORD)n, &wrote, NULL) || wrote == 0) break;
+        if (!WriteFile((HANDLE)j->wr, j->pl + j->pl_off, (DWORD)n, &wrote, NULL) || wrote == 0) {
+            *err = "failed to send payload to worker";
+            job_close_wr(j);
+            return;
+        }
 #else
         ssize_t wrote = write(j->wfd, j->pl + j->pl_off, n);
         if (wrote < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;   // retry next tick
-            break;                                                 // worker gone
+            *err = "failed to send payload to worker";
+            job_close_wr(j);
+            return;
         }
-        if (wrote == 0) break;
+        if (wrote == 0) { *err = "failed to send payload to worker"; job_close_wr(j); return; }
 #endif
         j->pl_off += (size_t)wrote;
     }
-#ifdef _WIN32
-    CloseHandle((HANDLE)j->wr); j->wr = NULL;
-#else
-    close(j->wfd); j->wfd = -1;
-#endif
-    free(j->pl); j->pl = NULL;
+    job_close_wr(j);        // EOF: the worker has the whole payload
 }
 
 // Parse as many complete frames as `acc` holds, handing each to on_frame.
@@ -411,11 +519,10 @@ void bridge_jobs_poll(bridge_jobs_t *p, int64_t now_ms,
         bridge_job_t *j = &p->slots[i];
         if (!j->active) continue;
 
-        job_feed(j);
-
         int eof = 0;
         const char *err = NULL;
         size_t drained = 0;
+        job_feed(j, &err);
         // Parse as we go: bounded reassembly means complete frames must leave
         // the buffer before the next read can refill it.
         while (drained < BRIDGE_JOB_DRAIN_MAX && !err) {
