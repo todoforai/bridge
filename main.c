@@ -231,6 +231,14 @@ typedef struct {
     char agent_settings_id[BLOCK_ID_CAP + 1];
     size_t agent_settings_id_len;
 
+    // Tab that started this TODO's run, and its kind hint. Exported as
+    // TODOFORAI_FRONTEND_ID / _KIND so tfa-surface has a default target.
+    // Same semantics as the two above: absent ⇒ keep, empty ⇒ clear.
+    char frontend_id[BLOCK_ID_CAP + 1];
+    size_t frontend_id_len;
+    char frontend_kind[BLOCK_ID_CAP + 1];
+    size_t frontend_kind_len;
+
     // RUN state machine ----------------------------------------------------
     // PTY echo is disabled at spawn, so the wrapper command line never
     // appears in OUTPUT and the sentinel scan is unambiguous.
@@ -1204,6 +1212,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->todo_id[0] = '\0';
             s->agent_settings_id_len = 0;
             s->agent_settings_id[0] = '\0';
+            s->frontend_id_len = 0;
+            s->frontend_id[0] = '\0';
+            s->frontend_kind_len = 0;
+            s->frontend_kind[0] = '\0';
             s->last_active_ms = monotonic_ms();
             s->one_shot = 1;
             created = 1;
@@ -1253,6 +1265,30 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->agent_settings_id_len = uasi_len;
         }
 
+        // Per-RUN frontend target (tfa-surface). Same validation/semantics.
+        const char *ufid = NULL; size_t ufid_len = 0;
+        if (json_get_str(msg, msg_len, "frontendId", &ufid, &ufid_len)) {
+            if (ufid_len > 0 && !is_valid_id(ufid, ufid_len)) {
+                free(cmd); RUN_FAIL_CLEANUP();
+                return send_error(e, NULL, 0, bid, bid_len, "INVALID_FRONTEND_ID",
+                                  "frontendId must be 1-64 chars of [A-Za-z0-9_.-]");
+            }
+            memcpy(s->frontend_id, ufid, ufid_len);
+            s->frontend_id[ufid_len] = '\0';
+            s->frontend_id_len = ufid_len;
+        }
+        const char *ufk = NULL; size_t ufk_len = 0;
+        if (json_get_str(msg, msg_len, "frontendKind", &ufk, &ufk_len)) {
+            if (ufk_len > 0 && !is_valid_id(ufk, ufk_len)) {
+                free(cmd); RUN_FAIL_CLEANUP();
+                return send_error(e, NULL, 0, bid, bid_len, "INVALID_FRONTEND_KIND",
+                                  "frontendKind must be 1-64 chars of [A-Za-z0-9_.-]");
+            }
+            memcpy(s->frontend_kind, ufk, ufk_len);
+            s->frontend_kind[ufk_len] = '\0';
+            s->frontend_kind_len = ufk_len;
+        }
+
         // Stash per-step routing on the session.
         size_t bn = bid_len < BLOCK_ID_CAP ? bid_len : BLOCK_ID_CAP;
         memcpy(s->run_block_id, bid, bn);
@@ -1274,6 +1310,21 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         json_get_str(msg, msg_len, "output", &omode, &omode_len);
         ob_resolve(&s->ob, omode, omode_len);
 
+        // The tfa-surface target is per-RUN state, and a persistent PTY keeps
+        // whatever a previous run exported — so this is a statement of its own
+        // that always runs: export the current target, or unset a stale one.
+        char fenv[2 * (BLOCK_ID_CAP + 1) + 96];
+        if (s->frontend_id[0]) {
+            if (s->frontend_kind[0])
+                snprintf(fenv, sizeof fenv, "; export TODOFORAI_FRONTEND_ID=%s TODOFORAI_FRONTEND_KIND=%s",
+                         s->frontend_id, s->frontend_kind);
+            else
+                snprintf(fenv, sizeof fenv, "; export TODOFORAI_FRONTEND_ID=%s; unset TODOFORAI_FRONTEND_KIND",
+                         s->frontend_id);
+        } else {
+            snprintf(fenv, sizeof fenv, "; unset TODOFORAI_FRONTEND_ID TODOFORAI_FRONTEND_KIND");
+        }
+
         // Wrap cmd in a brace group to capture $? and emit the per-step
         // sentinel. Assumes syntactically complete shell input; background
         // jobs (cmd &) make the sentinel fire at *launch*. Prefix `export`
@@ -1282,7 +1333,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // api_url are all validated charset-safe.
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
-                             + 2 * sizeof(s->todo_id) + sizeof(e->api_url) + 320;
+                             + 2 * sizeof(s->todo_id) + sizeof(e->api_url)
+                             + sizeof(fenv) + 320;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
@@ -1291,21 +1343,23 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
-                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
                 s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
                 s->todo_id[0] ? s->todo_id : "",
                 s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
+                fenv,
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
-                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
+                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s%s; "
                 "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
                 s->todo_id[0] ? s->todo_id : "",
                 s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
+                fenv,
                 (int)cmd_len, cmd, s->sentinel);
         }
         free(cmd);
