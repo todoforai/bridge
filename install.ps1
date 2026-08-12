@@ -56,14 +56,35 @@ $asset = "todoforai-bridge-windows-$arch.exe"
 
 # ── resolve release tag (default: latest) ───────────────────────────────────
 if (-not $Tag) {
-    # Resolve latest via the github.com redirect (not the rate-limited api.github.com):
-    # /releases/latest → 302 → /releases/tag/<TAG>
+    # Resolve latest via the github.com redirect (not the rate-limited
+    # api.github.com, which 403s after 60 req/hr per IP):
+    #   /releases/latest → 302 → /releases/tag/<TAG>
+    # HttpWebRequest with AllowAutoRedirect=$false returns the 302 as a normal
+    # response on both Windows PowerShell 5.1 and PowerShell 7. (Invoke-WebRequest
+    # -MaximumRedirection 0 instead *throws* on 5.1, so it can't be used here.)
+    $location = $null
     try {
-        $resp = Invoke-WebRequest "https://github.com/$Repo/releases/latest" -MaximumRedirection 0 -ErrorAction SilentlyContinue
-        $loc = $resp.Headers.Location
-        if (-not $loc) { $loc = $resp.BaseResponse.ResponseUri.AbsoluteUri }
-        $Tag = ($loc -replace '.*/tag/', '')
-    } catch { Die "could not determine latest release (see https://github.com/$Repo/releases)" }
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $req = [Net.HttpWebRequest]::Create("https://github.com/$Repo/releases/latest")
+        $req.AllowAutoRedirect = $false
+        $req.Method = 'HEAD'
+        $req.UserAgent = 'todoforai-bridge-installer'
+        $resp = $req.GetResponse()
+        $location = $resp.Headers['Location']
+        $resp.Close()
+    } catch [Net.WebException] {
+        if ($_.Exception.Response) {
+            $location = $_.Exception.Response.Headers['Location']
+            $_.Exception.Response.Close()
+        }
+    } catch { }
+
+    # Only accept a real .../releases/tag/<TAG> redirect; anything else (error
+    # page, login interstitial) must not be mistaken for a version string.
+    $expected = "https://github.com/$Repo/releases/tag/"
+    if ($location -and $location.StartsWith($expected)) {
+        $Tag = $location.Substring($expected.Length)
+    }
     if (-not $Tag) { Die "could not determine latest release (see https://github.com/$Repo/releases)" }
 }
 $url    = "https://github.com/$Repo/releases/download/$Tag/$asset"

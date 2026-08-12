@@ -73,15 +73,23 @@ fi
 
 # ── resolve release tag (default: latest) ──────────────────────────────────
 if [ -z "$TAG" ]; then
-    # Resolve latest via the github.com redirect (not the rate-limited api.github.com):
-    # /releases/latest → 302 → /releases/tag/<TAG>
+    # Resolve latest via the github.com redirect (not the rate-limited
+    # api.github.com, which 403s after 60 req/hr per IP):
+    #   /releases/latest → 302 → /releases/tag/<TAG>
     latest_url="https://github.com/$REPO/releases/latest"
+    tag_prefix="https://github.com/$REPO/releases/tag/"
     if command -v curl >/dev/null 2>&1; then
-        TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null | sed 's#.*/tag/##')
+        resolved=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null)
     else
-        TAG=$(wget -qS --max-redirect=0 "$latest_url" -O /dev/null 2>&1 \
-            | sed -n 's#.*[Ll]ocation: .*/tag/##p' | tr -d '\r')
+        resolved=$(wget -qS --max-redirect=0 "$latest_url" -O /dev/null 2>&1 \
+            | sed -n 's#^[[:space:]]*[Ll]ocation:[[:space:]]*##p' | tr -d '\r' | head -n1)
     fi
+    # Only accept a real .../releases/tag/<TAG> URL, so an error page or login
+    # interstitial can't be mistaken for a version string.
+    case "$resolved" in
+        "$tag_prefix"?*) TAG=${resolved#"$tag_prefix"} ;;
+        *) TAG="" ;;
+    esac
     [ -z "$TAG" ] && die "could not determine latest release (see https://github.com/$REPO/releases)"
 fi
 url="https://github.com/$REPO/releases/download/$TAG/$asset"
