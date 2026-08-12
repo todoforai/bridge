@@ -239,6 +239,12 @@ typedef struct {
     char frontend_kind[BLOCK_ID_CAP + 1];
     size_t frontend_kind_len;
 
+    // Group tag of the calling TODO. Exported as TODOFORAI_GROUP_ID so a
+    // todoforai-cli child inherits the parent's group. Same set/clear
+    // semantics as agent_settings_id.
+    char group_tag[BLOCK_ID_CAP + 1];
+    size_t group_tag_len;
+
     // RUN state machine ----------------------------------------------------
     // PTY echo is disabled at spawn, so the wrapper command line never
     // appears in OUTPUT and the sentinel scan is unambiguous.
@@ -1216,6 +1222,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->frontend_id[0] = '\0';
             s->frontend_kind_len = 0;
             s->frontend_kind[0] = '\0';
+            s->group_tag_len = 0;
+            s->group_tag[0] = '\0';
             s->last_active_ms = monotonic_ms();
             s->one_shot = 1;
             created = 1;
@@ -1289,6 +1297,19 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->frontend_kind_len = ufk_len;
         }
 
+        // Per-RUN group tag. Same validation/semantics as todoId.
+        const char *ugt = NULL; size_t ugt_len = 0;
+        if (json_get_str(msg, msg_len, "groupTag", &ugt, &ugt_len)) {
+            if (ugt_len > 0 && !is_valid_id(ugt, ugt_len)) {
+                free(cmd); RUN_FAIL_CLEANUP();
+                return send_error(e, NULL, 0, bid, bid_len, "INVALID_GROUP_ID",
+                                  "groupTag must be 1-64 chars of [A-Za-z0-9_.-]");
+            }
+            memcpy(s->group_tag, ugt, ugt_len);
+            s->group_tag[ugt_len] = '\0';
+            s->group_tag_len = ugt_len;
+        }
+
         // Stash per-step routing on the session.
         size_t bn = bid_len < BLOCK_ID_CAP ? bid_len : BLOCK_ID_CAP;
         memcpy(s->run_block_id, bid, bn);
@@ -1333,6 +1354,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // api_url are all validated charset-safe.
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
+                             + sizeof(s->group_tag)
                              + 2 * sizeof(s->todo_id) + sizeof(e->api_url)
                              + sizeof(fenv) + 320;
         char *wrapped = malloc(wrapped_cap);
@@ -1343,10 +1365,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
-                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
+                s->group_tag[0] ? " TODOFORAI_GROUP_ID=" : "",
+                s->group_tag[0] ? s->group_tag : "",
                 s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
                 s->todo_id[0] ? s->todo_id : "",
                 s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
@@ -1354,8 +1378,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
-                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s%s; "
+                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s%s%s%s; "
                 "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                s->group_tag[0] ? " TODOFORAI_GROUP_ID=" : "",
+                s->group_tag[0] ? s->group_tag : "",
                 s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
                 s->todo_id[0] ? s->todo_id : "",
                 s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
