@@ -83,13 +83,19 @@ release-linux-arm64: | build
 # macOS: link to system libc (no static option on darwin); Xcode's clang picks the SDK.
 # _DARWIN_C_SOURCE re-enables BSD extensions (memmem, strcasestr, SIGWINCH)
 # that _POSIX_C_SOURCE otherwise hides.
+# `strip` invalidates any existing code signature, and arm64 macOS refuses to
+# exec a binary whose signature is broken — so re-apply an ad-hoc signature
+# after stripping. CI replaces this with a real Developer ID signature (which
+# must likewise be applied after strip) before notarizing.
 release-darwin-x64: | build
 	clang -target x86_64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/todoforai-bridge-darwin-x64 $(SRCS)
 	strip build/todoforai-bridge-darwin-x64 2>/dev/null || true
+	codesign --force --sign - build/todoforai-bridge-darwin-x64 2>/dev/null || true
 
 release-darwin-arm64: | build
 	clang -target arm64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/todoforai-bridge-darwin-arm64 $(SRCS)
 	strip build/todoforai-bridge-darwin-arm64 2>/dev/null || true
+	codesign --force --sign - build/todoforai-bridge-darwin-arm64 2>/dev/null || true
 
 # Windows: ConPTY backend (pty_win.c) + winsock (ws.c uses WSAPoll). zig cc
 # bundles a recent mingw-w64.

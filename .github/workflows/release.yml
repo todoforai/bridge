@@ -4,7 +4,8 @@
 #
 # Builds todoforai-bridge-{linux,darwin}-{x64,arm64} + .sha256 sidecars, then creates a
 # GitHub Release with those assets. The installer at
-# https://todofor.ai/bridge reads `releases/latest` via the public GitHub API.
+# https://todofor.ai/bridge resolves the github.com `releases/latest` redirect.
+# macOS assets are Developer ID signed + notarized (see the darwin steps below).
 
 name: release
 
@@ -50,7 +51,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.optional == true }}
-    timeout-minutes: 10
+    # Notarization is an Apple round-trip; give the macOS jobs room.
+    timeout-minutes: 45
+    # Job-level so the signing steps can gate on it in `if:` (a step's own
+    # step-level `env` is not visible to that step's `if`).
+    env:
+      CERT: ${{ secrets.APPLE_CERT_P12_BASE64 }}
     steps:
       - name: Checkout bridge
         uses: actions/checkout@v4
@@ -80,6 +86,90 @@ jobs:
       - name: Build ${{ matrix.target }}
         working-directory: bridge
         run: make ${{ matrix.make }}
+
+      # ── macOS codesign + notarize ────────────────────────────────────────
+      # Without this, Gatekeeper blocks the curl-downloaded (quarantined)
+      # binary with "Apple could not verify ... free of malware".
+      #
+      # On this repo the signing secrets must be present: a tagged release that
+      # silently shipped an unsigned darwin binary would be broken for every
+      # macOS user. Forks (which can't have the secrets) skip signing instead.
+      - name: Require signing secrets for official darwin releases
+        if: startsWith(matrix.target, 'darwin-') && github.repository == 'todoforai/bridge'
+        env:
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          missing=""
+          [ -n "$CERT" ]               || missing="$missing APPLE_CERT_P12_BASE64"
+          [ -n "$CERT_PASSWORD" ]      || missing="$missing APPLE_CERT_PASSWORD"
+          [ -n "$APPLE_ID" ]           || missing="$missing APPLE_ID"
+          [ -n "$APPLE_TEAM_ID" ]      || missing="$missing APPLE_TEAM_ID"
+          [ -n "$APPLE_APP_PASSWORD" ] || missing="$missing APPLE_APP_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::missing signing secret(s):$missing — macOS builds would be blocked by Gatekeeper" >&2
+            exit 1
+          fi
+
+      - name: Import Developer ID certificate
+        if: startsWith(matrix.target, 'darwin-') && env.CERT != ''
+        env:
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+              -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          # Let codesign use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          # Pin the exact identity by SHA-1 so codesign can't pick the wrong
+          # cert (or fail as "ambiguous") if more than one matches by name.
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+              | awk '/Developer ID Application/ {print $2; exit}')
+          [ -n "$IDENTITY" ] || { echo "::error::no Developer ID Application identity in keychain" >&2; exit 1; }
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Codesign + notarize ${{ matrix.target }}
+        if: startsWith(matrix.target, 'darwin-') && env.CERT != ''
+        working-directory: bridge/build
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          ASSET: todoforai-bridge-${{ matrix.target }}
+        run: |
+          set -eu
+          # Hardened runtime + secure timestamp are both required by notarization.
+          # NOTE: must run AFTER `strip` (the Makefile strips), since stripping
+          # invalidates an existing signature.
+          codesign --force --timestamp --options runtime \
+              --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$ASSET"
+          codesign --verify --strict --verbose=2 "$ASSET"
+
+          # A bare Mach-O executable can't be stapled, so notarize a zip of it.
+          # Gatekeeper then validates online via the signed+notarized identity.
+          ditto -c -k --keepParent "$ASSET" "$ASSET.zip"
+          xcrun notarytool submit "$ASSET.zip" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --wait --timeout 30m
+          rm -f "$ASSET.zip"
+
+          # Fail the release if the result isn't something Gatekeeper accepts.
+          codesign --display --verbose=4 "$ASSET" 2>&1 | grep -E 'Authority|TeamIdentifier|flags'
+          spctl --assess --verbose=4 --type execute "$ASSET"
 
       - name: Compute sha256
         working-directory: bridge/build
