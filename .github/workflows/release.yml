@@ -167,9 +167,11 @@ jobs:
               --wait --timeout 30m
           rm -f "$ASSET.zip"
 
-          # Fail the release if the result isn't something Gatekeeper accepts.
+          # notarytool's Accepted status above is the notarization gate. A bare
+          # Mach-O CLI is not an app bundle, so `spctl --type execute` reports
+          # "does not seem to be an app" even when the signature and
+          # notarization are valid.
           codesign --display --verbose=4 "$ASSET" 2>&1 | grep -E 'Authority|TeamIdentifier|flags'
-          spctl --assess --verbose=4 --type execute "$ASSET"
 
       - name: Compute sha256
         working-directory: bridge/build
