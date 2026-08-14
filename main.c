@@ -497,10 +497,26 @@ static session_t *evict_lru_idle(edge_t *e) {
     return victim;
 }
 
+/* Log a wire frame for BRIDGE_DEBUG_WIRE. Frames carrying a credential
+ * (auth's deviceSecret, the pushed session token) are logged as a type only —
+ * they are plaintext at this layer. */
+static void debug_wire(const char *dir, long n, const char *s) {
+    static const char *secret_keys[] = {
+        "\"secret\"", "\"token\"", "\"apiToken\"",
+        "\"authorization\"", "\"cookie\"", "\"set-cookie\"", "\"setCookie\"", "\"x-api-key\"",
+    };
+    if (!getenv("BRIDGE_DEBUG_WIRE")) return;
+    for (size_t i = 0; i < sizeof secret_keys / sizeof *secret_keys; i++)
+        if (memmem(s, (size_t)n, secret_keys[i], strlen(secret_keys[i]))) {
+            fprintf(stderr, "%s (%ld) <redacted: credential frame>\n", dir, n);
+            return;
+        }
+    fprintf(stderr, "%s (%ld) %.*s\n", dir, n, (int)(n > 512 ? 512 : n), s);
+}
+
 static int send_json(edge_t *e, const char *s, size_t n) {
     if (e->ws.closed || !e->noise.handshake_done) return -1;
-    if (getenv("BRIDGE_DEBUG_WIRE"))
-        fprintf(stderr, "→ send (%zu) %.*s\n", n, (int)(n > 512 ? 512 : n), s);
+    debug_wire("→ send", (long)n, s);
     return noise_ws_send(&e->noise, &e->ws, (const uint8_t *)s, n);
 }
 
@@ -1912,8 +1928,7 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
         e->auth_sent_ms = monotonic_ms();
         return;
     }
-    if (getenv("BRIDGE_DEBUG_WIRE"))
-        fprintf(stderr, "← recv (%ld) %.*s\n", n, (int)(n > 512 ? 512 : n), (const char *)e->msg_buf);
+    debug_wire("← recv", n, (const char *)e->msg_buf);
     handle_command(e, (const char *)e->msg_buf, (size_t)n);
 }
 
