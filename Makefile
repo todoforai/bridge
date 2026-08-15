@@ -170,6 +170,18 @@ test-coalesce: | build
 	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-coalesce
 
+# Per-RUN env exported into the PTY: the chat message/block pair is always
+# export-or-unset (never inherited across steps of a persistent shell), while
+# todoId/groupTag stay session-scoped. Includes main.c with the Noise send
+# shimmed (no network).
+.PHONY: test-runenv
+test-runenv: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
+	    test/test_runenv.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c jobs.c \
+	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-runenv
+
 # A/B proof of the poll-loop fix: PTY fd out of vs in the pollset (50ms → ~1ms).
 .PHONY: test-pollfix
 test-pollfix: | build

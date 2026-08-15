@@ -1244,70 +1244,65 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (created && s->active) { bridge_pty_close(&s->pty); s->active = 0; s->state = SESS_IDLE; } \
         } while (0)
 
-        // Update opaque echo label from this RUN. Validated charset (same as
-        // blockId) so it's safe to interpolate raw with %s. Absent ⇒ keep the
-        // existing value; explicit "" ⇒ clear.
-        const char *utid = NULL; size_t utid_len = 0;
-        if (json_get_str(msg, msg_len, "todoId", &utid, &utid_len)) {
-            if (utid_len > 0 && !is_valid_id(utid, utid_len)) {
-                free(cmd); RUN_FAIL_CLEANUP();
-                return send_error(e, NULL, 0, bid, bid_len, "INVALID_TODO_ID",
-                                  "todoId must be 1-64 chars of [A-Za-z0-9_.-]");
-            }
-            memcpy(s->todo_id, utid, utid_len);
-            s->todo_id[utid_len] = '\0';
-            s->todo_id_len = utid_len;
-        }
+        // Per-RUN ids, all sharing blockId's charset so they can be
+        // interpolated raw into the wrapper with %s. Parsed and validated
+        // into locals FIRST: a later field failing validation must not leave
+        // an earlier one committed to the session.
+        //
+        // Absent ⇒ present=0 (keep the session's value); explicit "" ⇒
+        // present with len 0 (clear it).
+        struct run_id { const char *p; size_t len; int present; };
+        struct run_id todo = {0}, agent = {0}, fid = {0}, fkind = {0}, grp = {0},
+                      cmsg = {0}, cblk = {0};
 
-        // Per-RUN agent settings id. Same validation/semantics as todoId:
-        // absent ⇒ keep existing, empty ⇒ clear.
-        const char *uasi = NULL; size_t uasi_len = 0;
-        if (json_get_str(msg, msg_len, "agentSettingsId", &uasi, &uasi_len)) {
-            if (uasi_len > 0 && !is_valid_id(uasi, uasi_len)) {
-                free(cmd); RUN_FAIL_CLEANUP();
-                return send_error(e, NULL, 0, bid, bid_len, "INVALID_AGENT_ID",
-                                  "agentSettingsId must be 1-64 chars of [A-Za-z0-9_.-]");
-            }
-            memcpy(s->agent_settings_id, uasi, uasi_len);
-            s->agent_settings_id[uasi_len] = '\0';
-            s->agent_settings_id_len = uasi_len;
-        }
+        #define RUN_ID(dst, key, code, what) do { \
+            (dst).present = json_get_str(msg, msg_len, key, &(dst).p, &(dst).len); \
+            if ((dst).present && (dst).len > 0 && !is_valid_id((dst).p, (dst).len)) { \
+                free(cmd); RUN_FAIL_CLEANUP(); \
+                return send_error(e, NULL, 0, bid, bid_len, code, \
+                                  what " must be 1-64 chars of [A-Za-z0-9_.-]"); \
+            } \
+        } while (0)
 
-        // Per-RUN frontend target (tfa-surface). Same validation/semantics.
-        const char *ufid = NULL; size_t ufid_len = 0;
-        if (json_get_str(msg, msg_len, "frontendId", &ufid, &ufid_len)) {
-            if (ufid_len > 0 && !is_valid_id(ufid, ufid_len)) {
-                free(cmd); RUN_FAIL_CLEANUP();
-                return send_error(e, NULL, 0, bid, bid_len, "INVALID_FRONTEND_ID",
-                                  "frontendId must be 1-64 chars of [A-Za-z0-9_.-]");
-            }
-            memcpy(s->frontend_id, ufid, ufid_len);
-            s->frontend_id[ufid_len] = '\0';
-            s->frontend_id_len = ufid_len;
-        }
-        const char *ufk = NULL; size_t ufk_len = 0;
-        if (json_get_str(msg, msg_len, "frontendKind", &ufk, &ufk_len)) {
-            if (ufk_len > 0 && !is_valid_id(ufk, ufk_len)) {
-                free(cmd); RUN_FAIL_CLEANUP();
-                return send_error(e, NULL, 0, bid, bid_len, "INVALID_FRONTEND_KIND",
-                                  "frontendKind must be 1-64 chars of [A-Za-z0-9_.-]");
-            }
-            memcpy(s->frontend_kind, ufk, ufk_len);
-            s->frontend_kind[ufk_len] = '\0';
-            s->frontend_kind_len = ufk_len;
-        }
+        RUN_ID(todo,  "todoId",          "INVALID_TODO_ID",       "todoId");
+        RUN_ID(agent, "agentSettingsId", "INVALID_AGENT_ID",      "agentSettingsId");
+        RUN_ID(fid,   "frontendId",      "INVALID_FRONTEND_ID",   "frontendId");
+        RUN_ID(fkind, "frontendKind",    "INVALID_FRONTEND_KIND", "frontendKind");
+        RUN_ID(grp,   "groupTag",        "INVALID_GROUP_ID",      "groupTag");
+        RUN_ID(cmsg,  "chatMessageId",   "INVALID_MESSAGE_ID",    "chatMessageId");
+        RUN_ID(cblk,  "chatBlockId",     "INVALID_CHAT_BLOCK_ID", "chatBlockId");
+        #undef RUN_ID
 
-        // Per-RUN group tag. Same validation/semantics as todoId.
-        const char *ugt = NULL; size_t ugt_len = 0;
-        if (json_get_str(msg, msg_len, "groupTag", &ugt, &ugt_len)) {
-            if (ugt_len > 0 && !is_valid_id(ugt, ugt_len)) {
-                free(cmd); RUN_FAIL_CLEANUP();
-                return send_error(e, NULL, 0, bid, bid_len, "INVALID_GROUP_ID",
-                                  "groupTag must be 1-64 chars of [A-Za-z0-9_.-]");
-            }
-            memcpy(s->group_tag, ugt, ugt_len);
-            s->group_tag[ugt_len] = '\0';
-            s->group_tag_len = ugt_len;
+        // Validation done — commit the session-scoped ids. Exported so a
+        // tfa-* / todoforai-cli child inherits the calling TODO's identity.
+        #define RUN_ID_COMMIT(src, field) do { \
+            if ((src).present) { \
+                memcpy(s->field, (src).p, (src).len); \
+                s->field[(src).len] = '\0'; \
+                s->field##_len = (src).len; \
+            } \
+        } while (0)
+
+        RUN_ID_COMMIT(todo,  todo_id);
+        RUN_ID_COMMIT(agent, agent_settings_id);
+        RUN_ID_COMMIT(fid,   frontend_id);
+        RUN_ID_COMMIT(fkind, frontend_kind);
+        RUN_ID_COMMIT(grp,   group_tag);
+        #undef RUN_ID_COMMIT
+
+        // The chat message + bash block this step renders into (tfa-* sub-todo
+        // linking). Unlike the ids above these are NOT session state: they
+        // identify ONE chat block, so a later step on the same persistent PTY
+        // must never inherit them. Kept as locals and always emitted as
+        // export-or-unset below.
+        //
+        // Both or neither: a half-set pair links nothing, and exporting one
+        // half would pair a fresh id with a stale one in the shell.
+        char chat_message_id[BLOCK_ID_CAP + 1] = "";
+        char chat_block_id[BLOCK_ID_CAP + 1] = "";
+        if (cmsg.len > 0 && cblk.len > 0) {
+            memcpy(chat_message_id, cmsg.p, cmsg.len); chat_message_id[cmsg.len] = '\0';
+            memcpy(chat_block_id,   cblk.p, cblk.len); chat_block_id[cblk.len]   = '\0';
         }
 
         // Stash per-step routing on the session.
@@ -1346,6 +1341,40 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             snprintf(fenv, sizeof fenv, "; unset TODOFORAI_FRONTEND_ID TODOFORAI_FRONTEND_KIND");
         }
 
+        // Same reasoning for the chat message/block pair: always a statement of
+        // its own, so a persistent PTY can't leak the previous step's block into
+        // a tfa-* child that would then link its sub-todo to the wrong block.
+        char cenv[2 * (BLOCK_ID_CAP + 1) + 96];
+        if (chat_message_id[0])
+            snprintf(cenv, sizeof cenv, "; export TODOFORAI_MESSAGE_ID=%s TODOFORAI_BLOCK_ID=%s",
+                     chat_message_id, chat_block_id);
+        else
+            snprintf(cenv, sizeof cenv, "; unset TODOFORAI_MESSAGE_ID TODOFORAI_BLOCK_ID");
+
+        // Session ids as ` KEY=value` export fragments, skipped when unset.
+        // All are is_valid_id-validated, so they interpolate raw. Built once
+        // and shared by both wrapper branches below. TODOFORAI_TODO_ID doubles
+        // as the per-todo agent-browser session so parallel todos get isolated
+        // sockets. Unlike fenv/cenv these keep the old "absent ⇒ leave whatever
+        // the persistent shell has" behaviour.
+        char idenv[3 * (BLOCK_ID_CAP + 48)];
+        {
+            size_t n = 0;
+            #define ID_APPEND(key, val) do { \
+                if ((val)[0]) { \
+                    int r = snprintf(idenv + n, sizeof idenv - n, " %s=%s", (key), (val)); \
+                    if (r < 0 || (size_t)r >= sizeof idenv - n) { free(cmd); RUN_FAIL_CLEANUP(); \
+                        return send_error(e, NULL, 0, bid, bid_len, "INTERNAL", "id env too large"); } \
+                    n += (size_t)r; \
+                } \
+            } while (0)
+            idenv[0] = '\0';
+            ID_APPEND("TODOFORAI_GROUP_ID", s->group_tag);
+            ID_APPEND("TODOFORAI_TODO_ID", s->todo_id);
+            ID_APPEND("AGENT_BROWSER_SESSION", s->todo_id);
+            #undef ID_APPEND
+        }
+
         // Wrap cmd in a brace group to capture $? and emit the per-step
         // sentinel. Assumes syntactically complete shell input; background
         // jobs (cmd &) make the sentinel fire at *launch*. Prefix `export`
@@ -1354,38 +1383,27 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // api_url are all validated charset-safe.
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
-                             + sizeof(s->group_tag)
-                             + 2 * sizeof(s->todo_id) + sizeof(e->api_url)
-                             + sizeof(fenv) + 320;
+                             + sizeof(idenv) + sizeof(e->api_url)
+                             + sizeof(fenv) + sizeof(cenv) + 320;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
-        // TODOFORAI_TODO_ID doubles as the per-todo agent-browser session so
-        // parallel todos get isolated sockets (emit the id once, alias it).
         if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
-                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
-                s->group_tag[0] ? " TODOFORAI_GROUP_ID=" : "",
-                s->group_tag[0] ? s->group_tag : "",
-                s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
-                s->todo_id[0] ? s->todo_id : "",
-                s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
-                fenv,
+                idenv,
+                fenv, cenv,
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
-                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s%s%s%s; "
+                "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
                 "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
-                s->group_tag[0] ? " TODOFORAI_GROUP_ID=" : "",
-                s->group_tag[0] ? s->group_tag : "",
-                s->todo_id[0] ? " TODOFORAI_TODO_ID=" : "",
-                s->todo_id[0] ? s->todo_id : "",
-                s->todo_id[0] ? "; export AGENT_BROWSER_SESSION=$TODOFORAI_TODO_ID" : "",
-                fenv,
+                idenv,
+                fenv, cenv,
                 (int)cmd_len, cmd, s->sentinel);
         }
         free(cmd);
