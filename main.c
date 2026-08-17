@@ -1310,7 +1310,13 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 struct stat st;
                 if (stat(cwd_buf, &st) != 0 || !S_ISDIR(st.st_mode)) {
                     free(cmd);
-                    return send_error(e, NULL, 0, bid, bid_len, "INVALID_CWD", "cwd does not exist or is not a directory");
+                    // Name the offending path: this is almost always a
+                    // misconfigured workspace path, so make it self-diagnosing.
+                    char em[512];
+                    snprintf(em, sizeof em,
+                             "configured workspace path does not exist on this machine: %s"
+                             " — fix the workspace path in agent settings", cwd_buf);
+                    return send_error(e, NULL, 0, bid, bid_len, "INVALID_CWD", em);
                 }
             }
             // No cwd from agent → fall back to <tmpdir>/todoforai (mirrors edge),
