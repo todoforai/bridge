@@ -251,6 +251,19 @@ typedef struct {
     char group_tag[BLOCK_ID_CAP + 1];
     size_t group_tag_len;
 
+    // Spawn-time init drain ------------------------------------------------
+    // POSIX disables PTY echo via termios and blanks PS1/PS2 in the child's
+    // env, but ConPTY has no host-side ECHO toggle and Git Bash rc files
+    // re-set a prompt — so on Windows the prompt + echoed wrapper would leak
+    // into OUTPUT. Fix (platform-neutral): right after spawn an init line
+    // (`stty -echo; PS1=; PS2=; printf '\n<ready>\n'`) is written to the
+    // shell, and every byte read is DROPPED until the ready sentinel's line
+    // has passed. On POSIX the init is a cheap no-op that drains silently.
+    int    draining_init;                 // 1 ⇒ discard output up to ready line
+    char   ready_sentinel[SENTINEL_CAP];  // __BRIDGE_READY_<32 hex>__
+    size_t ready_len;
+    size_t init_drained;                  // bytes dropped so far (fail-safe cap)
+
     // RUN state machine ----------------------------------------------------
     // PTY echo is disabled at spawn, so the wrapper command line never
     // appears in OUTPUT and the sentinel scan is unambiguous.
@@ -397,15 +410,30 @@ static void gen_uuid_v4(char out[37]) {
     out[o] = '\0';
 }
 
-// Generate `__BRIDGE_STEP_<32 hex>__` into out (≤ SENTINEL_CAP). Returns length.
-static size_t gen_sentinel(char *out, size_t cap) {
-    static const char prefix[] = "__BRIDGE_STEP_";
-    static const char suffix[] = "__";
+// Generate `<prefix><32 hex>__` into out (≤ SENTINEL_CAP). Returns length.
+static size_t gen_sentinel_tag(char *out, size_t cap, const char *prefix) {
     uint8_t rnd[16];
     noise_random(rnd, sizeof(rnd));
     char hex[33];
     hex_encode(hex, rnd, sizeof(rnd));
-    int n = snprintf(out, cap, "%s%s%s", prefix, hex, suffix);
+    int n = snprintf(out, cap, "%s%s__", prefix, hex);
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+// Per-step result sentinel: `__BRIDGE_STEP_<32 hex>__`.
+static size_t gen_sentinel(char *out, size_t cap) {
+    return gen_sentinel_tag(out, cap, "__BRIDGE_STEP_");
+}
+
+// Build the spawn-time echo/prompt suppression line (see draining_init in
+// session_t). The ready sentinel is split across two quoted strings
+// ('__BRIDGE_''READY_…') so the ECHOED command line never contains the
+// contiguous marker — only the printf's real output does. Returns length, or
+// 0 on overflow.
+static size_t build_init_line(char *out, size_t cap, const char *ready_sentinel) {
+    int n = snprintf(out, cap,
+        "stty -echo 2>/dev/null; PS1=; PS2=; printf '\\n__BRIDGE_''%s\\n'\n",
+        ready_sentinel + 9 /* skip "__BRIDGE_" */);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
@@ -815,6 +843,57 @@ static void tail_append(session_t *s, const uint8_t *data, size_t len) {
     s->tail_len += len;
 }
 
+// Spawn-time init drain (see draining_init in session_t): consume tail_buf,
+// dropping everything up to and past the ready sentinel's line. Returns 1
+// when the drain is over (leftover bytes stay in tail_buf for the caller),
+// 0 while still draining (tail_buf holds at most a partial candidate).
+//
+// The init line split-quotes the sentinel ('__BRIDGE_''READY_…'), so the
+// ECHOED command never contains the contiguous marker — the first full match
+// is guaranteed to be the printf's real output. The shell runs sequentially,
+// so bytes between the marker and its '\n' can only be ConPTY VT decoration;
+// they are dropped without inspection (no terminator-adjacency requirement,
+// which ConPTY's escape injection would break).
+//
+// Fail-safe: if the marker still hasn't appeared after INIT_DRAIN_MAX drained
+// bytes (shell startup failed, non-bash shell mangled the init, …), give up
+// and pass output through — bounded prompt noise beats swallowing a RUN.
+#define INIT_DRAIN_MAX (64 * 1024)
+static int init_drain_scan(session_t *s) {
+    void *m = s->tail_len >= s->ready_len
+        ? memmem(s->tail_buf, s->tail_len, s->ready_sentinel, s->ready_len)
+        : NULL;
+    if (!m) {
+        s->init_drained += s->tail_len;
+        if (s->init_drained > INIT_DRAIN_MAX) {
+            fprintf(stderr, "init drain overflow on %s — passing output through\n", s->session_id);
+            s->draining_init = 0;
+            return 1;  // keep tail_buf as ordinary output
+        }
+        // Drop all but a possible marker prefix.
+        size_t keep = s->ready_len - 1;
+        if (keep > s->tail_len) keep = s->tail_len;
+        memmove(s->tail_buf, s->tail_buf + s->tail_len - keep, keep);
+        s->tail_len = keep;
+        return 0;
+    }
+    // Marker found: drop through the first '\n' after it.
+    size_t at = (size_t)((uint8_t *)m - s->tail_buf) + s->ready_len;
+    while (at < s->tail_len && s->tail_buf[at] != '\n') at++;
+    if (at >= s->tail_len) {
+        // Newline not arrived — hold from the marker start.
+        size_t start = (size_t)((uint8_t *)m - s->tail_buf);
+        memmove(s->tail_buf, s->tail_buf + start, s->tail_len - start);
+        s->tail_len -= start;
+        return 0;
+    }
+    at++;  // past the '\n'
+    memmove(s->tail_buf, s->tail_buf + at, s->tail_len - at);
+    s->tail_len -= at;
+    s->draining_init = 0;
+    return 1;
+}
+
 // ── Output policy engine (RUN path) ─────────────────────────────────────────
 // Streams the head live (line-capped), goes silent once the head fills, rolls
 // the last `last_limit` bytes in a tail, and emits a truncation notice + tail
@@ -952,15 +1031,29 @@ static long forward_pty_output(edge_t *e, session_t *s) {
     if (n <= 0) return 0;
     s->last_active_ms = monotonic_ms();
 
+    int appended = 0;  // bytes already funneled into tail_buf by the drain
+
+    if (s->draining_init) {
+        tail_append(s, e->pty_buf, (size_t)n);
+        appended = 1;
+        if (!init_drain_scan(s)) return n;   // still draining — all bytes dropped/held
+        if (s->tail_len == 0) return n;      // drain done, nothing left over
+    }
+
     if (s->state != SESS_RUNNING) {
-        send_output_bytes(e, s, e->pty_buf, (size_t)n);
+        if (appended) {
+            send_output_bytes(e, s, s->tail_buf, s->tail_len);
+            s->tail_len = 0;
+        } else {
+            send_output_bytes(e, s, e->pty_buf, (size_t)n);
+        }
         return n;
     }
 
     // PTY echo is OFF on this session (set at spawn), so what we read is the
     // command's actual output followed by our sentinel line. Funnel through
     // tail_buf to handle a sentinel that straddles read() boundaries.
-    tail_append(s, e->pty_buf, (size_t)n);
+    if (!appended) tail_append(s, e->pty_buf, (size_t)n);
 
     ssize_t found = find_sentinel(s);
     if (found < 0) {
@@ -1226,6 +1319,24 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (bridge_pty_spawn(&s->pty, DEFAULT_SHELL, spawn_cwd, /*no_echo=*/1) != 0) {
                 free(cmd);
                 return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", "failed to spawn PTY");
+            }
+            // Echo/prompt suppression init (see draining_init in session_t).
+            // Written immediately; the RUN wrapper below queues right behind
+            // it — the shell executes lines sequentially, so no extra
+            // round-trip latency. All output up to the ready line is dropped.
+            s->ready_len = gen_sentinel_tag(s->ready_sentinel, sizeof(s->ready_sentinel), "__BRIDGE_READY_");
+            s->draining_init = s->ready_len > 0;
+            s->init_drained = 0;
+            if (s->draining_init) {
+                char init_line[SENTINEL_CAP + 96];
+                size_t in_n = build_init_line(init_line, sizeof init_line, s->ready_sentinel);
+                if (in_n == 0 ||
+                    bridge_pty_write_all(&s->pty, init_line, in_n) != 0) {
+                    // Init failed to queue — proceed without drain rather than
+                    // dropping legitimate output while waiting for a ready
+                    // line that will never come.
+                    s->draining_init = 0;
+                }
             }
             gen_uuid_v4(s->session_id);
             snprintf(s->cwd, sizeof s->cwd, "%s", spawn_cwd);

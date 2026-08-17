@@ -121,6 +121,12 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     SetEnvironmentVariableA("MANPAGER", "cat");
     SetEnvironmentVariableA("SYSTEMD_PAGER", "cat");
     SetEnvironmentVariableA("AWS_PAGER", "");
+    // Mirror pty_posix.c: keep prompts out of OUTPUT. Git Bash rc files
+    // (git-prompt.sh) may re-set PS1 — main.c's spawn-time init line
+    // (`stty -echo; PS1=; …` + ready-sentinel drain) handles that and the
+    // ConPTY input echo, which has no host-side toggle here.
+    SetEnvironmentVariableA("PS1", "");
+    SetEnvironmentVariableA("PS2", "");
 
     const char *sh = resolve_shell(shell);
     char cmdline[MAX_PATH + 32];

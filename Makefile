@@ -182,6 +182,17 @@ test-runenv: | build
 	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
+# Spawn-time init drain: with PTY echo ON (simulating ConPTY, which has no
+# host-side ECHO toggle), the echoed init/wrapper and the shell prompt must be
+# drained up to the ready sentinel and step output must stay byte-exact.
+.PHONY: test-initdrain
+test-initdrain: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-initdrain \
+	    test/test_initdrain.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c jobs.c \
+	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-initdrain
+
 # A/B proof of the poll-loop fix: PTY fd out of vs in the pollset (50ms → ~1ms).
 .PHONY: test-pollfix
 test-pollfix: | build
