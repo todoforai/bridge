@@ -340,7 +340,8 @@ void print_help(void) {
            "  login                log in this device  [--token T] [--device-name NAME]\n"
            "  logout               remove credentials\n"
            "  whoami               show current user/device\n"
-           "  enroll               print a token to provision another device\n\n"
+           "  enroll               print a token to provision another device\n"
+           "  update               install the latest release\n\n"
            "  -h, --help           show this help\n"
            "  -v, --version        print version\n\n"
            "Docs: https://docs.todofor.ai\n");

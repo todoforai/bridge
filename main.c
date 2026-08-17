@@ -87,6 +87,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "pty.h"
 #include "subcmd.h"
 #include "tools.h"
+#include "update.h"
 #include "login.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
@@ -326,6 +327,10 @@ typedef struct {
     // Bridge's HTTP API URL, exported as TODOFORAI_API_URL so child CLIs
     // route to the SAME backend that minted the token.
     char api_url[320];
+
+    // Self-update, armed by `latestBridge` on the token push. The swap waits
+    // for every PTY to go idle, so an update never kills a running command.
+    int update_pending;
 
     uint16_t close_code;
     int      got_close_frame;
@@ -1604,6 +1609,18 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             fprintf(stderr, "subagent_token: missing or invalid 'token' field; ignoring\n");
         }
 
+        // The backend rides the token push (on connect, then every 12h) with
+        // the version it wants us on. That makes rollout a server-side dial —
+        // no polling, no GitHub rate limits — and gives an always-on bridge a
+        // second chance at an update it deferred while busy.
+        char latest[64]; size_t latest_len = 0;
+        if (json_get_str_decoded(msg, msg_len, "latestBridge", latest, sizeof latest, &latest_len)
+            && bridge_update_wanted(latest) && !e->update_pending) {
+            fprintf(stderr, "update: %s available (running %s) — will install once idle\n",
+                    latest, BRIDGE_VERSION);
+            e->update_pending = 1;
+        }
+
     } else if (IS("ping")) {
         // App-level keepalive over the Noise channel. The backend can't trust
         // WS-layer PONG delivery (its `ws` lib may drop pong events on long-idle
@@ -2055,6 +2072,25 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
     handle_command(e, (const char *)e->msg_buf, (size_t)n);
 }
 
+// Apply an armed update once no PTY is busy. Idleness is the whole safety
+// story: the swap ends with exit(0), and killing the process mid-RUN would
+// take a user's running command with it. A bridge that is never idle simply
+// updates later — the next token push re-arms this.
+static void maybe_self_update(edge_t *e) {
+    if (!e->update_pending) return;
+    for (int i = 0; i < g_max_sessions; i++)
+        if (e->sessions[i].active && e->sessions[i].state == SESS_RUNNING) return;
+
+    // Disarm before trying, so a failure (offline, GitHub hiccup) can't retry
+    // on the very next poll tick. The 12h token push re-arms it.
+    e->update_pending = 0;
+    if (bridge_update_apply() != 0) return;   // installer said no — keep this build
+    // The new binary is on disk. Exit cleanly so the supervisor starts it;
+    // idle PTYs die with us, which is what a reconnect would do to them anyway.
+    fprintf(stderr, "update: installed — restarting into the new binary\n");
+    exit(0);
+}
+
 static int run(edge_t *e, const char *device_id, const char *device_secret,
                const char *host, uint16_t port, const char *path,
                const uint8_t pubkey[32]) {
@@ -2173,6 +2209,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         // Forward anything the off-loop workers produced (tool scan results,
         // preview chunks). Never blocks; sending stays on this thread.
         bridge_jobs_poll(&e->jobs, monotonic_ms(), jobs_frame_cb, jobs_done_cb, e);
+        maybe_self_update(e);
         // Liveness watchdog: catch a half-open socket the kernel never EOFs
         // (e.g. surviving a hibernation, where last_recv_ms suddenly looks far
         // in the past on wake). PING after WS_PING_IDLE_MS, presume dead after
@@ -2307,6 +2344,10 @@ int bridge_main(int argc, char **argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "whoami") == 0) {
         return cmd_whoami(argc - 1, argv + 1);
+    }
+    // `--update` is accepted as an alias: it's the first thing people try.
+    if (argc >= 2 && (strcmp(argv[1], "update") == 0 || strcmp(argv[1], "--update") == 0)) {
+        return cmd_update(argc - 1, argv + 1);
     }
     if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "version") == 0)) {
         printf("%s\n", BRIDGE_VERSION);

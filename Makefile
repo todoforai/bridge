@@ -27,11 +27,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c \
+COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h json.h ws.h preview.h jobs.h \
+HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -166,7 +166,7 @@ test-timing: | build
 test-coalesce: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
-	    test/test_coalesce.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c jobs.c \
+	    test/test_coalesce.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
 	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-coalesce
 
@@ -178,7 +178,7 @@ test-coalesce: | build
 test-runenv: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
-	    test/test_runenv.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c jobs.c \
+	    test/test_runenv.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
 	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
@@ -192,6 +192,19 @@ test-initdrain: | build
 	    test/test_initdrain.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c preview.c jobs.c \
 	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-initdrain
+
+# Auto-update gating: only a supervised release build steps forward to a newer
+# release. Built twice — the "a dev build never auto-updates" rule depends on
+# the version baked in, so the test reads its own BRIDGE_VERSION and asserts
+# the matching expectations.
+.PHONY: test-update
+test-update: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/cli -DBRIDGE_VERSION='"v1.5.7"' \
+	    -o build/test-update test/test_update.c update.c
+	./build/test-update
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/cli -DBRIDGE_VERSION='"v1.5.7-3-gabc1234-dirty"' \
+	    -o build/test-update-dev test/test_update.c update.c
+	./build/test-update-dev
 
 # A/B proof of the poll-loop fix: PTY fd out of vs in the pollset (50ms → ~1ms).
 .PHONY: test-pollfix
@@ -207,7 +220,7 @@ test-probe: | build
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c
+BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 
