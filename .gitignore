@@ -3,3 +3,4 @@ a.out
 *.o
 *.a
 .DS_Store
+vendor/
