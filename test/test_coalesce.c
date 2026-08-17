@@ -38,7 +38,7 @@ static double test_now_ms(void) {
 // Object-like renames so both the header prototype and main.c's call site move
 // to our shim; main.c's own entry point is compiled out of the way.
 #define noise_ws_send bridge_test_noise_send
-#define main bridge_main_unused
+#define bridge_main bridge_main_unused
 #include "../main.c"
 #undef main
 

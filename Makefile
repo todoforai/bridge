@@ -27,7 +27,7 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c \
+COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c

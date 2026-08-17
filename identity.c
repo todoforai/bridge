@@ -13,6 +13,10 @@
 #  include <direct.h>      // _getcwd
 #  define strcasecmp  _stricmp
 #  define strncasecmp _strnicmp
+#  ifdef _MSC_VER            // MSVC CRT spells these with an underscore
+#    define popen  _popen
+#    define pclose _pclose
+#  endif
 #else
 #  include <pwd.h>
 #  include <strings.h>

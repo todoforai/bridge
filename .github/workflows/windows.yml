@@ -14,21 +14,17 @@ on:
   push:
     branches: [main]
     paths:
-      - 'pty_win.c'
-      - 'env_path.c'
-      - 'main.c'
+      - '*.c'
+      - '*.h'
       - 'install.ps1'
       - 'Makefile'
-      - 'test/test_pty_win.c'
       - '.github/workflows/windows.yml'
   pull_request:
     paths:
-      - 'pty_win.c'
-      - 'env_path.c'
-      - 'main.c'
+      - '*.c'
+      - '*.h'
       - 'install.ps1'
       - 'Makefile'
-      - 'test/test_pty_win.c'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
 

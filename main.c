@@ -50,6 +50,12 @@
 #  include <fcntl.h>      // _O_WRONLY/_O_CREAT/_O_BINARY/_O_APPEND
 #  include <sys/stat.h>   // _S_IREAD/_S_IWRITE
 #  define poll WSAPoll
+#  ifdef _MSC_VER            // MSVC CRT: no ssize_t / S_ISDIR (mingw has both)
+typedef long long ssize_t;
+#    ifndef S_ISDIR
+#      define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#    endif
+#  endif
 // Portable byte-substring search: glibc has memmem; mingw/MSVCRT does not.
 static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
     if (nl == 0) return (void *)h;
@@ -2117,8 +2123,19 @@ static void bump_fd_limit(int want) {
 // for the same backend session slot. The kernel releases the lock on exit
 // (process death, kill, segfault, …) so there's no stale-lockfile cleanup
 // to maintain. Returns 0 on success, -1 if another process holds it.
-// Windows: no-op (flock unavailable; relying on server-side flap guard).
-#ifndef _WIN32
+// Windows: per-user named mutex — kernel releases it on process death, same
+// no-cleanup property as flock. Matters since the desktop app embeds the
+// bridge: a standalone bridge + embedded daemon must not flap-loop.
+#ifdef _WIN32
+static int acquire_device_lock(const char *device_id) {
+    char name[256];
+    snprintf(name, sizeof name, "Local\\todoforai-bridge-%s", device_id);
+    HANDLE h = CreateMutexA(NULL, TRUE, name);  // handle intentionally leaked
+    if (!h) return 0;                            // best-effort, like open() failure
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(h); return -1; }
+    return 0;
+}
+#else
 static int acquire_device_lock(const char *device_id) {
     // device_id is backend-issued `dev_<hex>`; refuse anything that could
     // escape the config dir if the creds file was hand-edited.
@@ -2151,7 +2168,7 @@ static int acquire_device_lock(const char *device_id) {
 }
 #endif
 
-int main(int argc, char **argv) {
+int bridge_main(int argc, char **argv) {
     // Off-loop worker: dispatch first and hard-return, so a worker can never
     // fall through into daemon startup. Hidden from --help; not a user command.
     if (argc >= 3 && strcmp(argv[1], "__job") == 0) return cmd_job_worker(argv[2]);
@@ -2255,7 +2272,6 @@ int main(int argc, char **argv) {
     // Refuse to start if another bridge process on this machine is already
     // running for the same device. Without this, two bridges flap-loop kicking
     // each other off the server (close code 4000) every ~1s.
-#ifndef _WIN32
     if (acquire_device_lock(saved_creds.device_id) < 0) {
         fprintf(stderr,
             "error: another todoforai-bridge is already running for device %.8s… on this machine.\n"
@@ -2263,7 +2279,6 @@ int main(int argc, char **argv) {
             saved_creds.device_id);
         return 1;
     }
-#endif
 
     // Show 8-char device id prefix so the trailing "..." reads as "connecting…"
     // rather than "id truncated". Full id is in ~/.config/todoforai/credentials.json.

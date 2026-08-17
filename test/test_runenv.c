@@ -32,7 +32,7 @@ static char g_error[256];        // last error frame's code
 static int test_capture(const char *json, size_t len);
 
 #define noise_ws_send bridge_test_noise_send
-#define main bridge_main_unused
+#define bridge_main bridge_main_unused
 #include "../main.c"
 #undef main
 
