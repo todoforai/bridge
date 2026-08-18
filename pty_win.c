@@ -2,9 +2,9 @@
 // uses the Win10-1809+ pseudo-console API (CreatePseudoConsole) and a pair
 // of anonymous pipes for stdin/stdout.
 //
-// Shell resolution (in order): explicit `shell` arg → $BRIDGE_SHELL →
-// bash.exe in PATH → Git for Windows install paths → cmd.exe (last resort,
-// where most catalog tools won't work). The RUN wrapper at main.c:723 is
+// Shell resolution (in order): explicit `shell` arg → $BRIDGE_SHELL → Git for
+// Windows install paths → bash.exe in PATH (never the System32 WSL stub) →
+// cmd.exe (last resort, where most catalog tools won't work). The RUN wrapper is
 // bash syntax, so a non-bash shell will produce broken output but the bridge
 // itself stays alive.
 //
@@ -59,6 +59,20 @@ static const char *resolve_shell(const char *shell) {
     if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf))
         return buf;
 
+    // Last resort. RUN wrappers are bash syntax, so every command will produce
+    // broken output while the bridge stays "online" — the failure mode that is
+    // hardest to diagnose from the UI. Say so once, loudly, instead of failing
+    // silently: an interactive PTY session in cmd.exe still works, so refusing
+    // to spawn would break more than it fixes.
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr,
+            "warn: no bash found — falling back to cmd.exe. RUN commands expect bash\n"
+            "      and will produce broken output. Install Git for Windows\n"
+            "      (https://git-scm.com/download/win) or set BRIDGE_SHELL.\n");
+        fflush(stderr);
+    }
     snprintf(buf, sizeof(buf), "cmd.exe");
     return buf;
 }

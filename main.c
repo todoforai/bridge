@@ -138,7 +138,7 @@ static char *bridge_expand_tilde(const char *p) {
 #define DEFAULT_PORT         80
 #define DEFAULT_PATH         "/ws/v2/bridge"
 #ifdef _WIN32
-// pty_win.c resolves NULL → $BRIDGE_SHELL → bash.exe (PATH) → Git Bash → cmd.exe.
+// pty_win.c resolves NULL → $BRIDGE_SHELL → Git Bash → bash.exe (PATH) → cmd.exe.
 #define DEFAULT_SHELL        NULL
 #else
 #define DEFAULT_SHELL        "/bin/sh"
@@ -2274,19 +2274,51 @@ static void bump_fd_limit(int want) {
 }
 
 // Acquire an exclusive per-device lock so two bridge processes can't race
-// for the same backend session slot. The kernel releases the lock on exit
-// (process death, kill, segfault, …) so there's no stale-lockfile cleanup
-// to maintain. Returns 0 on success, -1 if another process holds it.
-// Windows: per-user named mutex — kernel releases it on process death, same
-// no-cleanup property as flock. Matters since the desktop app embeds the
-// bridge: a standalone bridge + embedded daemon must not flap-loop.
+// for the same backend session slot. The OS releases it on exit (process
+// death, kill, segfault, …) so there's no stale-lock cleanup to maintain.
+// Returns 0 on success, -1 if another process holds it.
 #ifdef _WIN32
+// Windows: a named mutex is the flock equivalent — the kernel destroys the
+// object when the last handle closes, including on abnormal termination, so
+// there's nothing to clean up after a kill/crash.
+//
+// "Global\" (not "Local\"): Local is per-logon-session, so a bridge in a
+// console session and one in an RDP session would see different namespaces and
+// both start — the exact flap this guard exists to prevent. A named mutex in
+// Global needs no privilege (SeCreateGlobalPrivilege only gates file-mapping
+// and symlink objects).
+//
+// Scope this actually guarantees: all logon sessions of the *same* user — which
+// is the reported bug (the -Service scheduled task plus a manual terminal run).
+// Across *different* users it degrades to best-effort: the other user's mutex
+// carries a default SD, so CreateMutexA returns NULL/ACCESS_DENIED and we
+// proceed rather than refuse. Treating ACCESS_DENIED as "already running" would
+// hand any local user a trivial way to squat the name and keep the bridge down,
+// which is worse than the flap it would prevent. Fail-open matches POSIX, where
+// the lock file lives in the user's own config dir and is likewise per-user.
+//
+// bInitialOwner=FALSE: the lock is the object's existence, not its ownership,
+// so there's no reason to take ownership and inherit abandoned-mutex semantics.
 static int acquire_device_lock(const char *device_id) {
+    for (const char *p = device_id; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return 0;
+    }
     char name[256];
-    snprintf(name, sizeof name, "Local\\todoforai-bridge-%s", device_id);
-    HANDLE h = CreateMutexA(NULL, TRUE, name);  // handle intentionally leaked
-    if (!h) return 0;                            // best-effort, like open() failure
-    if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(h); return -1; }
+    // Backslash is the namespace separator and is illegal in the rest of the
+    // name — device_id is validated above, so this can't inject one.
+    snprintf(name, sizeof name, "Global\\todoforai-bridge-%s", device_id);
+    HANDLE h = CreateMutexA(NULL, FALSE, name);
+    // GetLastError must be read before any other Win32 call can clobber it.
+    DWORD err = GetLastError();
+    // No handle at all ⇒ locking unavailable (another user holds the name, or
+    // policy denies it); best-effort proceed, like a failed open() on POSIX.
+    if (!h) {
+        fprintf(stderr, "warn: could not create device lock (win32 error %lu); "
+                        "duplicate-instance detection is off\n", (unsigned long)err);
+        return 0;
+    }
+    if (err == ERROR_ALREADY_EXISTS) { CloseHandle(h); return -1; }
+    // Intentionally leak the handle — the kernel releases it on process exit.
     return 0;
 }
 #else
@@ -2433,7 +2465,11 @@ int bridge_main(int argc, char **argv) {
     if (acquire_device_lock(saved_creds.device_id) < 0) {
         fprintf(stderr,
             "error: another todoforai-bridge is already running for device %.8s… on this machine.\n"
+#ifdef _WIN32
+            "       Stop it first (Task Manager, or `Stop-ScheduledTask -TaskName 'TODOforAI Bridge'`).\n",
+#else
             "       Stop it first (`pgrep -af todoforai-bridge`) or remove the duplicate from pm2/systemd.\n",
+#endif
             saved_creds.device_id);
         return 1;
     }

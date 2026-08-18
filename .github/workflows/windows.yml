@@ -18,6 +18,8 @@ on:
       - '*.h'
       - 'install.ps1'
       - 'Makefile'
+      - 'test/test_pty_win.c'
+      - 'scripts/diagnose-windows.ps1'
       - '.github/workflows/windows.yml'
   pull_request:
     paths:
@@ -25,6 +27,8 @@ on:
       - '*.h'
       - 'install.ps1'
       - 'Makefile'
+      - 'test/test_pty_win.c'
+      - 'scripts/diagnose-windows.ps1'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
 
@@ -84,6 +88,89 @@ jobs:
         run: |
           make test-pty-win
           ./build/test-pty-win.exe
+
+      # Single-instance lock: without it two bridges flap-loop, each kicking the
+      # other off the backend with close code 4000 every ~1s. `-Service` both
+      # registers the Scheduled Task AND starts it, so a user who then also runs
+      # the bridge in a terminal hits exactly this. Assert the second process
+      # refuses to start instead of joining the flap.
+      #
+      # Uses fake credentials: the lock is taken after creds load and before the
+      # first connect, so the second process must hit the lock error and never
+      # reach the network. A device that isn't real can't affect the backend.
+      #
+      # --host must stay a NON-local address: login_is_local_host() switches the
+      # credential profile to "dev" for 127.0.0.1/10./192.168./172.16-31, which
+      # would bypass the flat creds written below and drop into interactive
+      # login. 192.0.2.1 is TEST-NET-1 (RFC 5737) — non-local, never routable,
+      # so the connect just retries while the process stays alive holding the lock.
+      #
+      # Scope: both processes run in the same logon session, so this proves the
+      # lock exists and refuses a duplicate — not the cross-session reach that
+      # motivated the "Global\" namespace (CI has no second session to test from).
+      - name: Single-instance lock refuses a second bridge
+        working-directory: bridge
+        shell: pwsh
+        run: |
+          $exe  = (Resolve-Path ".\build\todoforai-bridge-windows-x64.exe").Path
+          $cfg  = Join-Path $env:APPDATA 'todoforai'
+          New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+          # 64 hex chars = a well-formed (but bogus) backend pubkey, so startup
+          # gets past the pubkey parse and reaches the lock.
+          @{
+            deviceId      = 'dev_citestlock'
+            deviceSecret  = 'secret'
+            backendHost   = '192.0.2.1'
+            backendPubkey = ('0' * 64)
+            userEmail     = 'ci@example.com'
+          } | ConvertTo-Json | Set-Content (Join-Path $cfg 'credentials.json')
+
+          # First instance: holds the mutex. Unroutable host ⇒ it sits in the
+          # connect/retry loop and stays alive while we race the second one.
+          $first  = Start-Process $exe -ArgumentList '--host','192.0.2.1','--port','80' `
+                      -PassThru -WindowStyle Hidden
+          $second = $null
+          try {
+              Start-Sleep -Seconds 3
+              if ($first.HasExited) { throw "first bridge exited early (rc=$($first.ExitCode))" }
+
+              # Never run the second instance synchronously: if the lock is
+              # broken it enters the reconnect loop and never returns, hanging
+              # the job until its timeout instead of failing. Bound the wait.
+              $log    = Join-Path $env:RUNNER_TEMP 'second.log'
+              $second = Start-Process $exe -ArgumentList '--host','192.0.2.1','--port','80' `
+                          -PassThru -WindowStyle Hidden `
+                          -RedirectStandardError $log -RedirectStandardOutput "$log.out"
+              if (-not $second.WaitForExit(15000)) {
+                  throw "second bridge was still running after 15s — the lock is NOT holding"
+              }
+              $out = ((Get-Content $log -Raw -EA SilentlyContinue) +
+                      (Get-Content "$log.out" -Raw -EA SilentlyContinue))
+              Write-Host "second instance rc=$($second.ExitCode) output:`n$out"
+              if ($second.ExitCode -eq 0)           { throw "second bridge exited 0 — lock is not holding" }
+              if ($out -notmatch 'already running') { throw "second bridge failed for the wrong reason:`n$out" }
+              Write-Host "OK: second instance refused by the device lock"
+          } finally {
+              # Both, unconditionally: an exception anywhere in the try (including
+              # inside WaitForExit) must not leave a bridge running into later steps.
+              foreach ($p in @($first, $second)) {
+                  if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+              }
+              Remove-Item (Join-Path $cfg 'credentials.json') -ErrorAction SilentlyContinue
+          }
+
+      # The diagnostic advertises Windows PowerShell 5.1 support, so parse it with
+      # 5.1 (powershell.exe), not the pwsh 7 the steps above use. Parse-only: the
+      # script inspects live machine state, which CI doesn't have.
+      - name: Diagnostic script parses under PowerShell 5.1
+        working-directory: bridge
+        shell: powershell
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path '.\scripts\diagnose-windows.ps1').Path, [ref]$null, [ref]$errs) | Out-Null
+          if ($errs) { $errs | ForEach-Object { Write-Host $_ }; throw "$($errs.Count) parse error(s)" }
+          Write-Host "OK: parses clean under PS $($PSVersionTable.PSVersion)"
 
   # ── 2. Exercise the PowerShell installer end-to-end on Windows ──────────────
   # Installs the latest published release via install.ps1 (custom -Prefix that
