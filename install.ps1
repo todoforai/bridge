@@ -115,6 +115,8 @@ try {
     # stop existing task if present so we can overwrite a running exe
     Get-ScheduledTask -TaskName 'TODOforAI Bridge' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
     Move-Item -Force $bin $dest
+    # `tfa-bridge` alias alongside `todoforai-bridge` (no symlink privilege needed).
+    Copy-Item -Force $dest (Join-Path $Prefix 'tfa-bridge.exe')
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

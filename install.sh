@@ -119,6 +119,7 @@ ok "downloaded $asset $TAG ($human)"
 
 chmod +x "$tmp/todoforai-bridge"
 mv "$tmp/todoforai-bridge" "$PREFIX/todoforai-bridge"
+ln -sf todoforai-bridge "$PREFIX/tfa-bridge"
 
 BRIDGE="$PREFIX/todoforai-bridge"
 CMD="$BRIDGE"   # what to suggest in user-facing messages
@@ -159,6 +160,7 @@ case ":$PATH:" in
     *)
         if link_dir=$(pick_link_dir); then
             ln -sf "$PREFIX/todoforai-bridge" "$link_dir/todoforai-bridge"
+            ln -sf "$PREFIX/todoforai-bridge" "$link_dir/tfa-bridge"
             CMD=todoforai-bridge
             case "$link_dir" in
                 "$HOME"/*) WHERE="$WHERE, linked into ~/${link_dir#$HOME/}" ;;
