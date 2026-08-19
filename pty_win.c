@@ -19,6 +19,7 @@
 
 #include <windows.h>
 #include <winternl.h>   // UNICODE_STRING, used by the SYSTEM_PROCESS_INFORMATION layout
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -209,9 +210,14 @@ int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
     size_t written = 0;
     while (written < len) {
         DWORD n = 0;
-        if (!WriteFile((HANDLE)p->h_in_write, b + written, (DWORD)(len - written), &n, NULL))
+        if (!WriteFile((HANDLE)p->h_in_write, b + written, (DWORD)(len - written), &n, NULL)) {
+            // WriteFile reports via GetLastError, not errno; translate so the
+            // caller's strerror(errno) diagnosis is meaningful on Windows too.
+            DWORD ge = GetLastError();
+            errno = (ge == ERROR_BROKEN_PIPE || ge == ERROR_NO_DATA) ? EPIPE : EIO;
             return -1;
-        if (n == 0) return -1;
+        }
+        if (n == 0) { errno = EPIPE; return -1; }
         written += n;
     }
     return 0;

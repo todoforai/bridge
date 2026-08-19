@@ -1341,12 +1341,21 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (s->draining_init) {
                 char init_line[SENTINEL_CAP + 96];
                 size_t in_n = build_init_line(init_line, sizeof init_line, s->ready_sentinel);
-                if (in_n == 0 ||
-                    bridge_pty_write_all(&s->pty, init_line, in_n) != 0) {
-                    // Init failed to queue — proceed without drain rather than
-                    // dropping legitimate output while waiting for a ready
-                    // line that will never come.
+                if (in_n == 0) {
+                    // Couldn't even build the line — proceed without drain
+                    // rather than dropping output waiting for a ready line
+                    // that will never come.
                     s->draining_init = 0;
+                } else if (bridge_pty_write_all(&s->pty, init_line, in_n) != 0) {
+                    // Write failure may be PARTIAL: the shell holds an unknown
+                    // prefix of the init line, and the RUN wrapper would be
+                    // appended to that corrupted line. RUN_STARTED hasn't been
+                    // sent yet, so a plain ERROR is race-free — abort cleanly.
+                    fprintf(stderr, "init-line PTY write failed (%s) — aborting spawn\n", strerror(errno));
+                    bridge_pty_close(&s->pty);
+                    free(cmd);
+                    return send_error(e, NULL, 0, bid, bid_len, "PTY_WRITE_FAILED",
+                                      "shell spawned but not accepting input (starved/OOM-killed?)");
                 }
             }
             gen_uuid_v4(s->session_id);
@@ -1566,13 +1575,36 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         send_run_started(e, s, created);
 
         if (bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) != 0) {
+            int werr = errno;
             free(wrapped);
             // STEP_DONE is the terminal response (RUN_STARTED was already sent);
-            // a separate ERROR would race against the resolved promise. Log only.
-            fprintf(stderr, "PTY_WRITE_FAILED for session %s\n", s->session_id);
-            send_step_done(e, s, /*has_code=*/0, 0, /*timedOut=*/0);
+            // a separate ERROR frame would race against the resolved promise.
+            // Instead surface the failure IN-BAND: queue the error text as
+            // OUTPUT (flushed by send_step_done before the terminal frame) and
+            // report exit code 126, so the agent sees a real failure instead
+            // of a silent "(no output)" success. Typical cause: the shell
+            // child stopped draining the PTY (starved/OOM-killed on tiny VMs)
+            // → write_all times out (ETIMEDOUT).
+            fprintf(stderr, "PTY_WRITE_FAILED for session %s (%s)\n",
+                    s->session_id, strerror(werr));
+            char em[192];
+            int en = snprintf(em, sizeof em,
+                "bridge: failed to deliver command to shell (%s) — shell not "
+                "reading its PTY (dead/starved/OOM-killed?); session closed, retry may spawn a fresh shell\n",
+                strerror(werr));
+            if (en > 0) {
+                // snprintf returns the WOULD-BE length on truncation; clamp.
+                size_t em_len = (size_t)en < sizeof em ? (size_t)en : sizeof em - 1;
+                send_output_bytes(e, s, (const uint8_t *)em, em_len);
+            }
+            send_step_done(e, s, /*has_code=*/1, 126, /*timedOut=*/0);
+            // The write may have been PARTIAL: the shell holds an unknown
+            // prefix of the wrapper and could execute it (or emit stray
+            // output) later. The session is unusable either way — force
+            // teardown for persistent sessions too, so run_finish closes the
+            // PTY unconditionally and a retry spawns a fresh shell.
+            s->one_shot = 1;
             run_finish(s);
-            RUN_FAIL_CLEANUP();
             return 0;
         }
         // Stamp AFTER write_all returns: the bridge is single-threaded so the
