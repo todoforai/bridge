@@ -259,18 +259,19 @@ typedef struct {
     char project_id[BLOCK_ID_CAP + 1];
     size_t project_id_len;
 
-    // Spawn-time init drain ------------------------------------------------
+    // Per-step begin drain -------------------------------------------------
     // POSIX disables PTY echo via termios and blanks PS1/PS2 in the child's
-    // env, but ConPTY has no host-side ECHO toggle and Git Bash rc files
-    // re-set a prompt — so on Windows the prompt + echoed wrapper would leak
-    // into OUTPUT. Fix (platform-neutral): right after spawn an init line
-    // (`stty -echo; PS1=; PS2=; printf '\n<ready>\n'`) is written to the
-    // shell, and every byte read is DROPPED until the ready sentinel's line
-    // has passed. On POSIX the init is a cheap no-op that drains silently.
-    int    draining_init;                 // 1 ⇒ discard output up to ready line
-    char   ready_sentinel[SENTINEL_CAP];  // __BRIDGE_READY_<32 hex>__
-    size_t ready_len;
-    size_t init_drained;                  // bytes dropped so far (fail-safe cap)
+    // env, but ConPTY has no host-side ECHO toggle and `stty -echo` only
+    // works for shells that echo themselves (Git Bash); busybox-w32 and
+    // cmd.exe let conhost echo, so prompt + the echoed wrapper (exports,
+    // API token!) would leak into OUTPUT. Fix (platform-neutral): every RUN
+    // wrapper starts by printing a fresh begin sentinel, and every byte read
+    // is DROPPED until that sentinel's line has passed — so shell startup
+    // noise, prompts and echoed input can never reach OUTPUT.
+    int    draining_begin;                // 1 ⇒ discard output up to begin line
+    char   begin_sentinel[SENTINEL_CAP];  // __BRIDGE_BEGIN_<32 hex>__
+    size_t begin_len;
+    size_t begin_dropped;                 // bytes dropped so far (fail-safe cap)
 
     // RUN state machine ----------------------------------------------------
     // PTY echo is disabled at spawn, so the wrapper command line never
@@ -443,28 +444,22 @@ static size_t gen_sentinel(char *out, size_t cap) {
     return gen_sentinel_tag(out, cap, "__BRIDGE_STEP_");
 }
 
-// Build the spawn-time echo/prompt suppression line (see draining_init in
-// session_t). The ready sentinel is split across two quoted strings
-// ('__BRIDGE_''READY_…') so the ECHOED command line never contains the
-// contiguous marker — only the printf's real output does. Returns length, or
-// 0 on overflow.
-static size_t build_init_line(char *out, size_t cap, const char *ready_sentinel) {
-    int n = snprintf(out, cap,
-        "stty -echo 2>/dev/null; PS1=; PS2=; printf '\\n__BRIDGE_''%s\\n'\n",
-        ready_sentinel + 9 /* skip "__BRIDGE_" */);
+// Per-step begin sentinel: `__BRIDGE_BEGIN_<32 hex>__`.
+static size_t gen_begin_sentinel(char *out, size_t cap) {
+    return gen_sentinel_tag(out, cap, "__BRIDGE_BEGIN_");
+}
+
+// Spawn-time best-effort echo/prompt suppression. Works on shells that echo
+// themselves (Git Bash, POSIX ptys); a no-op on busybox-w32/ConPTY where
+// conhost echoes. Either way the per-step begin drain removes the leftovers.
+static size_t build_init_line(char *out, size_t cap) {
+    int n = snprintf(out, cap, "stty -echo 2>/dev/null; PS1=; PS2=\n");
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
-// cmd.exe variant of the init line (Windows last-resort mode). `echo off`
-// suppresses the prompt; the ready sentinel is emitted by a plain echo. The
-// caret (^) is cmd's escape char: the ECHOED input line carries
-// `__BRIDGE_^READY_…` (never matches the scan) while the echo's OUTPUT is the
-// contiguous marker. ConPTY input echo can't be disabled for cmd (no stty),
-// so wrapper lines stay visible in output — accepted noise for a mode whose
-// only job is letting the agent repair the machine.
-static size_t build_init_line_cmd(char *out, size_t cap, const char *ready_sentinel) {
-    int n = snprintf(out, cap, "echo off& echo __BRIDGE_^%s\r\n",
-                     ready_sentinel + 9 /* skip "__BRIDGE_" */);
+// cmd.exe variant (Windows last-resort mode): `echo off` kills the prompt.
+static size_t build_init_line_cmd(char *out, size_t cap) {
+    int n = snprintf(out, cap, "echo off\r\n");
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
@@ -844,6 +839,7 @@ static void run_finish(session_t *s) {
     s->run_block_id_len = 0;
     s->run_block_id[0] = '\0';
     s->sentinel_len = 0;
+    s->draining_begin = 0;
     s->pause_consec_ticks = 0;
     // LRU: command just finished; refresh the activity stamp so this session
     // is the most-recently-used.
@@ -874,42 +870,42 @@ static void tail_append(session_t *s, const uint8_t *data, size_t len) {
     s->tail_len += len;
 }
 
-// Spawn-time init drain (see draining_init in session_t): consume tail_buf,
-// dropping everything up to and past the ready sentinel's line. Returns 1
+// Per-step begin drain (see draining_begin in session_t): consume tail_buf,
+// dropping everything up to and past the begin sentinel's line. Returns 1
 // when the drain is over (leftover bytes stay in tail_buf for the caller),
 // 0 while still draining (tail_buf holds at most a partial candidate).
 //
-// The init line split-quotes the sentinel ('__BRIDGE_''READY_…'), so the
+// The wrapper split-quotes the sentinel ('__BRIDGE_''BEGIN_…'), so the
 // ECHOED command never contains the contiguous marker — the first full match
 // is guaranteed to be the printf's real output. The shell runs sequentially,
 // so bytes between the marker and its '\n' can only be ConPTY VT decoration;
 // they are dropped without inspection (no terminator-adjacency requirement,
 // which ConPTY's escape injection would break).
 //
-// Fail-safe: if the marker still hasn't appeared after INIT_DRAIN_MAX drained
-// bytes (shell startup failed, non-bash shell mangled the init, …), give up
+// Fail-safe: if the marker still hasn't appeared after BEGIN_DRAIN_MAX drained
+// bytes (shell startup failed, non-bash shell mangled the wrapper, …), give up
 // and pass output through — bounded prompt noise beats swallowing a RUN.
-#define INIT_DRAIN_MAX (64 * 1024)
-static int init_drain_scan(session_t *s) {
-    void *m = s->tail_len >= s->ready_len
-        ? memmem(s->tail_buf, s->tail_len, s->ready_sentinel, s->ready_len)
+#define BEGIN_DRAIN_MAX (64 * 1024)
+static int begin_drain_scan(session_t *s) {
+    void *m = s->tail_len >= s->begin_len
+        ? memmem(s->tail_buf, s->tail_len, s->begin_sentinel, s->begin_len)
         : NULL;
     if (!m) {
-        s->init_drained += s->tail_len;
-        if (s->init_drained > INIT_DRAIN_MAX) {
-            fprintf(stderr, "init drain overflow on %s — passing output through\n", s->session_id);
-            s->draining_init = 0;
+        s->begin_dropped += s->tail_len;
+        if (s->begin_dropped > BEGIN_DRAIN_MAX) {
+            fprintf(stderr, "begin drain overflow on %s — passing output through\n", s->session_id);
+            s->draining_begin = 0;
             return 1;  // keep tail_buf as ordinary output
         }
         // Drop all but a possible marker prefix.
-        size_t keep = s->ready_len - 1;
+        size_t keep = s->begin_len - 1;
         if (keep > s->tail_len) keep = s->tail_len;
         memmove(s->tail_buf, s->tail_buf + s->tail_len - keep, keep);
         s->tail_len = keep;
         return 0;
     }
     // Marker found: drop through the first '\n' after it.
-    size_t at = (size_t)((uint8_t *)m - s->tail_buf) + s->ready_len;
+    size_t at = (size_t)((uint8_t *)m - s->tail_buf) + s->begin_len;
     while (at < s->tail_len && s->tail_buf[at] != '\n') at++;
     if (at >= s->tail_len) {
         // Newline not arrived — hold from the marker start.
@@ -921,7 +917,7 @@ static int init_drain_scan(session_t *s) {
     at++;  // past the '\n'
     memmove(s->tail_buf, s->tail_buf + at, s->tail_len - at);
     s->tail_len -= at;
-    s->draining_init = 0;
+    s->draining_begin = 0;
     return 1;
 }
 
@@ -1064,10 +1060,10 @@ static long forward_pty_output(edge_t *e, session_t *s) {
 
     int appended = 0;  // bytes already funneled into tail_buf by the drain
 
-    if (s->draining_init) {
+    if (s->draining_begin) {
         tail_append(s, e->pty_buf, (size_t)n);
         appended = 1;
-        if (!init_drain_scan(s)) return n;   // still draining — all bytes dropped/held
+        if (!begin_drain_scan(s)) return n;  // still draining — all bytes dropped/held
         if (s->tail_len == 0) return n;      // drain done, nothing left over
     }
 
@@ -1379,24 +1375,17 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 free(cmd);
                 return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", "failed to spawn PTY");
             }
-            // Echo/prompt suppression init (see draining_init in session_t).
-            // Written immediately; the RUN wrapper below queues right behind
-            // it — the shell executes lines sequentially, so no extra
-            // round-trip latency. All output up to the ready line is dropped.
-            s->ready_len = gen_sentinel_tag(s->ready_sentinel, sizeof(s->ready_sentinel), "__BRIDGE_READY_");
-            s->draining_init = s->ready_len > 0;
-            s->init_drained = 0;
-            if (s->draining_init) {
-                char init_line[SENTINEL_CAP + 96];
+            // Best-effort echo/prompt suppression (see draining_begin in
+            // session_t). Written immediately; the RUN wrapper below queues
+            // right behind it — the shell executes lines sequentially, so no
+            // extra round-trip latency. Shells that ignore it (busybox-w32,
+            // cmd) are still covered by the per-step begin drain.
+            {
+                char init_line[96];
                 size_t in_n = s->cmd_mode
-                    ? build_init_line_cmd(init_line, sizeof init_line, s->ready_sentinel)
-                    : build_init_line(init_line, sizeof init_line, s->ready_sentinel);
-                if (in_n == 0) {
-                    // Couldn't even build the line — proceed without drain
-                    // rather than dropping output waiting for a ready line
-                    // that will never come.
-                    s->draining_init = 0;
-                } else if (bridge_pty_write_all(&s->pty, init_line, in_n) != 0) {
+                    ? build_init_line_cmd(init_line, sizeof init_line)
+                    : build_init_line(init_line, sizeof init_line);
+                if (in_n > 0 && bridge_pty_write_all(&s->pty, init_line, in_n) != 0) {
                     // Write failure may be PARTIAL: the shell holds an unknown
                     // prefix of the init line, and the RUN wrapper would be
                     // appended to that corrupted line. RUN_STARTED hasn't been
@@ -1519,6 +1508,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->run_block_id_len = bn;
 
         s->sentinel_len = gen_sentinel(s->sentinel, sizeof(s->sentinel));
+        // Arm the per-step begin drain: everything the shell emits before the
+        // wrapper's begin marker (prompt, echoed wrapper incl. the API token,
+        // leftover noise from a previous step) is dropped.
+        s->begin_len = gen_begin_sentinel(s->begin_sentinel, sizeof(s->begin_sentinel));
+        s->draining_begin = s->begin_len > 0;
+        s->begin_dropped = 0;
         long timeout_ms_raw = 0;
         json_get_long(msg, msg_len, "timeoutMs", &timeout_ms_raw);
         int64_t timeout_ms = (int64_t)timeout_ms_raw;
@@ -1589,7 +1584,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // when a device session token is set so tfa-* CLIs authenticate
         // without a real API key. Token (`dst_` + 64 hex), agent id, and
         // api_url are all validated charset-safe.
-        size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len
+        size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + s->begin_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
                              + sizeof(idenv) + sizeof(e->api_url)
                              + sizeof(fenv) + sizeof(cenv) + 320;
@@ -1604,12 +1599,15 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // scan. Env exports (TODOFORAI_*, PAGER) are skipped: cmd `set`
             // semantics differ and the tfa-* tools don't work here anyway.
             wn = snprintf(wrapped, wrapped_cap,
-                "%.*s\r\necho __BRIDGE_^%s:%%ERRORLEVEL%%\r\n",
-                (int)cmd_len, cmd, s->sentinel + 9 /* skip "__BRIDGE_" */);
+                "echo __BRIDGE_^%s\r\n%.*s\r\necho __BRIDGE_^%s:%%ERRORLEVEL%%\r\n",
+                s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
+                (int)cmd_len, cmd, s->sentinel + 9);
         } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
+                "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
                 "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
@@ -1618,8 +1616,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
+                "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
                 "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv,
                 fenv, cenv,
                 (int)cmd_len, cmd, s->sentinel);

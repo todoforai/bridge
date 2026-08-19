@@ -1,7 +1,7 @@
-// Spawn-time init drain: on Windows/ConPTY the PTY echoes the wrapper line
-// and bash prints a prompt (no host-side ECHO toggle), so main.c writes an
-// init line (`stty -echo; PS1=; PS2=; printf '\n<ready>\n'`) right after
-// spawn and DROPS all output until the ready sentinel's line has passed.
+// Per-step begin drain: on Windows/ConPTY (busybox, cmd) the console echoes
+// the wrapper line and the shell prints a prompt with no host-side ECHO
+// toggle, so every RUN wrapper starts with `printf '\n<begin>\n'` and all
+// output is DROPPED until that begin sentinel's line has passed.
 //
 // This test simulates the ConPTY condition on POSIX by spawning with echo ON
 // (no_echo=0): the echoed init + echoed wrapper must be fully drained/absent
@@ -49,7 +49,7 @@ static int test_capture(const char *json, size_t len) {
     return 0;
 }
 
-// ── Deterministic scanner tests (no PTY): drive init_drain_scan byte-by-byte ──
+// ── Deterministic scanner tests (no PTY): drive begin_drain_scan byte-by-byte ──
 
 // Feed `data` into the drain in `chunk`-sized pieces; returns final tail as a
 // string in out (assumes drain completes) and 1 if drain ended.
@@ -60,7 +60,7 @@ static int feed_drain(session_t *s, const char *data, size_t chunk, char *out, s
         size_t n = len - off < chunk ? len - off : chunk;
         tail_append(s, (const uint8_t *)data + off, n);
         off += n;
-        if (!done) done = init_drain_scan(s);
+        if (!done) done = begin_drain_scan(s);
         // Once done, further bytes just accumulate in tail_buf (caller's job);
         // keep appending to simulate the RUN parser's buffer.
     }
@@ -74,9 +74,9 @@ static session_t *mk_drain_sess(void) {
     static session_t s;
     memset(&s, 0, sizeof s);
     snprintf(s.session_id, sizeof s.session_id, "00000000-0000-4000-8000-000000000000");
-    snprintf(s.ready_sentinel, sizeof s.ready_sentinel, "__BRIDGE_READY_cafe__");
-    s.ready_len = strlen(s.ready_sentinel);
-    s.draining_init = 1;
+    snprintf(s.begin_sentinel, sizeof s.begin_sentinel, "__BRIDGE_BEGIN_cafe__");
+    s.begin_len = strlen(s.begin_sentinel);
+    s.draining_begin = 1;
     return &s;
 }
 
@@ -86,7 +86,7 @@ static int scanner_cases(void) {
 
     // Marker + VT escapes between marker and newline (ConPTY decoration),
     // then real output — split at EVERY chunk size to cover read boundaries.
-    const char *vt = "prompt$ echoed line\r\n__BRIDGE_READY_cafe__\x1b[?25h\x1b[0m\r\nREAL\r\n";
+    const char *vt = "prompt$ echoed line\r\n__BRIDGE_BEGIN_cafe__\x1b[?25h\x1b[0m\r\nREAL\r\n";
     for (size_t chunk = 1; chunk <= strlen(vt); chunk++) {
         session_t *s = mk_drain_sess();
         int done = feed_drain(s, vt, chunk, out, sizeof out);
@@ -100,7 +100,7 @@ static int scanner_cases(void) {
     // Echoed split-quoted copy must NOT terminate the drain early.
     {
         session_t *s = mk_drain_sess();
-        const char *echoed = "$ printf '\\n__BRIDGE_''READY_cafe__\\n'\r\n__BRIDGE_READY_cafe__\r\nout\r\n";
+        const char *echoed = "$ printf '\\n__BRIDGE_''READY_cafe__\\n'\r\n__BRIDGE_BEGIN_cafe__\r\nout\r\n";
         int done = feed_drain(s, echoed, 7, out, sizeof out);
         if (!done || strcmp(out, "out\r\n") != 0) {
             fprintf(stderr, "[scanner-echoed] FAIL: done=%d out=%s\n", done, out);
@@ -108,16 +108,16 @@ static int scanner_cases(void) {
         } else fprintf(stderr, "[scanner-echoed] OK\n");
     }
 
-    // Fail-safe: no marker ever arrives → drain gives up after INIT_DRAIN_MAX.
+    // Fail-safe: no marker ever arrives → drain gives up after BEGIN_DRAIN_MAX.
     {
         session_t *s = mk_drain_sess();
         char junk[1024]; memset(junk, 'x', sizeof junk - 1); junk[sizeof junk - 1] = '\0';
         int done = 0;
-        for (int i = 0; i < 2 * (INIT_DRAIN_MAX / 1023) + 4 && !done; i++) {
+        for (int i = 0; i < 2 * (BEGIN_DRAIN_MAX / 1023) + 4 && !done; i++) {
             tail_append(s, (const uint8_t *)junk, 1023);
-            done = init_drain_scan(s);
+            done = begin_drain_scan(s);
         }
-        if (!done || s->draining_init) {
+        if (!done || s->draining_begin) {
             fprintf(stderr, "[scanner-failsafe] FAIL: drain never gave up\n");
             fails++;
         } else fprintf(stderr, "[scanner-failsafe] OK\n");
@@ -142,24 +142,26 @@ static int run_case(const char *label, const char *cmd, const char *expect_out) 
     s->active = 1;
     snprintf(s->session_id, sizeof s->session_id, "00000000-0000-4000-8000-000000000000");
 
-    // Init line via the production builder (split-quoted sentinel).
-    s->ready_len = gen_sentinel_tag(s->ready_sentinel, sizeof s->ready_sentinel, "__BRIDGE_READY_");
-    assert(s->ready_len > 0);
-    s->draining_init = 1;
-    char init_line[SENTINEL_CAP + 96];
-    size_t in_n = build_init_line(init_line, sizeof init_line, s->ready_sentinel);
+    // Best-effort echo suppression, exactly like the RUN handler.
+    char init_line[96];
+    size_t in_n = build_init_line(init_line, sizeof init_line);
     assert(in_n > 0);
     assert(bridge_pty_write_all(&s->pty, init_line, in_n) == 0);
 
     // Wrapped step, queued immediately behind the init (no waiting).
     s->sentinel_len = gen_sentinel(s->sentinel, sizeof s->sentinel);
+    s->begin_len = gen_begin_sentinel(s->begin_sentinel, sizeof s->begin_sentinel);
+    assert(s->begin_len > 0);
+    s->draining_begin = 1;
+    s->begin_dropped = 0;
     s->state = SESS_RUNNING;
     s->tail_len = 0;
     s->one_shot = 0;
     ob_resolve(&s->ob, "raw", 3);
     char wrapped[4096];
     int wn = snprintf(wrapped, sizeof wrapped,
-        "{ %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n", cmd, s->sentinel);
+        "printf '\\n__BRIDGE_''%s\\n'; { %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+        s->begin_sentinel + 9, cmd, s->sentinel);
     assert(wn > 0 && (size_t)wn < sizeof wrapped);
     assert(bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) == 0);
 
@@ -182,8 +184,9 @@ static int run_case(const char *label, const char *cmd, const char *expect_out) 
         }
         fputc('\n', stderr);
         fail = 1;
-    } else if (memmem(g_out, g_out_len, s->ready_sentinel, s->ready_len) ||
+    } else if (memmem(g_out, g_out_len, s->begin_sentinel, s->begin_len) ||
                memmem(g_out, g_out_len, "stty -echo", 10) ||
+               memmem(g_out, g_out_len, "__RC=", 5) ||
                memmem(g_out, g_out_len, "PS1=", 4)) {
         fprintf(stderr, "[%s] FAIL: init/echo leaked into output\n", label);
         fail = 1;
@@ -204,8 +207,8 @@ int main(void) {
     fails += run_case("echo-on-simple", "echo hello",     "hello\r\n");
     fails += run_case("echo-on-multi",  "echo a; echo b", "a\r\nb\r\n");
     fails += run_case("echo-on-empty",  "true",           "");
-    // Output that contains the READY prefix must survive (drain is over by then).
-    fails += run_case("ready-lookalike", "printf '__BRIDGE_READY_fake__\\n'", "__BRIDGE_READY_fake__\r\n");
+    // Output that contains the BEGIN prefix must survive (drain is over by then).
+    fails += run_case("begin-lookalike", "printf '__BRIDGE_BEGIN_fake__\\n'", "__BRIDGE_BEGIN_fake__\r\n");
     if (fails) fprintf(stderr, "\n%d test(s) failed\n", fails);
     else       fprintf(stderr, "\nall init-drain tests passed\n");
     return fails ? 1 : 0;

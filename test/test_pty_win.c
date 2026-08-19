@@ -148,10 +148,10 @@ static int test_process_tree_termination(void) {
 
 // The provisioned-busybox floor: spawn busybox sh (path via TFA_TEST_BUSYBOX,
 // downloaded by CI) and drive it exactly like the production RUN path — init
-// line (stty -echo; PS1=; printf ready) then the bash-syntax wrapper with a
-// brace group, $? capture and printf sentinel. Proves the pinned busybox can
-// serve as the RUN shell: sentinel completes, exit code is real, and the
-// wrapper line itself must NOT appear as a contiguous sentinel in output.
+// line (stty -echo; PS1=) then the bash-syntax wrapper: begin sentinel,
+// brace group, $? capture and printf step sentinel. Proves the pinned busybox
+// can serve as the RUN shell: both sentinels complete, exit code is real, and
+// the echoed wrapper line must NOT yield a contiguous sentinel of its own.
 static int test_busybox_run_wrapper(void) {
     const char *bb = getenv("TFA_TEST_BUSYBOX");
     if (!bb || !*bb) {
@@ -165,11 +165,11 @@ static int test_busybox_run_wrapper(void) {
         return 1;
     }
 
-    // Mirror main.c: init line with split-quoted ready sentinel, then wrapper.
-    const char *init =
-        "stty -echo 2>/dev/null; PS1=; PS2=; printf '\\n__TB_''READY__\\n'\n";
+    // Mirror main.c: init line, then a wrapper whose first statement prints
+    // the split-quoted begin sentinel (drain marker) before the brace group.
+    const char *init = "stty -echo 2>/dev/null; PS1=; PS2=\n";
     const char *wrapper =
-        "{ echo hello-from-busybox; ls / >/dev/null 2>/dev/null; false\n"
+        "printf '\\n__TB_''BEGIN__\\n'; { echo hello-from-busybox; ls / >/dev/null 2>/dev/null; false\n"
         "}; __RC=$?; printf '\\n__TB_''STEP__:%d\\n' \"$__RC\"\n";
     if (bridge_pty_write_all(&pty, init, strlen(init)) != 0 ||
         bridge_pty_write_all(&pty, wrapper, strlen(wrapper)) != 0) {
@@ -186,8 +186,14 @@ static int test_busybox_run_wrapper(void) {
         return 1;
     }
     char scan[65536]; memcpy(scan, output, sizeof(scan)); strip_ansi(scan);
-    if (!strstr(scan, "hello-from-busybox")) {
-        fprintf(stderr, "FAIL: busybox command output missing. Output:\n%s\n", scan);
+    const char *begin = strstr(scan, "__TB_BEGIN__");
+    if (!begin) {
+        fprintf(stderr, "FAIL: busybox begin sentinel missing. Output:\n%s\n", scan);
+        bridge_pty_close(&pty);
+        return 1;
+    }
+    if (!strstr(begin, "hello-from-busybox")) {
+        fprintf(stderr, "FAIL: command output missing after the begin marker. Output:\n%s\n", scan);
         bridge_pty_close(&pty);
         return 1;
     }
@@ -196,7 +202,7 @@ static int test_busybox_run_wrapper(void) {
     return 0;
 }
 
-// cmd.exe last-resort dialect (main.c cmd_mode): command on its own line,
+// cmd.exe last-resort dialect (main.c cmd_mode): begin echo, command on its own line,
 // `echo <caret-split sentinel>:%ERRORLEVEL%` on the next. Must prove
 // (a) %ERRORLEVEL% expands to the previous command's exit code when the lines
 // arrive sequentially through ConPTY, and (b) the echoed input line (which
@@ -209,9 +215,10 @@ static int test_cmd_dialect(void) {
         return 1;
     }
 
-    const char *init = "echo off& echo __TC_^READY__\r\n";
-    // `exit /b 7` sets ERRORLEVEL without ending the shell.
+    const char *init = "echo off\r\n";
+    // `cmd /c exit 7` sets ERRORLEVEL without ending the shell.
     const char *step =
+        "echo __TC_^BEGIN__\r\n"
         "cmd /c exit 7\r\n"
         "echo __TC_^STEP__:%ERRORLEVEL%\r\n";
     if (bridge_pty_write_all(&pty, init, strlen(init)) != 0 ||
