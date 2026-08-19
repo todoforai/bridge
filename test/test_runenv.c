@@ -65,7 +65,7 @@ static int test_capture(const char *json, size_t len) {
 // The command echoes the env vars back so the assertions can read them.
 static void run_step(edge_t *e, const char *session_id, const char *extra) {
     static const char *CMD =
-        "echo \"T=[$TODOFORAI_TODO_ID] G=[$TODOFORAI_GROUP_ID] A=[$AGENT_BROWSER_SESSION]"
+        "echo \"T=[$TODOFORAI_TODO_ID] G=[$TODOFORAI_GROUP_ID] P=[$TODOFORAI_PROJECT_ID] A=[$AGENT_BROWSER_SESSION]"
         " M=[$TODOFORAI_MESSAGE_ID] B=[$TODOFORAI_BLOCK_ID] F=[$TODOFORAI_FRONTEND_ID]\"";
     char cmd_b64[512];
     size_t bn = b64_encode((const uint8_t *)CMD, strlen(CMD), cmd_b64, sizeof cmd_b64);
@@ -124,10 +124,10 @@ int main(void) {
     snprintf(s->session_id, sizeof s->session_id, "%s", SID);
 
     // ── The pair is exported when sent ──
-    run_step(e, SID, "\"todoId\":\"todo-1\",\"groupTag\":\"grp-1\","
+    run_step(e, SID, "\"todoId\":\"todo-1\",\"groupTag\":\"grp-1\",\"projectId\":\"proj-1\","
                 "\"chatMessageId\":\"msg-1\",\"chatBlockId\":\"blk-1\"");
     expect("pair exported", "M=[msg-1] B=[blk-1]");
-    expect("session ids exported", "T=[todo-1] G=[grp-1]");
+    expect("session ids exported", "T=[todo-1] G=[grp-1] P=[proj-1]");
     expect("todoId aliases the browser session", "A=[todo-1]");
     ok("chat ids + session ids are exported into the PTY");
 
@@ -136,7 +136,7 @@ int main(void) {
     // otherwise link its sub-todo to step 1's block.
     run_step(e, SID, "\"todoId\":\"todo-1\"");
     expect("chat ids cleared", "M=[] B=[]");
-    expect("session ids survive", "T=[todo-1] G=[grp-1]");
+    expect("session ids survive", "T=[todo-1] G=[grp-1] P=[proj-1]");
     ok("omitted chat ids are unset, session ids keep their value");
 
     // ── A half-set pair links nothing, so it must not half-export ──
@@ -173,7 +173,7 @@ int main(void) {
         g_fails++;
     }
     run_step(e, SID, "");
-    expect("session ids unchanged by rejected run", "T=[todo-1] G=[grp-1]");
+    expect("session ids unchanged by rejected run", "T=[todo-1] G=[grp-1] P=[proj-1]");
     ok("a rejected RUN leaves session ids untouched");
 
     // ── A recycled slot must not leak the previous occupant's ids ──

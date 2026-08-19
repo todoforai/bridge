@@ -252,6 +252,12 @@ typedef struct {
     char group_tag[BLOCK_ID_CAP + 1];
     size_t group_tag_len;
 
+    // Project id of the calling TODO. Exported as TODOFORAI_PROJECT_ID so
+    // CLI children (card CRUD, show) resolve the project without a flag.
+    // Same set/clear semantics as group_tag.
+    char project_id[BLOCK_ID_CAP + 1];
+    size_t project_id_len;
+
     // Spawn-time init drain ------------------------------------------------
     // POSIX disables PTY echo via termios and blanks PS1/PS2 in the child's
     // env, but ConPTY has no host-side ECHO toggle and Git Bash rc files
@@ -1344,7 +1350,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                     free(cmd);
                     // Name the offending path: this is almost always a
                     // misconfigured workspace path, so make it self-diagnosing.
-                    char em[512];
+                    char em[sizeof cwd_buf + 128];
                     snprintf(em, sizeof em,
                              "configured workspace path does not exist on this machine: %s"
                              " — fix the workspace path in agent settings", cwd_buf);
@@ -1420,6 +1426,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->frontend_kind[0] = '\0';
             s->group_tag_len = 0;
             s->group_tag[0] = '\0';
+            s->project_id_len = 0;
+            s->project_id[0] = '\0';
             s->last_active_ms = monotonic_ms();
             s->one_shot = 1;
             created = 1;
@@ -1449,7 +1457,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // present with len 0 (clear it).
         struct run_id { const char *p; size_t len; int present; };
         struct run_id todo = {0}, agent = {0}, fid = {0}, fkind = {0}, grp = {0},
-                      cmsg = {0}, cblk = {0};
+                      proj = {0}, cmsg = {0}, cblk = {0};
 
         #define RUN_ID(dst, key, code, what) do { \
             (dst).present = json_get_str(msg, msg_len, key, &(dst).p, &(dst).len); \
@@ -1465,6 +1473,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         RUN_ID(fid,   "frontendId",      "INVALID_FRONTEND_ID",   "frontendId");
         RUN_ID(fkind, "frontendKind",    "INVALID_FRONTEND_KIND", "frontendKind");
         RUN_ID(grp,   "groupTag",        "INVALID_GROUP_ID",      "groupTag");
+        RUN_ID(proj,  "projectId",       "INVALID_PROJECT_ID",    "projectId");
         RUN_ID(cmsg,  "chatMessageId",   "INVALID_MESSAGE_ID",    "chatMessageId");
         RUN_ID(cblk,  "chatBlockId",     "INVALID_CHAT_BLOCK_ID", "chatBlockId");
         #undef RUN_ID
@@ -1484,6 +1493,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         RUN_ID_COMMIT(fid,   frontend_id);
         RUN_ID_COMMIT(fkind, frontend_kind);
         RUN_ID_COMMIT(grp,   group_tag);
+        RUN_ID_COMMIT(proj,  project_id);
         #undef RUN_ID_COMMIT
 
         // The chat message + bash block this step renders into (tfa-* sub-todo
@@ -1553,7 +1563,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // as the per-todo agent-browser session so parallel todos get isolated
         // sockets. Unlike fenv/cenv these keep the old "absent ⇒ leave whatever
         // the persistent shell has" behaviour.
-        char idenv[3 * (BLOCK_ID_CAP + 48)];
+        char idenv[4 * (BLOCK_ID_CAP + 48)];
         {
             size_t n = 0;
             #define ID_APPEND(key, val) do { \
@@ -1566,6 +1576,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             } while (0)
             idenv[0] = '\0';
             ID_APPEND("TODOFORAI_GROUP_ID", s->group_tag);
+            ID_APPEND("TODOFORAI_PROJECT_ID", s->project_id);
             ID_APPEND("TODOFORAI_TODO_ID", s->todo_id);
             ID_APPEND("AGENT_BROWSER_SESSION", s->todo_id);
             #undef ID_APPEND
