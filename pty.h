@@ -29,9 +29,10 @@ typedef struct {
 
 #ifdef _WIN32
 // Resolve which shell bridge_pty_spawn(NULL, …) would actually run:
-// $BRIDGE_SHELL → Git for Windows bash → PATH bash.exe (never the System32
-// WSL stub) → cmd.exe. Returns a static buffer. Used by identity reporting
-// and the RUN cmd.exe pre-check so all three always agree.
+// $BRIDGE_SHELL → Git for Windows bash.exe/sh.exe → PATH bash.exe/sh.exe
+// (never the System32 WSL stub) → provisioned busybox → cmd.exe. Returns a
+// static buffer. Used by identity reporting and the RUN cmd.exe pre-check so
+// all three always agree.
 const char *bridge_pty_resolve_shell(const char *shell);
 #endif
 

@@ -3,7 +3,8 @@
 // of anonymous pipes for stdin/stdout.
 //
 // Shell resolution (in order): explicit `shell` arg → $BRIDGE_SHELL → Git for
-// Windows install paths → bash.exe in PATH (never the System32 WSL stub) →
+// Windows install paths (bash.exe or sh.exe, bin\ then usr\bin\) → bash.exe /
+// sh.exe in PATH (never the System32 WSL stub) → provisioned busybox →
 // cmd.exe (last resort, where most catalog tools won't work). The RUN wrapper is
 // bash syntax, so a non-bash shell will produce broken output but the bridge
 // itself stays alive.
@@ -124,10 +125,18 @@ const char *bridge_pty_resolve_shell(const char *shell) {
     const char *env = getenv("BRIDGE_SHELL");
     if (env && *env) { snprintf(buf, sizeof(buf), "%s", env); return buf; }
 
-    // Git for Windows bash first — it's the shell RUN/tool catalog assume.
+    // Git for Windows first — it's the shell RUN/tool catalog assume. Probe
+    // sh.exe as well as bash.exe: they are the same msys2 binary, and an
+    // install whose bash.exe was renamed/removed (seen in the wild as
+    // `bash.exe.disabled`) still ships a perfectly good sh.exe. usr\bin is
+    // the real home of both; bin\ holds the wrappers.
     const char *fallbacks[] = {
         "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files\\Git\\bin\\sh.exe",
+        "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+        "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
         "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\sh.exe",
         NULL,
     };
     for (int i = 0; fallbacks[i]; i++) {
@@ -136,8 +145,13 @@ const char *bridge_pty_resolve_shell(const char *shell) {
             return buf;
         }
     }
-    // Then a PATH bash.exe, but never the System32 WSL launcher.
+    // Then a PATH bash.exe/sh.exe, but never the System32 WSL launcher.
+    // sh.exe is checked second: a PATH bash is the better-known shape, and
+    // the provisioned busybox (also sh.exe) is reached by the branch below
+    // even if it somehow landed on PATH.
     if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf))
+        return buf;
+    if (SearchPathA(NULL, "sh.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf))
         return buf;
 
     // Provisioned busybox sh (the guaranteed floor — see provision_shell_async).

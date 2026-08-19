@@ -175,10 +175,13 @@ GNU/BSD/macOS userspace; no extra installation needed.
 
 - POSIX + Windows (ConPTY, Win10 1809+). Windows build via
   `make release-windows-x64` (zig cc + mingw-w64). On Windows the bridge
-  spawns `bash.exe` inside ConPTY — set `BRIDGE_SHELL` to override, otherwise
-  it prefers Git for Windows bash, then a PATH `bash.exe` (skipping the
-  System32 WSL launcher, which isn't a usable POSIX shell here), falling back to `cmd.exe`
-  (RUN/tool catalog assume bash semantics — install Git for Windows or WSL).
+  spawns a POSIX shell inside ConPTY — set `BRIDGE_SHELL` to override,
+  otherwise it prefers Git for Windows (`bash.exe` or `sh.exe`, the same msys2
+  binary, so an install whose `bash.exe` was renamed still works), then a PATH
+  `bash.exe`/`sh.exe` (skipping the System32 WSL launcher, which isn't a
+  usable POSIX shell here), then a pinned busybox-w32 it provisions itself
+  into `%USERPROFILE%\.todoforai\shell\sh.exe`, falling back to `cmd.exe`
+  (RUN/tool catalog assume bash semantics — install Git for Windows).
   `step_paused` works on Linux, macOS, and Windows; on Windows the
   `passwordPrompt` flag is always 0 (the child's ECHO state isn't exposed
   through the ConPTY API).
