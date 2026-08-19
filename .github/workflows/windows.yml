@@ -82,6 +82,23 @@ jobs:
       # ConPTY smoke: spawn Git Bash inside a pseudo-console, run a command,
       # read its output, resize, and kill the process tree. Proves pty_win.c.
       # `make test-pty-win` cross-compiles then runs the .exe on this Windows host.
+      #
+      # Also exercises the two no-Git-Bash floors on a real console host:
+      #   - the pinned busybox (same asset + sha256 the bridge provisions at
+      #     runtime — see pty_win.c SHELL_ASSET_*) driving the production RUN
+      #     wrapper (init line, brace group, $?, sentinel), and
+      #   - the cmd.exe last-resort dialect (caret-split sentinel +
+      #     %ERRORLEVEL% on its own line — see main.c cmd_mode).
+      - name: Fetch pinned busybox (the bridge's provisioned shell)
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/todoforai/bridge/releases/download/shell-busybox-FRP-6075/busybox-w64u.exe'
+          $sha = '6E263D154D8548D1EB936F65D1D8312C80DF31C45974E48D6335E4DCC0F4F34C'
+          $out = Join-Path $env:RUNNER_TEMP 'busybox-sh.exe'
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $out
+          if ((Get-FileHash $out -Algorithm SHA256).Hash -ne $sha) { throw "busybox sha256 mismatch" }
+          "TFA_TEST_BUSYBOX=$out" | Out-File -Append $env:GITHUB_ENV
+
       - name: Build + run ConPTY smoke test
         working-directory: bridge
         shell: bash

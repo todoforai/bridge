@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "pty.h"
@@ -145,9 +146,98 @@ static int test_process_tree_termination(void) {
     return 1;
 }
 
+// The provisioned-busybox floor: spawn busybox sh (path via TFA_TEST_BUSYBOX,
+// downloaded by CI) and drive it exactly like the production RUN path — init
+// line (stty -echo; PS1=; printf ready) then the bash-syntax wrapper with a
+// brace group, $? capture and printf sentinel. Proves the pinned busybox can
+// serve as the RUN shell: sentinel completes, exit code is real, and the
+// wrapper line itself must NOT appear as a contiguous sentinel in output.
+static int test_busybox_run_wrapper(void) {
+    const char *bb = getenv("TFA_TEST_BUSYBOX");
+    if (!bb || !*bb) {
+        puts("SKIP: busybox RUN wrapper (TFA_TEST_BUSYBOX not set)");
+        return 0;
+    }
+
+    bridge_pty_t pty;
+    if (bridge_pty_spawn(&pty, bb, NULL, 1) != 0) {
+        fprintf(stderr, "FAIL: could not spawn busybox sh\n");
+        return 1;
+    }
+
+    // Mirror main.c: init line with split-quoted ready sentinel, then wrapper.
+    const char *init =
+        "stty -echo 2>/dev/null; PS1=; PS2=; printf '\\n__TB_''READY__\\n'\n";
+    const char *wrapper =
+        "{ echo hello-from-busybox; ls / >/dev/null 2>/dev/null; false\n"
+        "}; __RC=$?; printf '\\n__TB_''STEP__:%d\\n' \"$__RC\"\n";
+    if (bridge_pty_write_all(&pty, init, strlen(init)) != 0 ||
+        bridge_pty_write_all(&pty, wrapper, strlen(wrapper)) != 0) {
+        fprintf(stderr, "FAIL: could not write to busybox session\n");
+        bridge_pty_close(&pty);
+        return 1;
+    }
+
+    char output[65536] = {0};
+    if (wait_for_text(&pty, "__TB_STEP__:1", output, sizeof(output), 15000)) {
+        strip_ansi(output);
+        fprintf(stderr, "FAIL: busybox RUN wrapper sentinel never completed. Output:\n%s\n", output);
+        bridge_pty_close(&pty);
+        return 1;
+    }
+    char scan[65536]; memcpy(scan, output, sizeof(scan)); strip_ansi(scan);
+    if (!strstr(scan, "hello-from-busybox")) {
+        fprintf(stderr, "FAIL: busybox command output missing. Output:\n%s\n", scan);
+        bridge_pty_close(&pty);
+        return 1;
+    }
+    bridge_pty_close(&pty);
+    puts("PASS: busybox sh runs the production RUN wrapper (init, brace group, $?, sentinel)");
+    return 0;
+}
+
+// cmd.exe last-resort dialect (main.c cmd_mode): command on its own line,
+// `echo <caret-split sentinel>:%ERRORLEVEL%` on the next. Must prove
+// (a) %ERRORLEVEL% expands to the previous command's exit code when the lines
+// arrive sequentially through ConPTY, and (b) the echoed input line (which
+// carries the caret) never yields a contiguous sentinel before the real echo
+// output does — i.e. scanning for "<sentinel>:" completes with the right code.
+static int test_cmd_dialect(void) {
+    bridge_pty_t pty;
+    if (bridge_pty_spawn(&pty, "cmd.exe", NULL, 1) != 0) {
+        fprintf(stderr, "FAIL: could not spawn cmd.exe\n");
+        return 1;
+    }
+
+    const char *init = "echo off& echo __TC_^READY__\r\n";
+    // `exit /b 7` sets ERRORLEVEL without ending the shell.
+    const char *step =
+        "cmd /c exit 7\r\n"
+        "echo __TC_^STEP__:%ERRORLEVEL%\r\n";
+    if (bridge_pty_write_all(&pty, init, strlen(init)) != 0 ||
+        bridge_pty_write_all(&pty, step, strlen(step)) != 0) {
+        fprintf(stderr, "FAIL: could not write to cmd session\n");
+        bridge_pty_close(&pty);
+        return 1;
+    }
+
+    char output[65536] = {0};
+    if (wait_for_text(&pty, "__TC_STEP__:7", output, sizeof(output), 15000)) {
+        strip_ansi(output);
+        fprintf(stderr, "FAIL: cmd dialect sentinel:%%ERRORLEVEL%% never completed. Output:\n%s\n", output);
+        bridge_pty_close(&pty);
+        return 1;
+    }
+    bridge_pty_close(&pty);
+    puts("PASS: cmd.exe dialect (caret-split sentinel + %ERRORLEVEL% on its own line)");
+    return 0;
+}
+
 int main(void) {
     if (test_shell_io() != 0) return 1;
     if (test_process_tree_termination() != 0) return 1;
+    if (test_busybox_run_wrapper() != 0) return 1;
+    if (test_cmd_dialect() != 0) return 1;
     puts("Windows PTY smoke tests passed");
     return 0;
 }
