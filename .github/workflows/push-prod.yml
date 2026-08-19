@@ -1,0 +1,53 @@
+# Prod release — triggered by fast-forwarding the `prod` branch:
+#
+#   git push origin main:prod        (or: tfa-push-prod)
+#
+# There is no version file in this repo (BRIDGE_VERSION comes from `git describe`),
+# so the version IS the tag: this job bumps the latest vMAJOR.MINOR.PATCH tag by one
+# patch, pushes it, then dispatches release.yml on that tag.
+#
+# A tag pushed with GITHUB_TOKEN does NOT trigger release.yml's `on: push: tags`
+# (GitHub suppresses workflow-triggered events), hence the explicit workflow_dispatch.
+
+name: push-prod
+
+on:
+  push:
+    branches: ['prod']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # push the tag
+  actions: write    # dispatch release.yml
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags for `git describe`
+
+      - name: Resolve next tag
+        id: next
+        run: |
+          latest=$(git tag --list 'v*.*.*' --sort=-v:refname | head -1)
+          [ -n "$latest" ] || { echo "::error::no vMAJOR.MINOR.PATCH tag found"; exit 1; }
+          next=$(echo "$latest" | awk -F. '{sub(/^v/,"",$1); print "v"$1"."$2"."($3+1)}')
+          echo "Latest: $latest → next: $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Trigger release build
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --ref "$TAG" -f tag="$TAG"
