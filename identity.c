@@ -25,6 +25,9 @@
 #endif
 
 #include "json.h"
+#ifdef _WIN32
+#  include "pty.h"   // bridge_pty_resolve_shell
+#endif
 
 // Read first matching `KEY=value` line from a small text file. Strips surrounding
 // quotes. Returns 0 on found, -1 otherwise. Caller-owned `out` is NUL-terminated.
@@ -218,9 +221,11 @@ void bridge_identity_gather(bridge_identity_t *id) {
     const char *home = getenv("USERPROFILE");
     snprintf(id->home, sizeof(id->home), "%s", home ? home : "C:\\");
 
-    const char *sh = getenv("BRIDGE_SHELL");
-    if (!sh) sh = getenv("SHELL");
-    snprintf(id->shell, sizeof(id->shell), "%s", sh ? sh : "bash.exe");
+    // Report the shell RUN will actually spawn (BRIDGE_SHELL → Git Bash →
+    // PATH bash → cmd.exe), not an env guess — the agent's systemprompt shows
+    // this, and a "bash" label over a cmd.exe reality makes every RUN
+    // silently broken.
+    snprintf(id->shell, sizeof(id->shell), "%s", bridge_pty_resolve_shell(NULL));
 
     if (!_getcwd(id->cwd, sizeof(id->cwd)))
         snprintf(id->cwd, sizeof(id->cwd), "C:\\");

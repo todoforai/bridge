@@ -27,6 +27,14 @@ typedef struct {
     int    alive;
 } bridge_pty_t;
 
+#ifdef _WIN32
+// Resolve which shell bridge_pty_spawn(NULL, …) would actually run:
+// $BRIDGE_SHELL → Git for Windows bash → PATH bash.exe (never the System32
+// WSL stub) → cmd.exe. Returns a static buffer. Used by identity reporting
+// and the RUN cmd.exe pre-check so all three always agree.
+const char *bridge_pty_resolve_shell(const char *shell);
+#endif
+
 // Spawn `shell` in a new PTY. `cwd` may be NULL. If `no_echo`, the slave
 // terminal starts with ECHO/ECHOE/ECHOK cleared (used by RUN to keep wrapper
 // command lines off the output stream — sentinel scanning relies on this).

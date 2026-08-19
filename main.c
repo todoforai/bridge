@@ -1271,6 +1271,22 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
     if (IS("run")) {
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
+#ifdef _WIN32
+        // RUN wrappers are bash syntax. If shell resolution would land on
+        // cmd.exe, every step would emit garbage and never complete (the
+        // sentinel line is a bash printf) — fail loud and self-diagnosing
+        // instead. Interactive PTY paths are unaffected.
+        {
+            const char *rsh = bridge_pty_resolve_shell(DEFAULT_SHELL);
+            const char *base = rsh + strlen(rsh);
+            while (base > rsh && base[-1] != '\\' && base[-1] != '/') base--;
+            if (_stricmp(base, "cmd.exe") == 0 || _stricmp(base, "cmd") == 0)
+                return send_error(e, NULL, 0, bid, bid_len, "NO_BASH",
+                                  "shell resolved to cmd.exe but RUN commands require bash. "
+                                  "Install Git for Windows (https://git-scm.com/download/win) "
+                                  "or set BRIDGE_SHELL to a bash.exe path, then restart the bridge");
+        }
+#endif
         // Required fields: blockId, cmdB64. `sessionId` is optional — when
         // absent, the bridge spawns a one-shot PTY and auto-closes it on
         // STEP_DONE (kept alive only if STEP_AWAITING_INPUT fires first).

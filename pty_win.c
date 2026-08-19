@@ -38,8 +38,14 @@ static int is_wsl_stub(const char *path) {
     return _strnicmp(path, sysdir, n) == 0;
 }
 
-static const char *resolve_shell(const char *shell) {
+// Public (identity.c reports it; main.c RUN pre-checks it) so the shell the
+// backend/agent sees is the shell that actually spawns — never a guess.
+const char *bridge_pty_resolve_shell(const char *shell) {
     static char buf[MAX_PATH];
+    // Same PATH for every caller (identity, RUN pre-check, spawn): the
+    // managed-tools dirs are prepended before the PATH probe below, exactly
+    // as spawn does. Idempotent, so spawn's own call becomes a no-op.
+    bridge_prepend_tools_path_win();
     if (shell && *shell) { snprintf(buf, sizeof(buf), "%s", shell); return buf; }
     const char *env = getenv("BRIDGE_SHELL");
     if (env && *env) { snprintf(buf, sizeof(buf), "%s", env); return buf; }
@@ -143,7 +149,7 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     SetEnvironmentVariableA("PS1", "");
     SetEnvironmentVariableA("PS2", "");
 
-    const char *sh = resolve_shell(shell);
+    const char *sh = bridge_pty_resolve_shell(shell);
     char cmdline[MAX_PATH + 32];
     // Quoting: shell path may contain spaces. ConPTY child gets argv[0] = sh.
     snprintf(cmdline, sizeof(cmdline), "\"%s\"", sh);
