@@ -242,9 +242,57 @@ static int vt_cases(void) {
     return fails;
 }
 
+// redact_token: the device session token must never reach an OUTPUT frame,
+// whatever put it there (echoed wrapper, `set -x`, `env`).
+static int redact_cases(void) {
+    edge_t e;
+    memset(&e, 0, sizeof e);
+    snprintf(e.subagent_token, sizeof e.subagent_token,
+             "dst_%064d", 0);   // dst_ + 64 chars, same shape as the real one
+    const char *tok = e.subagent_token;
+
+    struct { const char *label; char buf[512]; const char *want_absent; } t[] = {
+        { "bare token",   "", tok },
+        { "in a wrapper", "", tok },
+        { "twice",        "", tok },
+    };
+    snprintf(t[0].buf, sizeof t[0].buf, "%s", tok);
+    snprintf(t[1].buf, sizeof t[1].buf, "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=x\n", tok);
+    snprintf(t[2].buf, sizeof t[2].buf, "%s and again %s\n", tok, tok);
+
+    int fails = 0;
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++) {
+        size_t len = strlen(t[i].buf);
+        redact_token(&e, (uint8_t *)t[i].buf, len);
+        if (strlen(t[i].buf) != len) {
+            fprintf(stderr, "[redact %s] FAIL: length changed\n", t[i].label);
+            fails++;
+        } else if (strstr(t[i].buf, t[i].want_absent)) {
+            fprintf(stderr, "[redact %s] FAIL: token survived: %s\n", t[i].label, t[i].buf);
+            fails++;
+        } else if (!strstr(t[i].buf, "dst_****")) {
+            fprintf(stderr, "[redact %s] FAIL: no dst_**** marker: %s\n", t[i].label, t[i].buf);
+            fails++;
+        }
+    }
+    // No token configured ⇒ never touch the data.
+    {
+        edge_t e2; memset(&e2, 0, sizeof e2);
+        char buf[] = "dst_looks_like_a_token_but_none_is_set";
+        redact_token(&e2, (uint8_t *)buf, strlen(buf));
+        if (strcmp(buf, "dst_looks_like_a_token_but_none_is_set") != 0) {
+            fprintf(stderr, "[redact no-token] FAIL: data was modified: %s\n", buf);
+            fails++;
+        }
+    }
+    if (!fails) fprintf(stderr, "[redact-token] OK (all cases)\n");
+    return fails;
+}
+
 int main(void) {
     g_max_sessions = 4;
     int fails = 0;
+    fails += redact_cases();
     fails += vt_cases();
     fails += scanner_cases();
     fails += run_case("echo-on-simple", "echo hello",     "hello\r\n");

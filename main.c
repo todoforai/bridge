@@ -753,6 +753,36 @@ static void emit_output_frame(edge_t *e, session_t *s,
     free(b64);
 }
 
+// Last line of defence before OUTPUT leaves the machine: scrub the device
+// session token (`dst_` + 64 hex) if it somehow reached the stream.
+//
+// The bridge injects that token into every RUN wrapper as an `export`, and a
+// terminal that echoes its input (ConPTY/conhost — see draining_begin) put
+// the whole wrapper line into OUTPUT, i.e. into backend logs and the agent's
+// context. The drain removes the echo at the source; this removes the
+// *credential* no matter what the source is (a `set -x` trace, `env`, a
+// wedged drain, a future wrapper change). Cheap: one memmem over each batch,
+// only while a token exists. In place, same length, so framing is unaffected.
+//
+// Scope: per batch. A token split across two flushes survives — closing that
+// needs a hold-back buffer, which would delay every OUTPUT frame to defend
+// against a leak the drain already prevents. Not worth it: this layer exists
+// to make the *common* leak shapes (a whole echoed wrapper line, an `env`
+// dump) non-credential-bearing, not as the primary control.
+static void redact_token(edge_t *e, uint8_t *data, size_t len) {
+    size_t tlen = strlen(e->subagent_token);
+    if (tlen == 0 || len < tlen) return;
+    uint8_t *p = data, *end = data + len;
+    while ((size_t)(end - p) >= tlen) {
+        uint8_t *hit = memmem(p, (size_t)(end - p), e->subagent_token, tlen);
+        if (!hit) return;
+        // Keep the `dst_` prefix so a reader can tell what was removed.
+        size_t keep = tlen > 4 ? 4 : 0;
+        memset(hit + keep, '*', tlen - keep);
+        p = hit + tlen;
+    }
+}
+
 // Ship whatever is queued for this session now. No-op when nothing is pending.
 // Every terminal frame (STEP_DONE / STEP_AWAITING_INPUT / EXIT) calls this
 // first, so the tail can never arrive after the frame that closes the step.
@@ -761,6 +791,7 @@ static void flush_output(edge_t *e, session_t *s) {
     size_t n = s->obuf_len;
     s->obuf_len = 0;
     s->obuf_since_ms = 0;
+    redact_token(e, s->obuf, n);
     emit_output_frame(e, s, s->obuf, n);
 }
 
@@ -772,7 +803,14 @@ static void send_output_bytes(edge_t *e, session_t *s,
                               const uint8_t *data, size_t len) {
     if (len == 0) return;
     // Single emission bigger than the whole buffer: keep ordering, send as-is.
-    if (len > sizeof s->obuf) { flush_output(e, s); emit_output_frame(e, s, data, len); return; }
+    // Bypasses obuf, so it needs its own redaction pass (callers own the
+    // buffer and expect it scrubbed either way — see redact_token).
+    if (len > sizeof s->obuf) {
+        flush_output(e, s);
+        redact_token(e, (uint8_t *)data, len);
+        emit_output_frame(e, s, data, len);
+        return;
+    }
     if (len > sizeof s->obuf - s->obuf_len) flush_output(e, s);
     memcpy(s->obuf + s->obuf_len, data, len);
     s->obuf_len += len;
