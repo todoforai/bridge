@@ -71,6 +71,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #  include <fcntl.h>
 #  include <poll.h>
 #  include <pwd.h>          // getpwnam/getpwuid for ~user expansion
+#  include <signal.h>       // kill() for --kill takeover
 #  include <sys/file.h>     // flock
 #  include <sys/resource.h>
 #  include <unistd.h>
@@ -2395,6 +2396,50 @@ static void bump_fd_limit(int want) {
 //
 // bInitialOwner=FALSE: the lock is the object's existence, not its ownership,
 // so there's no reason to take ownership and inherit abandoned-mutex semantics.
+
+// Owner-pid sidecar file. The mutex proves "someone is running"; the pid file
+// says WHO, so --kill can address it. Only ever read while the mutex is held by
+// a live process, so the pid can't be stale (the kernel destroys the mutex on
+// any process death, making acquire succeed and skip the kill entirely).
+static int device_pid_path(const char *device_id, char *buf, size_t cap) {
+    char cfg[1024];
+    if (login_config_path(cfg, sizeof cfg) < 0) return -1;
+    char *slash = strrchr(cfg, '\\');
+    if (!slash) slash = strrchr(cfg, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    snprintf(buf, cap, "%s\\bridge-%s.pid", cfg, device_id);
+    return 0;
+}
+
+static void device_lock_write_pid(const char *device_id) {
+    char path[1280];
+    if (device_pid_path(device_id, path, sizeof path) < 0) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%lu\n", (unsigned long)GetCurrentProcessId());
+    fclose(f);
+}
+
+static long device_lock_owner_pid(const char *device_id) {
+    char path[1280];
+    if (device_pid_path(device_id, path, sizeof path) < 0) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    long pid = 0;
+    if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+    fclose(f);
+    return pid;
+}
+
+static void device_lock_kill_owner(long pid) {
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (!h) return;
+    TerminateProcess(h, 1);
+    WaitForSingleObject(h, 5000);
+    CloseHandle(h);
+}
+
 static int acquire_device_lock(const char *device_id) {
     for (const char *p = device_id; *p; p++) {
         if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return 0;
@@ -2414,24 +2459,30 @@ static int acquire_device_lock(const char *device_id) {
         return 0;
     }
     if (err == ERROR_ALREADY_EXISTS) { CloseHandle(h); return -1; }
+    device_lock_write_pid(device_id);
     // Intentionally leak the handle — the kernel releases it on process exit.
     return 0;
 }
 #else
+static int device_lock_path(const char *device_id, char *buf, size_t cap) {
+    char cfg[1024];
+    if (login_config_path(cfg, sizeof cfg) < 0) return -1;  // no $HOME
+    // Strip "/credentials.json" to get the config dir, then build lock path.
+    char *slash = strrchr(cfg, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    snprintf(buf, cap, "%s/bridge-%s.lock", cfg, device_id);
+    return 0;
+}
+
 static int acquire_device_lock(const char *device_id) {
     // device_id is backend-issued `dev_<hex>`; refuse anything that could
     // escape the config dir if the creds file was hand-edited.
     for (const char *p = device_id; *p; p++) {
         if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return 0;
     }
-    char cfg[1024];
-    if (login_config_path(cfg, sizeof cfg) < 0) return 0;  // no $HOME → skip
-    // Strip "/credentials.json" to get the config dir, then build lock path.
-    char *slash = strrchr(cfg, '/');
-    if (!slash) return 0;
-    *slash = '\0';
     char lock_path[1280];
-    snprintf(lock_path, sizeof lock_path, "%s/bridge-%s.lock", cfg, device_id);
+    if (device_lock_path(device_id, lock_path, sizeof lock_path) < 0) return 0;
     int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return 0;  // best-effort; don't block startup on FS errors
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
@@ -2445,10 +2496,64 @@ static int acquire_device_lock(const char *device_id) {
         close(fd);
         return -1;
     }
+    // The holder's pid, so a `--kill` can address it. Safe to trust: this
+    // is only read while the flock is HELD, and a held flock means the writer
+    // is still alive (the kernel drops it on any process death).
+    char pidbuf[32];
+    int n = snprintf(pidbuf, sizeof pidbuf, "%ld\n", (long)getpid());
+    if (ftruncate(fd, 0) == 0) { ssize_t w = write(fd, pidbuf, (size_t)n); (void)w; }
     // Intentionally leak fd — kernel releases the lock on process exit.
     return 0;
 }
+
+static long device_lock_owner_pid(const char *device_id) {
+    char lock_path[1280];
+    if (device_lock_path(device_id, lock_path, sizeof lock_path) < 0) return 0;
+    FILE *f = fopen(lock_path, "r");
+    if (!f) return 0;
+    long pid = 0;
+    if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+    fclose(f);
+    return pid;
+}
+
+static void device_lock_kill_owner(long pid) {
+    kill((pid_t)pid, SIGTERM);
+}
 #endif
+
+static void lock_sleep_100ms(void) {
+#ifdef _WIN32
+    Sleep(100);
+#else
+    usleep(100 * 1000);
+#endif
+}
+
+// `--kill`: stop whoever holds the device lock, then take it. The polling
+// re-acquire (rather than waitpid) is because the holder is NOT our child —
+// it's a previous app instance, a systemd unit, a manual terminal run. The OS
+// releases the lock on the holder's death, so acquire succeeding IS the proof
+// that it's gone.
+static int device_lock_kill_existing(const char *device_id) {
+    long pid = device_lock_owner_pid(device_id);
+    if (pid <= 1) return -1;  // no owner recorded — refuse to guess
+    fprintf(stderr, "kill: stopping existing bridge (pid %ld) for device %.8s…\n",
+            pid, device_id);
+    device_lock_kill_owner(pid);
+    for (int i = 0; i < 50; i++) {           // up to 5s for a graceful exit
+        if (acquire_device_lock(device_id) == 0) return 0;
+        lock_sleep_100ms();
+    }
+#ifndef _WIN32
+    kill((pid_t)pid, SIGKILL);               // Windows TerminateProcess is already hard
+#endif
+    for (int i = 0; i < 20; i++) {           // up to 2s post-SIGKILL
+        if (acquire_device_lock(device_id) == 0) return 0;
+        lock_sleep_100ms();
+    }
+    return -1;
+}
 
 int bridge_main(int argc, char **argv) {
     // Off-loop worker: dispatch first and hard-return, so a worker can never
@@ -2483,11 +2588,13 @@ int bridge_main(int argc, char **argv) {
     }
 
     const char *host = NULL, *port_s = NULL, *profile = NULL;
+    int kill_existing = 0;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "profile",       ko_required_argument, 'P' },
+        { "kill",          ko_no_argument,       'K' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
@@ -2497,6 +2604,7 @@ int bridge_main(int argc, char **argv) {
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'P') profile = opt.arg;
+        else if (c == 'K') kill_existing = 1;
         else cli_parse_error("todoforai-bridge", USAGE_MAIN, argc, argv, &opt, c);
     }
     // Select the credential profile before any load (env is last resort).
@@ -2558,13 +2666,17 @@ int bridge_main(int argc, char **argv) {
     // Refuse to start if another bridge process on this machine is already
     // running for the same device. Without this, two bridges flap-loop kicking
     // each other off the server (close code 4000) every ~1s.
-    if (acquire_device_lock(saved_creds.device_id) < 0) {
+    // With --kill the newcomer wins: stop the holder, take the lock.
+    if (acquire_device_lock(saved_creds.device_id) < 0
+        && (!kill_existing || device_lock_kill_existing(saved_creds.device_id) < 0)) {
         fprintf(stderr,
             "error: another todoforai-bridge is already running for device %.8s… on this machine.\n"
 #ifdef _WIN32
-            "       Stop it first (Task Manager, or `Stop-ScheduledTask -TaskName 'TODOforAI Bridge'`).\n",
+            "       Stop it first (Task Manager, or `Stop-ScheduledTask -TaskName 'TODOforAI Bridge'`),\n"
+            "       or start with --kill to replace it.\n",
 #else
-            "       Stop it first (`pgrep -af todoforai-bridge`) or remove the duplicate from pm2/systemd.\n",
+            "       Stop it first (`pgrep -af todoforai-bridge`), remove the duplicate from pm2/systemd,\n"
+            "       or start with --kill to replace it.\n",
 #endif
             saved_creds.device_id);
         return 1;

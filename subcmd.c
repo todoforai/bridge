@@ -342,6 +342,7 @@ void print_help(void) {
            "  whoami               show current user/device\n"
            "  enroll               print a token to provision another device\n"
            "  update               install the latest release\n\n"
+           "      --kill           replace a bridge already running for this device\n"
            "  -h, --help           show this help\n"
            "  -v, --version        print version\n\n"
            "Docs: https://docs.todofor.ai\n");
