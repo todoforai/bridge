@@ -125,18 +125,21 @@ const char *bridge_pty_resolve_shell(const char *shell) {
     const char *env = getenv("BRIDGE_SHELL");
     if (env && *env) { snprintf(buf, sizeof(buf), "%s", env); return buf; }
 
-    // Git for Windows first — it's the shell RUN/tool catalog assume. Probe
-    // sh.exe as well as bash.exe: they are the same msys2 binary, and an
-    // install whose bash.exe was renamed/removed (seen in the wild as
-    // `bash.exe.disabled`) still ships a perfectly good sh.exe. usr\bin is
-    // the real home of both; bin\ holds the wrappers.
+    // Git for Windows first — it's the shell RUN/tool catalog assume. The RUN
+    // wrapper is bash syntax, so every bash.exe location is probed before any
+    // sh.exe. sh.exe is worth probing at all because it's the same msys2
+    // binary and an install whose bash.exe was renamed/removed (seen in the
+    // wild as `bash.exe.disabled`) still ships a perfectly good sh.exe —
+    // vastly better than falling through to busybox or cmd.exe.
     const char *fallbacks[] = {
         "C:\\Program Files\\Git\\bin\\bash.exe",
-        "C:\\Program Files\\Git\\bin\\sh.exe",
         "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-        "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
         "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+        "C:\\Program Files\\Git\\bin\\sh.exe",
+        "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
         "C:\\Program Files (x86)\\Git\\bin\\sh.exe",
+        "C:\\Program Files (x86)\\Git\\usr\\bin\\sh.exe",
         NULL,
     };
     for (int i = 0; fallbacks[i]; i++) {
