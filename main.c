@@ -205,6 +205,21 @@ typedef struct {
 } out_policy_t;
 
 
+// ── ConPTY VT stripper (Windows) ────────────────────────────────────────────
+// conhost re-renders the screen, so it injects escape sequences at ARBITRARY
+// byte offsets — including into the middle of our sentinel
+// (`__BRIDGE_STEP_485cc738f<ESC>[?25l4ef35d…`), which breaks the scan and
+// leaks the result line into OUTPUT. RUN output is consumed by an agent, not
+// a terminal, so the sequences carry no information: strip them before any
+// scanning. Stateful (a sequence may straddle read() boundaries).
+typedef enum {
+    VT_TEXT = 0,   // ordinary bytes
+    VT_ESC,        // saw ESC, awaiting the sequence type
+    VT_CSI,        // ESC [ … final byte in 0x40..0x7E
+    VT_OSC,        // ESC ] … terminated by BEL or ST
+    VT_OSC_ESC,    // inside OSC, saw ESC (expecting the ST backslash)
+    VT_CHARSET,    // ESC ( / ) / * / + <one byte>
+} vt_state_t;
 typedef enum { SESS_IDLE = 0, SESS_RUNNING } sess_state_t;
 
 typedef struct {
@@ -258,6 +273,10 @@ typedef struct {
     // Same set/clear semantics as group_tag.
     char project_id[BLOCK_ID_CAP + 1];
     size_t project_id_len;
+
+    // ConPTY VT stripper state (see vt_state_t). Carries across reads so a
+    // sequence split by a read() boundary is still removed.
+    vt_state_t vt;
 
     // Per-step begin drain -------------------------------------------------
     // POSIX disables PTY echo via termios and blanks PS1/PS2 in the child's
@@ -1051,20 +1070,66 @@ static void ob_finish(edge_t *e, session_t *s) {
     }
 }
 
+// Strip ANSI/VT escape sequences from buf in place (see vt_state_t). Keeps
+// \r\n\t and every printable byte; drops CSI/OSC/charset sequences and lone
+// control escapes. Returns the surviving length.
+static size_t vt_strip(vt_state_t *st, uint8_t *buf, size_t len) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = buf[i];
+        switch (*st) {
+        case VT_TEXT:
+            if (c == 0x1b) { *st = VT_ESC; break; }
+            buf[w++] = c;
+            break;
+        case VT_ESC:
+            if (c == '[')                          *st = VT_CSI;
+            else if (c == ']')                     *st = VT_OSC;
+            else if (c=='('||c==')'||c=='*'||c=='+') *st = VT_CHARSET;
+            else                                   *st = VT_TEXT;  // 2-byte ESC seq
+            break;
+        case VT_CSI:
+            // Parameter/intermediate bytes 0x20..0x3F, final byte 0x40..0x7E.
+            if (c >= 0x40 && c <= 0x7e) *st = VT_TEXT;
+            break;
+        case VT_OSC:
+            if (c == 0x07)      *st = VT_TEXT;     // BEL terminator
+            else if (c == 0x1b) *st = VT_OSC_ESC;  // maybe ST (ESC \)
+            break;
+        case VT_OSC_ESC:
+            *st = (c == '\\') ? VT_TEXT : VT_OSC;
+            break;
+        case VT_CHARSET:
+            *st = VT_TEXT;
+            break;
+        }
+    }
+    return w;
+}
+
 // Returns the number of bytes read this call (0 on EAGAIN/no data), so the
 // caller can keep draining while a full buffer suggests more is pending.
 static long forward_pty_output(edge_t *e, session_t *s) {
-    long n = bridge_pty_read(&s->pty, e->pty_buf, sizeof(e->pty_buf));
-    if (n <= 0) return 0;
+    long n_read = bridge_pty_read(&s->pty, e->pty_buf, sizeof(e->pty_buf));
+    if (n_read <= 0) return 0;
     s->last_active_ms = monotonic_ms();
+    long n = n_read;
+#ifdef _WIN32
+    // ConPTY injects escapes mid-stream (even inside the sentinel). Strip
+    // before anything scans or forwards these bytes. The READ count is what
+    // the caller wants back ("a full buffer means more may be pending"), so
+    // it stays separate from the surviving byte count `n`.
+    n = (long)vt_strip(&s->vt, e->pty_buf, (size_t)n);
+    if (n == 0) return n_read;
+#endif
 
     int appended = 0;  // bytes already funneled into tail_buf by the drain
 
     if (s->draining_begin) {
         tail_append(s, e->pty_buf, (size_t)n);
         appended = 1;
-        if (!begin_drain_scan(s)) return n;  // still draining — all bytes dropped/held
-        if (s->tail_len == 0) return n;      // drain done, nothing left over
+        if (!begin_drain_scan(s)) return n_read;  // still draining — all bytes dropped/held
+        if (s->tail_len == 0) return n_read;      // drain done, nothing left over
     }
 
     if (s->state != SESS_RUNNING) {
@@ -1074,7 +1139,7 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         } else {
             send_output_bytes(e, s, e->pty_buf, (size_t)n);
         }
-        return n;
+        return n_read;
     }
 
     // PTY echo is OFF on this session (set at spawn), so what we read is the
@@ -1093,7 +1158,7 @@ static long forward_pty_output(edge_t *e, session_t *s) {
             memmove(s->tail_buf, s->tail_buf + emit, s->tail_len - emit);
             s->tail_len -= emit;
         }
-        return n;
+        return n_read;
     }
 
     // Strict result-line parse: require "<sentinel>:<int>\r?\n". Anything
@@ -1141,7 +1206,7 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         s->tail_len -= skip;
         // Loop hint: caller will run again on next read; if more sentinel
         // candidates already in tail, they'll be discovered then.
-        return n;
+        return n_read;
     }
 
     if (!has_code) {
@@ -1155,7 +1220,7 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         size_t keep = s->tail_len - (size_t)found;
         memmove(s->tail_buf, s->tail_buf + (size_t)found, keep);
         s->tail_len = keep;
-        return n;
+        return n_read;
     }
 
     // Success. Emit pre-sentinel bytes minus the injected separator.
@@ -1180,7 +1245,7 @@ static long forward_pty_output(edge_t *e, session_t *s) {
     // closes the PTY + clears s->active — so the caller's drain loop must
     // re-check s->active before reading again.
     run_finish(s);
-    return n;
+    return n_read;
 }
 
 // ── Command dispatch ────────────────────────────────────────────────────────

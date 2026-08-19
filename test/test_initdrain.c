@@ -200,9 +200,52 @@ static int run_case(const char *label, const char *cmd, const char *expect_out) 
     return fail;
 }
 
+// vt_strip: conhost injects escapes at arbitrary offsets — even inside the
+// sentinel — so the stripper must remove them across read() boundaries and
+// leave every printable byte (and \r\n\t) untouched.
+static int vt_cases(void) {
+    static const struct { const char *in, *want; } cases[] = {
+        // ESC split INSIDE the sentinel (the real ConPTY failure).
+        { "__BRIDGE_STEP_485cc738f\x1b[?25l4ef35d__:0\r\n", "__BRIDGE_STEP_485cc738f4ef35d__:0\r\n" },
+        { "hello\x1b[19;1H\r\n",        "hello\r\n" },        // CSI cursor move
+        { "a\x1b]0;title\ab",            "ab" },               // OSC + BEL
+        { "a\x1b]0;title\x1b\\b",        "ab" },               // OSC + ST
+        { "a\x1b(Bb",                    "ab" },               // charset select
+        { "a\x1b=b",                     "ab" },               // 2-byte ESC seq
+        { "plain\ttext\r\n",             "plain\ttext\r\n" },  // nothing to strip
+    };
+    int fails = 0;
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+        // Every chunk size: a sequence straddling reads must still vanish.
+        size_t len = strlen(cases[c].in);
+        for (size_t chunk = 1; chunk <= len; chunk++) {
+            vt_state_t st = VT_TEXT;
+            char out[256]; size_t out_len = 0;
+            for (size_t off = 0; off < len; off += chunk) {
+                size_t take = len - off < chunk ? len - off : chunk;
+                uint8_t tmp[256];
+                memcpy(tmp, cases[c].in + off, take);
+                size_t kept = vt_strip(&st, tmp, take);
+                memcpy(out + out_len, tmp, kept);
+                out_len += kept;
+            }
+            out[out_len] = '\0';
+            if (strcmp(out, cases[c].want) != 0) {
+                fprintf(stderr, "[vt-strip case=%zu chunk=%zu] FAIL: got '%s' want '%s'\n",
+                        c, chunk, out, cases[c].want);
+                fails++;
+                break;
+            }
+        }
+    }
+    if (!fails) fprintf(stderr, "[vt-strip] OK (all cases, all chunk splits)\n");
+    return fails;
+}
+
 int main(void) {
     g_max_sessions = 4;
     int fails = 0;
+    fails += vt_cases();
     fails += scanner_cases();
     fails += run_case("echo-on-simple", "echo hello",     "hello\r\n");
     fails += run_case("echo-on-multi",  "echo a; echo b", "a\r\nb\r\n");
