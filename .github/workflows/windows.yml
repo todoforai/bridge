@@ -94,7 +94,10 @@ jobs:
         run: |
           $url = 'https://github.com/todoforai/bridge/releases/download/shell-busybox-FRP-6075/busybox-w64u.exe'
           $sha = '6E263D154D8548D1EB936F65D1D8312C80DF31C45974E48D6335E4DCC0F4F34C'
-          $out = Join-Path $env:RUNNER_TEMP 'busybox-sh.exe'
+          # MUST be named sh.exe: busybox is a multi-call binary that picks its
+          # applet from argv[0] — a "busybox*" name prints the banner and exits.
+          # Same reason the bridge provisions it as .todoforai\shell\sh.exe.
+          $out = Join-Path $env:RUNNER_TEMP 'sh.exe'
           Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $out
           if ((Get-FileHash $out -Algorithm SHA256).Hash -ne $sha) { throw "busybox sha256 mismatch" }
           "TFA_TEST_BUSYBOX=$out" | Out-File -Append $env:GITHUB_ENV
