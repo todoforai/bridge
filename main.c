@@ -269,6 +269,12 @@ typedef struct {
     // PTY echo is disabled at spawn, so the wrapper command line never
     // appears in OUTPUT and the sentinel scan is unambiguous.
     sess_state_t state;
+    // Windows last-resort: shell resolved to cmd.exe (no POSIX shell yet —
+    // busybox provisioning pending/failed). RUN still works via a cmd-dialect
+    // wrapper (`echo <sentinel>:%ERRORLEVEL%` on its own line) so the agent
+    // can e.g. install Git Bash itself; every step's output carries a notice.
+    // Env exports (TODOFORAI_*, PAGER) are skipped in this mode.
+    int cmd_mode;
     char sentinel[SENTINEL_CAP];
     size_t sentinel_len;
     // Per-step routing (echoed in OUTPUT/STEP_DONE while running).
@@ -439,6 +445,19 @@ static size_t build_init_line(char *out, size_t cap, const char *ready_sentinel)
     int n = snprintf(out, cap,
         "stty -echo 2>/dev/null; PS1=; PS2=; printf '\\n__BRIDGE_''%s\\n'\n",
         ready_sentinel + 9 /* skip "__BRIDGE_" */);
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+// cmd.exe variant of the init line (Windows last-resort mode). `echo off`
+// suppresses the prompt; the ready sentinel is emitted by a plain echo. The
+// caret (^) is cmd's escape char: the ECHOED input line carries
+// `__BRIDGE_^READY_…` (never matches the scan) while the echo's OUTPUT is the
+// contiguous marker. ConPTY input echo can't be disabled for cmd (no stty),
+// so wrapper lines stay visible in output — accepted noise for a mode whose
+// only job is letting the agent repair the machine.
+static size_t build_init_line_cmd(char *out, size_t cap, const char *ready_sentinel) {
+    int n = snprintf(out, cap, "echo off& echo __BRIDGE_^%s\r\n",
+                     ready_sentinel + 9 /* skip "__BRIDGE_" */);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
@@ -1145,6 +1164,14 @@ static long forward_pty_output(edge_t *e, session_t *s) {
 
     (void)line_end;  // bytes after the sentinel line are silently dropped (they shouldn't exist).
     ob_finish(e, s);  // emit truncation notice + tail (no-op if nothing dropped)
+    if (s->cmd_mode) {
+        // Make the degraded mode unmissable for the agent on every step.
+        static const char notice[] =
+            "\n[cmd.exe limited mode - POSIX shell missing; bridge is provisioning busybox "
+            "in the background. For full functionality install Git for Windows "
+            "(https://git-scm.com/download/win) or set BRIDGE_SHELL, then restart the bridge]\n";
+        send_output_bytes(e, s, (const uint8_t *)notice, sizeof notice - 1);
+    }
     send_step_done(e, s, has_code, exit_code, /*timedOut=*/0);
     // run_finish drops the run to SESS_IDLE, and for one-shot sessions also
     // closes the PTY + clears s->active — so the caller's drain loop must
@@ -1271,22 +1298,6 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
     if (IS("run")) {
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
-#ifdef _WIN32
-        // RUN wrappers are bash syntax. If shell resolution would land on
-        // cmd.exe, every step would emit garbage and never complete (the
-        // sentinel line is a bash printf) — fail loud and self-diagnosing
-        // instead. Interactive PTY paths are unaffected.
-        {
-            const char *rsh = bridge_pty_resolve_shell(DEFAULT_SHELL);
-            const char *base = rsh + strlen(rsh);
-            while (base > rsh && base[-1] != '\\' && base[-1] != '/') base--;
-            if (_stricmp(base, "cmd.exe") == 0 || _stricmp(base, "cmd") == 0)
-                return send_error(e, NULL, 0, bid, bid_len, "NO_BASH",
-                                  "shell resolved to cmd.exe but RUN commands require bash. "
-                                  "Install Git for Windows (https://git-scm.com/download/win) "
-                                  "or set BRIDGE_SHELL to a bash.exe path, then restart the bridge");
-        }
-#endif
         // Required fields: blockId, cmdB64. `sessionId` is optional — when
         // absent, the bridge spawns a one-shot PTY and auto-closes it on
         // STEP_DONE (kept alive only if STEP_AWAITING_INPUT fires first).
@@ -1343,6 +1354,20 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // No cwd from agent → fall back to <tmpdir>/todoforai (mirrors edge),
             // so we don't leak whatever pwd the bridge daemon was launched in.
             const char *spawn_cwd = has_cwd ? cwd_buf : resolve_default_cwd();
+            // Windows last-resort detection: resolution landing on cmd.exe
+            // means no POSIX shell yet (busybox provisioning pending/failed).
+            // RUN proceeds in cmd-dialect (see session_t.cmd_mode) so the
+            // agent can still act — e.g. install Git Bash itself.
+            s->cmd_mode = 0;
+#ifdef _WIN32
+            {
+                const char *rsh = bridge_pty_resolve_shell(DEFAULT_SHELL);
+                const char *rb = rsh + strlen(rsh);
+                while (rb > rsh && rb[-1] != '\\' && rb[-1] != '/') rb--;
+                if (_stricmp(rb, "cmd.exe") == 0 || _stricmp(rb, "cmd") == 0)
+                    s->cmd_mode = 1;
+            }
+#endif
             if (bridge_pty_spawn(&s->pty, DEFAULT_SHELL, spawn_cwd, /*no_echo=*/1) != 0) {
                 free(cmd);
                 return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", "failed to spawn PTY");
@@ -1356,7 +1381,9 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->init_drained = 0;
             if (s->draining_init) {
                 char init_line[SENTINEL_CAP + 96];
-                size_t in_n = build_init_line(init_line, sizeof init_line, s->ready_sentinel);
+                size_t in_n = s->cmd_mode
+                    ? build_init_line_cmd(init_line, sizeof init_line, s->ready_sentinel)
+                    : build_init_line(init_line, sizeof init_line, s->ready_sentinel);
                 if (in_n == 0) {
                     // Couldn't even build the line — proceed without drain
                     // rather than dropping output waiting for a ready line
@@ -1557,7 +1584,17 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
-        if (e->subagent_token[0]) {
+        if (s->cmd_mode) {
+            // cmd.exe dialect. Two separate lines: %ERRORLEVEL% expands at
+            // PARSE time, so it must sit on its own line to see the command's
+            // exit code. The echoed input line carries a caret-split sentinel
+            // (`__BRIDGE_^STEP_…`) so only the echo's real output matches the
+            // scan. Env exports (TODOFORAI_*, PAGER) are skipped: cmd `set`
+            // semantics differ and the tfa-* tools don't work here anyway.
+            wn = snprintf(wrapped, wrapped_cap,
+                "%.*s\r\necho __BRIDGE_^%s:%%ERRORLEVEL%%\r\n",
+                (int)cmd_len, cmd, s->sentinel + 9 /* skip "__BRIDGE_" */);
+        } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
                 "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",

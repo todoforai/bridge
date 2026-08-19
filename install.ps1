@@ -121,6 +121,34 @@ try {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
+# ── shell provisioning (busybox) ────────────────────────────────────────────
+# RUN commands require a POSIX shell. If neither Git Bash nor a provisioned
+# shell exists, pre-download the pinned busybox-w32 the bridge would otherwise
+# fetch on first use (same asset, same canonical path, same sha256 pin as in
+# bridge pty_win.c).
+$shellDir  = Join-Path $env:USERPROFILE '.todoforai\shell'
+$shellExe  = Join-Path $shellDir 'sh.exe'
+$gitBash   = @("$env:ProgramFiles\Git\bin\bash.exe", "${env:ProgramFiles(x86)}\Git\bin\bash.exe") |
+             Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $gitBash -and -not (Test-Path $shellExe)) {
+    $shellUrl = 'https://github.com/todoforai/bridge/releases/download/shell-busybox-FRP-6075/busybox-w64u.exe'
+    $shellSha = '6E263D154D8548D1EB936F65D1D8312C80DF31C45974E48D6335E4DCC0F4F34C'
+    try {
+        New-Item -ItemType Directory -Force -Path $shellDir | Out-Null
+        $part = "$shellExe.$PID.part"
+        Invoke-WebRequest -UseBasicParsing -Uri $shellUrl -OutFile $part
+        if ((Get-FileHash $part -Algorithm SHA256).Hash -eq $shellSha) {
+            Move-Item -Force $part $shellExe
+            Ok "provisioned minimal shell (busybox) -> $shellExe"
+        } else {
+            Remove-Item -Force $part
+            Info "shell download hash mismatch - the bridge will retry at runtime"
+        }
+    } catch {
+        Info "could not pre-provision shell ($($_.Exception.Message)) - the bridge will retry at runtime"
+    }
+}
+
 $Bridge = Join-Path $Prefix 'todoforai-bridge.exe'
 $Cmd    = $Bridge
 $Where  = $Bridge

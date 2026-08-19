@@ -25,6 +25,80 @@
 #include <stdlib.h>
 #include <string.h>
 
+// ── provisioned shell (busybox-w32) ─────────────────────────────────────────
+// When neither Git Bash nor a PATH bash exists, the bridge guarantees its own
+// POSIX shell: a pinned busybox-w32 (ash + coreutils applets, ~660 KB, 64-bit
+// Unicode build) mirrored as a todoforai/bridge release asset. Downloaded once
+// to %USERPROFILE%\.todoforai\shell\sh.exe, sha256-verified against the pin
+// below. GPLv2; upstream https://github.com/rmyorston/busybox-w32.
+#define SHELL_ASSET_URL \
+    "https://github.com/todoforai/bridge/releases/download/shell-busybox-FRP-6075/busybox-w64u.exe"
+#define SHELL_ASSET_SHA256 \
+    "6E263D154D8548D1EB936F65D1D8312C80DF31C45974E48D6335E4DCC0F4F34C"
+
+// %USERPROFILE%\.todoforai\shell\sh.exe. Returns 0 on success.
+static int canonical_shell_path(char *buf, size_t cap) {
+    const char *home = getenv("USERPROFILE");
+    if (!home || !*home) return -1;
+    int n = snprintf(buf, cap, "%s\\.todoforai\\shell\\sh.exe", home);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+// Fire-and-forget download of the pinned busybox to the canonical path.
+// The bridge has no TLS client (update.c precedent), so shell out to
+// powershell: fetch to a per-PID .part file, verify sha256, atomic rename.
+// Idempotent per process; safe across racing bridge processes (unique temp,
+// Move-Item -Force). Failure is silent here — the resolver keeps returning
+// cmd.exe and RUN keeps failing fast with a self-diagnosing error.
+static void provision_shell_async(void) {
+    static int started = 0;
+    if (started) return;
+    started = 1;
+
+    char dest[MAX_PATH];
+    if (canonical_shell_path(dest, sizeof dest) != 0) return;
+    // dest is interpolated into a single-quoted powershell string below; a
+    // quote in USERPROFILE (C:\Users\O'Brien) would break out of it. Rare
+    // enough to just skip — NO_BASH-mode guidance still tells the user what
+    // to install by hand.
+    if (strpbrk(dest, "'\"")) return;
+
+    // mkdir -p %USERPROFILE%\.todoforai\shell
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof dir, "%s", dest);
+    char *slash = strrchr(dir, '\\');
+    if (!slash) return;
+    *slash = '\0';
+    char parent[MAX_PATH];
+    snprintf(parent, sizeof parent, "%s", dir);
+    char *pslash = strrchr(parent, '\\');
+    if (pslash) { *pslash = '\0'; CreateDirectoryA(parent, NULL); }
+    CreateDirectoryA(dir, NULL);
+
+    char pscmd[2048];
+    int n = snprintf(pscmd, sizeof pscmd,
+        "powershell -NoProfile -NonInteractive -Command "
+        "\"$ProgressPreference='SilentlyContinue';"
+        "$d='%s';$t=$d+'.'+$PID+'.part';"
+        "try{Invoke-WebRequest -UseBasicParsing -Uri '%s' -OutFile $t;"
+        "if((Get-FileHash $t -Algorithm SHA256).Hash -eq '%s')"
+        "{Move-Item -Force $t $d}else{Remove-Item -Force $t}}"
+        "catch{if(Test-Path $t){Remove-Item -Force $t -ErrorAction SilentlyContinue}}\"",
+        dest, SHELL_ASSET_URL, SHELL_ASSET_SHA256);
+    if (n <= 0 || (size_t)n >= sizeof pscmd) return;
+
+    fprintf(stderr, "note: no bash found — provisioning minimal shell (busybox) to %s\n", dest);
+    fflush(stderr);
+
+    STARTUPINFOA si = { .cb = sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+    if (CreateProcessA(NULL, pscmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);   // don't wait: resolver re-checks per call
+    }
+}
+
 // Resolve the shell path. Caller may pass NULL.
 // True if `path` lives in System32 — i.e. the WSL launcher (…\System32\bash.exe).
 // That stub is NOT a POSIX shell: with no WSL distro installed it just prints a
@@ -66,20 +140,17 @@ const char *bridge_pty_resolve_shell(const char *shell) {
     if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf))
         return buf;
 
-    // Last resort. RUN wrappers are bash syntax, so every command will produce
-    // broken output while the bridge stays "online" — the failure mode that is
-    // hardest to diagnose from the UI. Say so once, loudly, instead of failing
-    // silently: an interactive PTY session in cmd.exe still works, so refusing
-    // to spawn would break more than it fixes.
-    static int warned = 0;
-    if (!warned) {
-        warned = 1;
-        fprintf(stderr,
-            "warn: no bash found — falling back to cmd.exe. RUN commands expect bash\n"
-            "      and will produce broken output. Install Git for Windows\n"
-            "      (https://git-scm.com/download/win) or set BRIDGE_SHELL.\n");
-        fflush(stderr);
-    }
+    // Provisioned busybox sh (the guaranteed floor — see provision_shell_async).
+    if (canonical_shell_path(buf, sizeof(buf)) == 0 &&
+        GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES)
+        return buf;
+
+    // Nothing yet: kick the one-time async provisioning and fall back to
+    // cmd.exe for now. RUN refuses cmd.exe (NO_BASH pre-check in main.c) and
+    // the resolver re-runs per call, so the first RUN after the download
+    // lands picks up sh.exe automatically. Interactive PTY sessions still
+    // work in cmd.exe, so refusing to spawn would break more than it fixes.
+    provision_shell_async();
     snprintf(buf, sizeof(buf), "cmd.exe");
     return buf;
 }

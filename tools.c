@@ -20,6 +20,9 @@
 #include "tools.h"
 #include "json.h"
 #include "env_path.h"
+#ifdef _WIN32
+#  include "pty.h"   // bridge_pty_resolve_shell — the one shell resolver
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -52,30 +55,16 @@
 // stdout+stderr into `out` (NUL-terminated, trimmed of trailing whitespace).
 // Returns the child exit code (0 = success), or -1 on spawn/timeout failure.
 #ifdef _WIN32
-// Locate a POSIX-ish shell. Catalog commands assume `sh -c` semantics, so on
-// Windows we run them through bash.exe (Git Bash / MSYS2 / WSL). $BRIDGE_SHELL
-// overrides; otherwise let CreateProcess search PATH for "bash.exe".
+// Locate a POSIX-ish shell via the one shared resolver (pty_win.c), so tool
+// probing, identity and RUN always agree. Catalog commands assume `sh -c`
+// semantics, so a cmd.exe resolution means "no usable shell" here.
 static const char *win_shell(void) {
-    static char buf[MAX_PATH];
-    static int  resolved = 0;
-    if (resolved) return buf[0] ? buf : NULL;
-    resolved = 1;
-    const char *env = getenv("BRIDGE_SHELL");
-    if (env && *env) { snprintf(buf, sizeof(buf), "%s", env); return buf; }
-    if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0) return buf;
-    const char *fallbacks[] = {
-        "C:\\Program Files\\Git\\bin\\bash.exe",
-        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-        NULL,
-    };
-    for (int i = 0; fallbacks[i]; i++) {
-        if (GetFileAttributesA(fallbacks[i]) != INVALID_FILE_ATTRIBUTES) {
-            snprintf(buf, sizeof(buf), "%s", fallbacks[i]);
-            return buf;
-        }
-    }
-    buf[0] = '\0';
-    return NULL;
+    const char *sh = bridge_pty_resolve_shell(NULL);
+    if (!sh || !*sh) return NULL;
+    const char *base = sh + strlen(sh);
+    while (base > sh && base[-1] != '\\' && base[-1] != '/') base--;
+    if (_stricmp(base, "cmd.exe") == 0 || _stricmp(base, "cmd") == 0) return NULL;
+    return sh;
 }
 
 static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
