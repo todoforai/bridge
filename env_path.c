@@ -90,6 +90,8 @@ void bridge_prepend_tools_path_win(void) {
 static const char *ABSOLUTE_CANDIDATE_DIRS[] = {
     "/opt/homebrew/bin",              // Homebrew, Apple Silicon
     "/opt/homebrew/sbin",
+    "/usr/local/bin",                 // Homebrew, Intel mac (and classic Unix)
+    "/usr/local/sbin",
     "/home/linuxbrew/.linuxbrew/bin", // Linuxbrew
     NULL,
 };
