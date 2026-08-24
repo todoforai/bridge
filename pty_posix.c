@@ -30,17 +30,34 @@
 int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no_echo) {
     // Pre-build termios so the slave starts in the desired mode. Setting echo
     // from the child after fork races against the parent's first write.
+    //
+    // Everything is stated explicitly: a zeroed struct means "disabled", never
+    // "default", so any behavior we rely on must be written down here. (This
+    // used to go through cfmakeraw() + a re-enable of ICANON|ISIG|IEXTEN, which
+    // netted out to exactly the flags below — but left c_cc all-zero, i.e.
+    // `intr = <undef>`. ISIG with no VINTR is inert, so the `\x03` the UI and
+    // agent send for Ctrl+C reached the command as ordinary stdin data instead
+    // of raising SIGINT. Hence: no derive-then-undo, just the intended mode.)
     struct termios t = {0};
-    t.c_iflag = ICRNL | IXON;
+    t.c_iflag = ICRNL;                      // CR→NL on input; no IXON — a stray ^S must not freeze a run
     t.c_oflag = OPOST | ONLCR;
     t.c_cflag = CREAD | CS8 | B38400;
-    t.c_lflag = ICANON | ISIG | IEXTEN | ECHO | ECHOE | ECHOK;
-    cfmakeraw(&t);
-    // Re-enable canonical line discipline + signals; cfmakeraw turned them off.
-    t.c_iflag |= ICRNL;
-    t.c_oflag |= OPOST | ONLCR;
-    t.c_lflag |= ICANON | ISIG | IEXTEN;
+    t.c_lflag = ICANON | ISIG | IEXTEN;     // line-at-a-time + control chars raise signals
     if (!no_echo) t.c_lflag |= ECHO | ECHOE | ECHOK;
+
+    // Control characters ISIG/ICANON act on. Conventional values (Linux/macOS
+    // <sys/ttydefaults.h>), spelled out rather than included for portability.
+    t.c_cc[VINTR]  = 0x03;                  // ^C  — SIGINT: the interrupt path
+    t.c_cc[VQUIT]  = 0x1c;                  // ^\  — SIGQUIT
+    t.c_cc[VEOF]   = 0x04;                  // ^D  — EOF, releases a blocked stdin reader
+    t.c_cc[VERASE] = 0x7f;
+    t.c_cc[VKILL]  = 0x15;
+    t.c_cc[VMIN]   = 1;
+    t.c_cc[VTIME]  = 0;
+    // ^Z stays disabled: the shell runs without job control and no wire message
+    // sends SIGCONT, so a stopped run would hang until its deadline — invisible
+    // to the pause detector, which only recognizes tasks blocked in n_tty_read.
+    t.c_cc[VSUSP]  = _POSIX_VDISABLE;
 
     int master_fd = -1;
     pid_t pid = forkpty(&master_fd, NULL, &t, NULL);

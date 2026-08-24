@@ -212,6 +212,13 @@ test-pollfix: | build
 	$(CC) -O0 -g -Wall -I. -o build/test-pollfix test/test_pollfix.c $(TEST_DEPS) -lutil
 	./build/test-pollfix
 
+# Ctrl+C: `\x03` must raise SIGINT via the line discipline (VINTR), repeatably,
+# without killing the persistent shell.
+.PHONY: test-sigint
+test-sigint: | build
+	$(CC) -O0 -g -Wall -I. -o build/test-sigint test/test_sigint.c $(TEST_DEPS) -lutil
+	./build/test-sigint
+
 # Blocked-on-stdin detection: `read` prompts and /dev/tty getpass (sudo's path).
 .PHONY: test-probe
 test-probe: | build
