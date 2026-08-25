@@ -350,6 +350,11 @@ typedef struct {
     // Defer identity until auth round-trip settles: backend awaits
     // validateDevice() async, so a TCP-coalesced 2nd frame is rejected.
     int identity_sent;
+    // Set on the first decrypted server frame AFTER auth was sent — the only
+    // proof the server accepted our credentials. The "✓ Authenticated" banner
+    // keys off this, never off merely having SENT the auth frame (which used
+    // to print a lying banner right before a 4401).
+    int auth_confirmed;
     int64_t auth_sent_ms;
 
     // Bearer (dst_… 64 hex) from backend post-auth. Exported as
@@ -406,7 +411,7 @@ static void reset_connection_state(edge_t *e) {
     memset(&e->ws, 0, sizeof(e->ws));
     memset(&e->noise, 0, sizeof(e->noise));
     e->done = 0; e->rc = 0;
-    e->identity_sent = 0; e->auth_sent_ms = 0;
+    e->identity_sent = 0; e->auth_confirmed = 0; e->auth_sent_ms = 0;
     e->got_close_frame = 0; e->close_code = 0;
     e->close_reason[0] = '\0'; e->err_msg[0] = '\0';
     // Token is reissued by the backend on every reconnect; drop the stale one.
@@ -2269,6 +2274,15 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
         return;
     }
     debug_wire("← recv", n, (const char *)e->msg_buf);
+    if (!e->auth_confirmed && e->auth_sent_ms != 0) {
+        // First app frame from the server post-auth (token push, ping, RUN…):
+        // the server validated our device credentials.
+        e->auth_confirmed = 1;
+        if (e->user_email && e->user_email[0])
+            fprintf(stderr, "✓ Authenticated as %s\n", e->user_email);
+        else
+            fprintf(stderr, "✓ Authenticated\n");
+    }
     handle_command(e, (const char *)e->msg_buf, (size_t)n);
 }
 
@@ -2400,10 +2414,6 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             int il = bridge_identity_json(id, sizeof id, 0);
             if (il <= 0 || send_json(e, id, (size_t)il) != 0) { fail(e, "failed to send identity frame"); break; }
             e->identity_sent = 1;
-            if (e->user_email && e->user_email[0])
-                fprintf(stderr, "✓ Authenticated as %s\n", e->user_email);
-            else
-                fprintf(stderr, "✓ Authenticated\n");
         }
         service_sessions(e);
         // Forward anything the off-loop workers produced (tool scan results,
@@ -2807,7 +2817,7 @@ int bridge_main(int argc, char **argv) {
     const int max_attempts_post_auth = 60;   // ~5 h   — rides out server outages
     int attempt = 0;
     int ever_authenticated = 0;
-    int relogin_attempted = 0;  // one auto re-enroll per 4401 streak
+    int relogin_hint_shown = 0;  // print the manual-recovery hint once per 4401 streak
     char last_err_shown[sizeof e->err_msg] = {0};
     int rc;
     for (;;) {
@@ -2815,7 +2825,7 @@ int bridge_main(int argc, char **argv) {
                  host, port, DEFAULT_PATH, server_pubkey);
         if (rc == 0) break;
 
-        int was_authenticated = e->identity_sent;
+        int was_authenticated = e->auth_confirmed;  // server-confirmed, not merely "auth frame sent"
         if (was_authenticated) ever_authenticated = 1;
 
         if (e->got_close_frame) {
@@ -2830,33 +2840,77 @@ int bridge_main(int argc, char **argv) {
             }
         }
 
-        if (e->got_close_frame && e->close_code == 4401) {
-            // Stale creds (device removed or secret rotated server-side).
-            // Self-heal: clear them and re-run the same login flow first-run
-            // uses, then reload and keep the loop going. Guarded to one attempt
-            // per disconnect so a persistently failing login can't tight-loop.
-            if (!relogin_attempted) {
-                relogin_attempted = 1;
-                fprintf(stderr, "Device credentials rejected — re-enrolling this device...\n");
-                login_logout("todoforai-bridge");
-                if (bridge_login_run(NULL, NULL, host, NULL) == 0
-                    && login_load_credentials(&saved_creds) == 0
-                    && saved_creds.device_id[0] && saved_creds.device_secret[0]
-                    && saved_creds.backend_pubkey[0]
-                    && parse_pubkey_hex(saved_creds.backend_pubkey, server_pubkey) == 0) {
-                    attempt = 0;
-                    reset_connection_state(e);
-                    continue;
+        int is_4401 = e->got_close_frame && e->close_code == 4401;
+        if (is_4401) {
+            // Server rejected our device credentials. This is NEVER a reason
+            // to destroy local state: the rejection can be transient (backend
+            // datastore restarted empty or behind, or a sibling process on
+            // this host rotated the secret via re-enroll). Self-heal
+            // NON-destructively:
+            //   1. Re-read credentials.json — a sibling login may have written
+            //      a rotated secret; pick it up and reconnect immediately.
+            //   2. Otherwise keep our credentials and retry forever with
+            //      capped backoff. If the device really was removed, a human
+            //      runs `todoforai-bridge logout && todoforai-bridge login` in
+            //      another shell and step 1
+            //      picks up the new credentials on the next 4401 — no daemon
+            //      restart, no interactive prompt on a headless box, and
+            //      never a deleted credentials.json.
+            login_credentials_t disk;
+            int adopt = 0;
+            if (login_load_credentials(&disk) == 0
+                && disk.device_id[0] && disk.device_secret[0]
+                && (strcmp(disk.device_id, saved_creds.device_id) != 0
+                    || strcmp(disk.device_secret, saved_creds.device_secret) != 0)) {
+                adopt = 1;
+                // The per-device lock was taken for the original id. A changed
+                // id means a different backend session slot — claim its lock
+                // too before adopting, or another daemon already owns it and
+                // we must not fight over the slot. (The old lock is simply
+                // kept until exit; harmless.)
+                if (strcmp(disk.device_id, saved_creds.device_id) != 0
+                    && acquire_device_lock(disk.device_id) != 0) {
+                    fprintf(stderr, "Credentials on disk are for device %.8s…, but another bridge "
+                                    "already runs as it — not adopting.\n", disk.device_id);
+                    adopt = 0;
                 }
             }
-            fprintf(stderr, "Re-run `todoforai-bridge login` (device removed or secret rotated).\n");
-            break;
+            if (adopt) {
+                fprintf(stderr, "Credentials changed on disk — reloading and reconnecting...\n");
+                // Parse the (possibly new) pubkey into a scratch buffer first:
+                // parse_pubkey_hex writes as it goes, so a half-bad value must
+                // not clobber the known-good server_pubkey.
+                uint8_t newkey[32];
+                if (disk.backend_pubkey[0]) {
+                    if (parse_pubkey_hex(disk.backend_pubkey, newkey) == 0)
+                        memcpy(server_pubkey, newkey, sizeof newkey);
+                    else
+                        fprintf(stderr, "warning: bad backend pubkey in reloaded credentials; keeping previous.\n");
+                }
+                saved_creds = disk;  // e->user_email points into saved_creds (stable stack address)
+                attempt = 0;
+                relogin_hint_shown = 0;
+                reset_connection_state(e);
+                continue;
+            }
+            if (!relogin_hint_shown) {
+                relogin_hint_shown = 1;
+                fprintf(stderr,
+                    "Device credentials rejected by server — keeping local credentials and retrying.\n"
+                    "If this persists, run `todoforai-bridge logout && todoforai-bridge login` in another\n"
+                    "terminal; this daemon will pick up the new credentials automatically.\n");
+            }
         }
 
-        if (was_authenticated) { attempt = 0; relogin_attempted = 0; }  // healthy drop → fresh budget
+        if (was_authenticated) { attempt = 0; relogin_hint_shown = 0; }  // healthy drop → fresh budget
         ++attempt;
         int max_attempts = ever_authenticated ? max_attempts_post_auth : max_attempts_pre_auth;
-        if (attempt >= max_attempts) {
+        if (is_4401) {
+            // Never give up on 4401 — an outage of the backend's device store
+            // must not strand an unattended machine. Pin the backoff at its
+            // 300s ceiling instead of exhausting the attempt budget.
+            if (attempt > 14) attempt = 14;
+        } else if (attempt >= max_attempts) {
             fprintf(stderr, "Giving up after %d attempts.\n", max_attempts);
             break;
         }
@@ -2864,9 +2918,10 @@ int bridge_main(int argc, char **argv) {
         // Backoff: 1, then 2s for the first several retries so a routine
         // backend restart (down ~20s) is ridden out with tight polling, then
         // exponential 4, 8, 16, … capped at 300s.
-        int delay = attempt <= 1 ? 1
-                  : attempt <= 6 ? 2
-                  :                (1 << (attempt - 5)) > 300 ? 300 : (1 << (attempt - 5));
+        int delay = attempt <= 1  ? 1
+                  : attempt <= 6  ? 2
+                  : attempt >= 14 ? 300  // 1<<9=512 already capped; also avoids UB shifts at high attempt counts
+                  :                 1 << (attempt - 5);
         fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n", delay, attempt, max_attempts);
 #ifdef _WIN32
         Sleep((DWORD)delay * 1000);
