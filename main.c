@@ -345,6 +345,15 @@ typedef struct {
     const char *device_id;
     const char *device_secret;
     const char *user_email;  // for the auth banner; points into main()'s saved_creds
+    // Mayfly mode (--mayfly <todoId>): ephemeral, task-scoped session. Auths
+    // with the normal saved credentials but registers backend-side under the
+    // in-memory id `mayfly-<todoId>` — never as the persistent device row —
+    // so it can run alongside the normal bridge and is invisible to other
+    // TODOs. Keyed by the todo itself (scramjet pattern): only that todo's
+    // dispatch ever resolves it, and reconnects land in the same session slot.
+    int  mayfly;
+    char mayfly_todo_id[40];     // the todo this session is scoped to (CLI-minted)
+    char mayfly_workspace[1024]; // absolute cwd at startup — the task's workspace root
     int done;
     int rc;
     // Defer identity until auth round-trip settles: backend awaits
@@ -2263,11 +2272,17 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
     }
     if (n == 0) {
         // Handshake just completed → send auth. Identity is deferred (see edge_t).
-        char auth[1024]; size_t u = 0;
+        // Mayfly mode piggybacks on the same credentials but asks the backend
+        // for an ephemeral, task-scoped registration (see edge_t.mayfly).
+        char auth[2048]; size_t u = 0;
         if (json_emit_raw(auth, sizeof auth, &u, "{", 1) < 0 ||
             jfield_str(auth, sizeof auth, &u, "type", "auth", -1, 0) < 0 ||
             jfield_str(auth, sizeof auth, &u, "deviceId", e->device_id, -1, 1) < 0 ||
             jfield_str(auth, sizeof auth, &u, "secret", e->device_secret, -1, 1) < 0 ||
+            (e->mayfly &&
+             (jfield_raw(auth, sizeof auth, &u, "mayfly", "true", 1) < 0 ||
+              jfield_str(auth, sizeof auth, &u, "todoId", e->mayfly_todo_id, -1, 1) < 0 ||
+              jfield_str(auth, sizeof auth, &u, "workspacePath", e->mayfly_workspace, -1, 1) < 0)) ||
             json_emit_raw(auth, sizeof auth, &u, "}", 1) < 0) { fail(e, "failed to build auth frame"); return; }
         if (send_json(e, auth, u) != 0) { fail(e, "failed to send auth frame"); return; }
         e->auth_sent_ms = monotonic_ms();
@@ -2282,6 +2297,13 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
             fprintf(stderr, "✓ Authenticated as %s\n", e->user_email);
         else
             fprintf(stderr, "✓ Authenticated\n");
+        if (e->mayfly) {
+            // Machine-readable readiness line for the spawning CLI (stdout,
+            // not stderr — it's the mayfly contract, not a log). The device
+            // id the backend registered us under is `mayfly-<todoId>`.
+            printf("BRIDGE_READY id=mayfly-%s\n", e->mayfly_todo_id);
+            fflush(stdout);
+        }
     }
     handle_command(e, (const char *)e->msg_buf, (size_t)n);
 }
@@ -2292,6 +2314,9 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
 // updates later — the next token push re-arms this.
 static void maybe_self_update(edge_t *e) {
     if (!e->update_pending) return;
+    // Never in mayfly mode: the swap ends with exit(0), which would kill the
+    // task-scoped session out from under the CLI that spawned it.
+    if (e->mayfly) { e->update_pending = 0; return; }
     for (int i = 0; i < g_max_sessions; i++)
         if (e->sessions[i].active && e->sessions[i].state == SESS_RUNNING) return;
 
@@ -2702,12 +2727,16 @@ int bridge_main(int argc, char **argv) {
 
     const char *host = NULL, *port_s = NULL, *profile = NULL;
     int kill_existing = 0;
+    const char *mayfly_todo_id = NULL;
+    const char *mayfly_workspace = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "profile",       ko_required_argument, 'P' },
         { "kill",          ko_no_argument,       'K' },
+        { "mayfly",        ko_required_argument, 'M' },
+        { "workspace",     ko_required_argument, 'W' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
@@ -2718,6 +2747,8 @@ int bridge_main(int argc, char **argv) {
         else if (c == 'p') port_s = opt.arg;
         else if (c == 'P') profile = opt.arg;
         else if (c == 'K') kill_existing = 1;
+        else if (c == 'M') mayfly_todo_id = opt.arg;
+        else if (c == 'W') mayfly_workspace = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE_MAIN, argc, argv, &opt, c);
     }
     // Select the credential profile before any load (env is last resort).
@@ -2780,7 +2811,9 @@ int bridge_main(int argc, char **argv) {
     // running for the same device. Without this, two bridges flap-loop kicking
     // each other off the server (close code 4000) every ~1s.
     // With --kill the newcomer wins: stop the holder, take the lock.
-    if (acquire_device_lock(saved_creds.device_id) < 0
+    // Mayfly sessions skip the lock entirely: they register backend-side under
+    // a fresh id, so they coexist with the normal bridge for this device.
+    if (!mayfly_todo_id && acquire_device_lock(saved_creds.device_id) < 0
         && (!kill_existing || device_lock_kill_existing(saved_creds.device_id) < 0)) {
         fprintf(stderr,
             "error: another todoforai-bridge is already running for device %.8s… on this machine.\n"
@@ -2810,6 +2843,41 @@ int bridge_main(int argc, char **argv) {
     e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
     if (!e->sessions) { free(e); return 1; }
     e->user_email = saved_creds.user_email;  // safe: saved_creds outlives the run loop
+    if (mayfly_todo_id) {
+        // Todo ids are CLI-minted uuids (enforced server-side too); reject
+        // anything else so a typo'd flag fails here instead of as a server
+        // auth error.
+        if (!is_valid_uuid(mayfly_todo_id, strlen(mayfly_todo_id))) {
+            fprintf(stderr, "error: --mayfly requires a uuid todo id.\n");
+            free(e->sessions); free(e);
+            return 1;
+        }
+        e->mayfly = 1;
+        snprintf(e->mayfly_todo_id, sizeof e->mayfly_todo_id, "%s", mayfly_todo_id);
+        // Workspace root: --workspace flag, else the invoking cwd — the
+        // spawning CLI runs from the task's repo, so "." is the contract.
+        if (mayfly_workspace) {
+            if (strlen(mayfly_workspace) >= sizeof e->mayfly_workspace) {
+                fprintf(stderr, "error: --workspace path too long (max %zu bytes).\n",
+                        sizeof e->mayfly_workspace - 1);
+                free(e->sessions); free(e);
+                return 1;
+            }
+            snprintf(e->mayfly_workspace, sizeof e->mayfly_workspace, "%s", mayfly_workspace);
+        } else {
+#ifdef _WIN32
+            if (!_getcwd(e->mayfly_workspace, sizeof e->mayfly_workspace))
+#else
+            if (!getcwd(e->mayfly_workspace, sizeof e->mayfly_workspace))
+#endif
+            {
+                fprintf(stderr, "error: --mayfly could not resolve cwd (pass --workspace).\n");
+                free(e->sessions); free(e);
+                return 1;
+            }
+        }
+        fprintf(stderr, "mayfly session for todo %s (workspace: %s)\n", e->mayfly_todo_id, e->mayfly_workspace);
+    }
 
     // Reconnect loop. PTY sessions survive across reconnects; in-flight RPCs
     // are rejected by handleClose, not replayed.

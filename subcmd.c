@@ -343,6 +343,8 @@ void print_help(void) {
            "  enroll               print a token to provision another device\n"
            "  update               install the latest release\n\n"
            "      --kill           replace a bridge already running for this device\n"
+           "      --mayfly TODO    ephemeral session scoped to that todo (used by tfa-cli --isolated)\n"
+           "      --workspace P    workspace root for --mayfly (default: cwd)\n"
            "  -h, --help           show this help\n"
            "  -v, --version        print version\n\n"
            "Docs: https://docs.todofor.ai\n");
