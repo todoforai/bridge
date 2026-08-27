@@ -344,6 +344,10 @@ typedef struct {
     noise_ws_t noise;
     const char *device_id;
     const char *device_secret;
+    // Login-less mayfly auth: when set, the auth frame carries this API key
+    // instead of device credentials — no `login`, no credentials.json, no
+    // Device row. Only meaningful together with `mayfly`.
+    const char *api_key;
     const char *user_email;  // for the auth banner; points into main()'s saved_creds
     // Mayfly mode (--mayfly <todoId>): ephemeral, task-scoped session. Auths
     // with the normal saved credentials but registers backend-side under the
@@ -595,7 +599,7 @@ static session_t *evict_lru_idle(edge_t *e) {
  * they are plaintext at this layer. */
 static void debug_wire(const char *dir, long n, const char *s) {
     static const char *secret_keys[] = {
-        "\"secret\"", "\"token\"", "\"apiToken\"",
+        "\"secret\"", "\"token\"", "\"apiToken\"", "\"apiKey\"",
         "\"authorization\"", "\"cookie\"", "\"set-cookie\"", "\"setCookie\"", "\"x-api-key\"",
     };
     if (!getenv("BRIDGE_DEBUG_WIRE")) return;
@@ -1810,12 +1814,18 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // Persist as `apiToken` so CLIs invoked outside a bridge-spawned
             // PTY (no TODOFORAI_API_TOKEN in env) can still auth. Refreshed
             // on every reconnect; TTL ~24h matches backend session TTL.
-            login_credentials_t upd;
-            memset(&upd, 0, sizeof upd);
-            if (tlen < sizeof upd.api_token) {
-                memcpy(upd.api_token, t, tlen);
-                upd.api_token[tlen] = '\0';
-                (void)login_save_credentials(&upd);
+            // NEVER in mayfly mode: the session is ephemeral, and writing a
+            // dst_ token into credentials.json pollutes the host CLI's key
+            // resolution (the stored token outranks the env API key but is
+            // rejected on /api/v1 — the exact failure --isolated had).
+            if (!e->mayfly) {
+                login_credentials_t upd;
+                memset(&upd, 0, sizeof upd);
+                if (tlen < sizeof upd.api_token) {
+                    memcpy(upd.api_token, t, tlen);
+                    upd.api_token[tlen] = '\0';
+                    (void)login_save_credentials(&upd);
+                }
             }
         } else {
             // Bad/oversized token: clear so we don't leak a partial value into env.
@@ -2277,8 +2287,10 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
         char auth[2048]; size_t u = 0;
         if (json_emit_raw(auth, sizeof auth, &u, "{", 1) < 0 ||
             jfield_str(auth, sizeof auth, &u, "type", "auth", -1, 0) < 0 ||
-            jfield_str(auth, sizeof auth, &u, "deviceId", e->device_id, -1, 1) < 0 ||
-            jfield_str(auth, sizeof auth, &u, "secret", e->device_secret, -1, 1) < 0 ||
+            (e->api_key
+                ? (jfield_str(auth, sizeof auth, &u, "apiKey", e->api_key, -1, 1) < 0)
+                : (jfield_str(auth, sizeof auth, &u, "deviceId", e->device_id, -1, 1) < 0 ||
+                   jfield_str(auth, sizeof auth, &u, "secret", e->device_secret, -1, 1) < 0)) ||
             (e->mayfly &&
              (jfield_raw(auth, sizeof auth, &u, "mayfly", "true", 1) < 0 ||
               jfield_str(auth, sizeof auth, &u, "todoId", e->mayfly_todo_id, -1, 1) < 0 ||
@@ -2729,6 +2741,7 @@ int bridge_main(int argc, char **argv) {
     int kill_existing = 0;
     const char *mayfly_todo_id = NULL;
     const char *mayfly_workspace = NULL;
+    const char *api_key = NULL;
     ko_longopt_t longopts[] = {
         { "help",          ko_no_argument,       'h' },
         { "host",          ko_required_argument, 'H' },
@@ -2737,11 +2750,12 @@ int bridge_main(int argc, char **argv) {
         { "kill",          ko_no_argument,       'K' },
         { "mayfly",        ko_required_argument, 'M' },
         { "workspace",     ko_required_argument, 'W' },
+        { "api-key",       ko_required_argument, 'A' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:P:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hH:p:P:A:", longopts)) >= 0) {
         if      (c == 'h') { print_help(); return 0; }
         else if (c == 'H') host = opt.arg;
         else if (c == 'p') port_s = opt.arg;
@@ -2749,7 +2763,34 @@ int bridge_main(int argc, char **argv) {
         else if (c == 'K') kill_existing = 1;
         else if (c == 'M') mayfly_todo_id = opt.arg;
         else if (c == 'W') mayfly_workspace = opt.arg;
+        else if (c == 'A') api_key = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE_MAIN, argc, argv, &opt, c);
+    }
+    // Env fallback keeps the key out of argv (visible in `ps`); the spawning
+    // CLI prefers it over the flag.
+    //
+    // Copy it out and scrub the variable immediately: PTYs inherit this
+    // process's environment, so leaving it there would hand the user's DURABLE
+    // api key to every command the agent runs (`env`, /proc/<pid>/environ, …).
+    // Agent shells only ever get the short-lived dst_ session token.
+    static char api_key_buf[256];
+    if (!api_key && mayfly_todo_id) {
+        const char *envk = getenv("TODOFORAI_MAYFLY_API_KEY");
+        if (envk && envk[0] && strlen(envk) < sizeof api_key_buf) {
+            snprintf(api_key_buf, sizeof api_key_buf, "%s", envk);
+            api_key = api_key_buf;
+        }
+    }
+#ifdef _WIN32
+    _putenv("TODOFORAI_MAYFLY_API_KEY=");
+#else
+    unsetenv("TODOFORAI_MAYFLY_API_KEY");
+#endif
+    // --api-key is only meaningful for ephemeral mayfly sessions; the
+    // persistent daemon must keep its device identity (login flow).
+    if (api_key && !mayfly_todo_id) {
+        fprintf(stderr, "error: --api-key requires --mayfly.\n");
+        return 2;
     }
     // Select the credential profile before any load (env is last resort).
     // When --host points at a local/dev backend but no --profile was given,
@@ -2766,7 +2807,9 @@ int bridge_main(int argc, char **argv) {
 
     // No creds → run login inline, then fall through to daemon.
     // Sandbox/systemd setups pre-provision via `login --token` and skip this.
-    if (!saved_creds.device_id[0] || !saved_creds.device_secret[0]) {
+    // Login-less mayfly (--api-key) needs no device identity at all: the API
+    // key authenticates the auth frame directly, so never trigger login.
+    if (!api_key && (!saved_creds.device_id[0] || !saved_creds.device_secret[0])) {
         fprintf(stderr, "No device credentials found. Starting login...\n\n");
         // Forward --host only; --port here is BRIDGE_PORT (HTTP/WS), not Noise.
         int rc = bridge_login_run(NULL, NULL, host, NULL);
@@ -2795,15 +2838,23 @@ int bridge_main(int argc, char **argv) {
 
     // The Noise pubkey was pinned during `login` (TOFU on the NX handshake).
     // No flag, no env, no hardcoded default — just what we learned on day one.
-    if (!saved_creds.backend_pubkey[0]) {
+    // Login-less mayfly has no stored pin (and no credentials at all): fall
+    // back to TOFU on this connection — the same trust profile `login --token`
+    // has on its first connect, and the API key never travels before the
+    // encrypted channel is up. Prefer a stored pin when one exists though.
+    uint8_t server_pubkey[32];
+    int have_pubkey = 0;
+    if (saved_creds.backend_pubkey[0]) {
+        if (parse_pubkey_hex(saved_creds.backend_pubkey, server_pubkey) == 0) have_pubkey = 1;
+        else if (!api_key) {
+            fprintf(stderr, "error: stored backend pubkey is corrupt (re-run `todoforai-bridge login`).\n");
+            return 1;
+        }
+    }
+    if (!have_pubkey && !api_key) {
         fprintf(stderr,
             "error: credentials are missing the backend pubkey.\n"
             "Run `todoforai-bridge logout && todoforai-bridge login` to refresh.\n");
-        return 1;
-    }
-    uint8_t server_pubkey[32];
-    if (parse_pubkey_hex(saved_creds.backend_pubkey, server_pubkey) != 0) {
-        fprintf(stderr, "error: stored backend pubkey is corrupt (re-run `todoforai-bridge login`).\n");
         return 1;
     }
 
@@ -2843,6 +2894,7 @@ int bridge_main(int argc, char **argv) {
     e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
     if (!e->sessions) { free(e); return 1; }
     e->user_email = saved_creds.user_email;  // safe: saved_creds outlives the run loop
+    e->api_key = api_key;                    // login-less mayfly auth (NULL otherwise)
     if (mayfly_todo_id) {
         // Todo ids are CLI-minted uuids (enforced server-side too); reject
         // anything else so a typo'd flag fails here instead of as a server
@@ -2890,7 +2942,7 @@ int bridge_main(int argc, char **argv) {
     int rc;
     for (;;) {
         rc = run(e, saved_creds.device_id, saved_creds.device_secret,
-                 host, port, DEFAULT_PATH, server_pubkey);
+                 host, port, DEFAULT_PATH, have_pubkey ? server_pubkey : NULL);
         if (rc == 0) break;
 
         int was_authenticated = e->auth_confirmed;  // server-confirmed, not merely "auth frame sent"
@@ -2908,6 +2960,15 @@ int bridge_main(int argc, char **argv) {
             }
         }
 
+        // 4402: the server rejected our API key (login-less mayfly). Unlike a
+        // 4401 there is nothing to self-heal — no credentials.json to reload,
+        // no rotation to pick up — so retrying just burns the CLI's readiness
+        // timeout and reports a misleading "not ready" instead of the cause.
+        if (e->got_close_frame && e->close_code == 4402) {
+            fprintf(stderr, "error: API key rejected by server.\n");
+            rc = 1;
+            break;
+        }
         int is_4401 = e->got_close_frame && e->close_code == 4401;
         if (is_4401) {
             // Server rejected our device credentials. This is NEVER a reason
