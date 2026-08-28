@@ -207,8 +207,56 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
+  # The .exe is cross-compiled on Linux (zig), which can't run signtool — so
+  # Azure Trusted Signing happens in this separate Windows job. It rewrites the
+  # build artifact in place (signed exe + regenerated sha256) before `release`
+  # downloads everything. Mirrors the frontend repo's signing setup.
+  sign-windows:
     needs: build
+    runs-on: windows-latest
+    # The windows build leg is optional (continue-on-error) — mirror that here
+    # so a missing/failed exe still doesn't hold up Linux/macOS releases.
+    continue-on-error: true
+    steps:
+      - name: Download windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: todoforai-bridge-windows-x64
+          path: signdir
+
+      - name: Sign with Azure Trusted Signing
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          cargo install trusted-signing-cli --version 0.11.0 --locked
+          $exe = "signdir/todoforai-bridge-windows-x64.exe"
+          trusted-signing-cli -e "${{ secrets.AZURE_SIGNING_ENDPOINT }}" -a "${{ secrets.AZURE_SIGNING_ACCOUNT }}" -c "${{ secrets.AZURE_SIGNING_PROFILE }}" -d TODOforAI $exe
+          if ($LASTEXITCODE -ne 0) { Write-Error "signing failed"; exit 1 }
+          # Prove the signature landed
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          & $signtool verify /pa /v $exe
+          if ($LASTEXITCODE -ne 0) { Write-Error "exe is not signed"; exit 1 }
+          # The signature changed the bytes -> the checksum must be regenerated
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  todoforai-bridge-windows-x64.exe" | Set-Content "$exe.sha256" -NoNewline
+
+      - name: Re-upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: todoforai-bridge-windows-x64
+          path: |
+            signdir/todoforai-bridge-windows-x64.exe
+            signdir/todoforai-bridge-windows-x64.exe.sha256
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [build, sign-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (for gh CLI context)
