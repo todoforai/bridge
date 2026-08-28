@@ -345,6 +345,8 @@ void print_help(void) {
            "      --kill           replace a bridge already running for this device\n"
            "      --mayfly TODO    ephemeral session scoped to that todo (used by tfa-cli --isolated)\n"
            "      --workspace P    workspace root for --mayfly (default: cwd)\n"
+           "      --session-token T  authenticate --mayfly with a token instead of this\n"
+           "                       device's credentials (env: TODOFORAI_MAYFLY_TOKEN)\n"
            "  -h, --help           show this help\n"
            "  -v, --version        print version\n\n"
            "Docs: https://docs.todofor.ai\n");
