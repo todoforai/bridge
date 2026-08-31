@@ -174,9 +174,31 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
         // locked with no thread left to release it. So everything unsafe
         // (building PATH, setenv) happens once in the parent — see
         // bridge_scan_tools — and this child only rearranges fds and execs.
+        // Order matters, and so does every guarded close: if the bridge was
+        // started with a standard descriptor already closed, pipe() hands back
+        // the low number that frees up — pipefd[0] can BE fd 0. Closing a
+        // source fd unconditionally after it has become a destination undoes
+        // the very redirect we just made, so each close is guarded and stdin is
+        // claimed last, once the pipe ends are out of the way.
         dup2(pipefd[1], 1);
         dup2(pipefd[1], 2);
-        close(pipefd[0]); close(pipefd[1]);
+        if (pipefd[0] > 2) close(pipefd[0]);
+        if (pipefd[1] > 2) close(pipefd[1]);
+        // stdin from /dev/null, never the bridge's own. A probe that reads
+        // stdin (a CLI prompting for a password, a `read` in a statusCmd)
+        // would otherwise inherit our terminal or socket and block until the
+        // deadline killed it — reported as "not authenticated" for a tool that
+        // was merely waiting for input nobody was there to type. /dev/null
+        // gives it instant EOF, so it fails fast and honestly instead.
+        // This also closes the pipe's read end in the case where it landed on
+        // fd 0; if /dev/null can't be opened, an EBADF stdin still beats
+        // inheriting ours, which is what this exists to prevent.
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            if (devnull != 0) { dup2(devnull, 0); close(devnull); }
+        } else {
+            close(0);
+        }
         // New process group so we can kill the whole shell pipeline on timeout.
         setpgid(0, 0);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
@@ -430,7 +452,15 @@ static int probe_append_json(const probe_t *p, int first,
         if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
         if (json_emit_str(out, out_cap, used, p->version_out, -1) < 0) return -1;
     }
-    if (p->installed && p->have_s) {
+    // s_exit == -1 is our own failure to run the probe (deadline hit, spawn
+    // error), not the tool's answer. Emitting `false` for it would label a
+    // working CLI "signed out"; omitting the field leaves it "not checked",
+    // which the backend merge keeps at its last known value.
+    //
+    // Only -1 qualifies. A probe that ran and died on a signal still exits
+    // through the shell as 128+signo (SIGABRT = 134), which is a real, if
+    // unhappy, answer from the tool and is reported as such.
+    if (p->installed && p->have_s && p->s_exit >= 0) {
         if (json_emit_raw(out, out_cap, used, ",", 1) < 0) return -1;
         if (json_emit_str(out, out_cap, used, "authenticated", -1) < 0) return -1;
         if (json_emit_raw(out, out_cap, used, ":", 1) < 0) return -1;
@@ -594,7 +624,8 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
             // Auth only applies to tools that define a statusCmd (`have_s`).
             // Tools without one have no auth concept — don't count them as
             // authenticated (that would make the banner read N/N spuriously).
-            if (p->installed && p->have_s) {
+            // A probe we failed to run (s_exit -1) has no answer to count.
+            if (p->installed && p->have_s && p->s_exit >= 0) {
                 stats->auth_applicable++;
                 if (p->authed) stats->authenticated++;
             }

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int fails = 0;
@@ -92,6 +93,56 @@ int main(void) {
     len = bridge_scan_tools(entries, n, out, sizeof(out), &st);
     CHECK(len > 0 && strstr(out, "\"echotool\":{\"installed\":true") != NULL,
           "without config: catalog tool back to normal");
+
+    // A statusCmd that reads stdin must hit EOF, not the bridge's own stdin.
+    //
+    // The test installs its OWN blocking stdin — the read end of a pipe whose
+    // write end is held open — instead of trusting whatever the runner hands
+    // us. Under `make test-tools </dev/null` an inherited fd 0 is already at
+    // EOF, so the probe would return promptly with or without the fix and the
+    // test would pass vacuously. With a pipe nobody writes to, an inherited
+    // fd 0 blocks until the 10s deadline; only the /dev/null redirect can make
+    // this finish quickly.
+    //
+    // Asserting the emitted auth verdict too, not just elapsed time: `read`
+    // hitting EOF exits non-zero, so a probe that truly ran reports
+    // authenticated:false. A probe killed by the deadline omits the field
+    // entirely (s_exit -1), which is exactly what the timing catches.
+    {
+        int hold[2];
+        CHECK(pipe(hold) == 0, "test pipe for blocking stdin");
+        int saved_stdin = dup(0);
+        dup2(hold[0], 0);
+
+        char cv[512], cs[512], line[2048];
+        enc("echo v1", cv, sizeof(cv));
+        enc("read x", cs, sizeof(cs));
+        size_t sn = (size_t)snprintf(line, sizeof(line), "stdintool\t%s\t%s", cv, cs);
+        time_t t0 = time(NULL);
+        len = bridge_scan_tools(line, sn, out, sizeof(out), &st);
+        long elapsed = (long)(time(NULL) - t0);
+
+        // Restore before asserting, so a failure can still print.
+        dup2(saved_stdin, 0);
+        close(saved_stdin); close(hold[0]); close(hold[1]);
+
+        CHECK(len > 0 && strstr(out, "\"stdintool\":{\"installed\":true,\"version\":\"v1\",\"authenticated\":false") != NULL
+              && elapsed < 5 && st.auth_applicable == 1 && st.authenticated == 0,
+              "stdin-reading status probe gets EOF instead of blocking");
+    }
+
+    // A probe we could not run (timeout) is "not checked", never "signed
+    // out": the tool may be perfectly authenticated — we just failed to ask.
+    // `sleep` reaches the deadline on its own, without depending on stdin.
+    {
+        char cv[512], cs[512], slow[2048];
+        enc("echo v1", cv, sizeof(cv));
+        enc("echo who; sleep 30", cs, sizeof(cs));
+        size_t sn = (size_t)snprintf(slow, sizeof(slow), "slowtool\t%s\t%s", cv, cs);
+        len = bridge_scan_tools(slow, sn, out, sizeof(out), &st);
+        CHECK(len > 0 && strstr(out, "\"slowtool\"") && strstr(out, "authenticated") == NULL,
+              "timed-out status probe omits authenticated");
+    }
 
     printf("%s\n", fails ? "FAILED" : "PASSED");
     return fails ? 1 : 0;

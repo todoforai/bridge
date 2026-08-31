@@ -2793,9 +2793,19 @@ int bridge_main(int argc, char **argv) {
     // caller that exports its API key (CI does) would otherwise leak it into
     // every PTY. tfa-cli strips these before spawning us, so this is belt and
     // braces — it also covers a hand-run bridge.
+    //
+    // The NODE_* entries are our parent's private IPC wiring, not ours. A
+    // process manager that speaks to its children over a pipe (PM2, npm, a
+    // Node supervisor) exports NODE_CHANNEL_FD=<fd>; inherited by every tool
+    // we spawn, each Node CLI then claims that fd as its own IPC channel and
+    // aborts (SIGABRT, exit 134) — *after* printing correct output. That read
+    // as "the tool failed", so a perfectly signed-in CLI (zele) rendered
+    // "Sign in" in the UI. The bridge is not a Node child; the variable is
+    // meaningless here and harmful downstream.
     static const char *const scrub_env[] = {
         "TODOFORAI_MAYFLY_TOKEN", "TODOFORAI_MAYFLY_API_KEY", "TODOFORAI_API_TOKEN",
         "TODO4AI_MAYFLY_TOKEN",   "TODO4AI_MAYFLY_API_KEY",   "TODO4AI_API_TOKEN",
+        "NODE_CHANNEL_FD",        "NODE_CHANNEL_SERIALIZATION_MODE",
     };
     for (size_t i = 0; i < sizeof scrub_env / sizeof *scrub_env; i++) {
 #ifdef _WIN32
@@ -2891,16 +2901,32 @@ int bridge_main(int argc, char **argv) {
     // a fresh id, so they coexist with the normal bridge for this device.
     if (!mayfly_todo_id && acquire_device_lock(saved_creds.device_id) < 0
         && (!kill_existing || device_lock_kill_existing(saved_creds.device_id) < 0)) {
+        // The pid file is best-effort: it's missing or unparsable when the
+        // holder was killed mid-write, and on Windows another process can see
+        // the mutex before the sidecar exists. `pid <= 1` therefore means "not
+        // known", never a pid to act on — printing `kill 0` would tell the user
+        // to signal their own process group. Same threshold device_lock_kill_
+        // existing() refuses to guess on.
+        long holder = device_lock_owner_pid(saved_creds.device_id);
         fprintf(stderr,
-            "error: another todoforai-bridge is already running for device %.8s… on this machine.\n"
+            "error: another todoforai-bridge is already running for device %.8s… (%s, profile %s).\n",
+            saved_creds.device_id, saved_creds.device_name, profile ? profile : "default");
+        if (holder > 1) {
 #ifdef _WIN32
-            "       Stop it first (Task Manager, or `Stop-ScheduledTask -TaskName 'TODOforAI Bridge'`),\n"
-            "       or start with --kill to replace it.\n",
+            fprintf(stderr, "       It is pid %ld — stop it (Task Manager, or\n"
+                            "       `Stop-ScheduledTask -TaskName 'TODOforAI Bridge'`).\n", holder);
 #else
-            "       Stop it first (`pgrep -af todoforai-bridge`), remove the duplicate from pm2/systemd,\n"
-            "       or start with --kill to replace it.\n",
+            fprintf(stderr, "       It is pid %ld — stop it (`kill %ld`).\n", holder, holder);
 #endif
-            saved_creds.device_id);
+        } else {
+#ifdef _WIN32
+            fprintf(stderr, "       Its pid could not be read; find it in Task Manager.\n");
+#else
+            fprintf(stderr, "       Its pid could not be read; find it with `pgrep -af todoforai-bridge`.\n");
+#endif
+        }
+        fprintf(stderr, "       Or start with --kill to replace it (only that pid is killed,\n"
+                        "       other profiles keep running).\n");
         return 1;
     }
 
