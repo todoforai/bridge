@@ -263,6 +263,24 @@ analyze-scan-build: | build
 	    -o /tmp/_bridge_sb $(SRCS) $(LIBS) > build/analysis/scan-build.log 2>&1 || true
 	@grep -E 'bug(s)? found|No bugs found' build/analysis/scan-build.log | tail -1
 
+.PHONY: help
+help:
+	@echo "  make run        - Build + run bridge (production: api.todofor.ai)"
+	@echo "  make run-dev    - Build + run bridge (local backend on localhost)"
+	@echo "  make login      - Provision device credentials (once, production)"
+	@echo "  make            - Build build/todoforai-bridge"
+	@echo "  make static     - Static musl binary (zig cc)"
+	@echo "  make dev        - Build + install into ~/.todoforai/bin"
+
+# Foreground run against production. Needs `make login` once.
+.PHONY: run
+run: build/todoforai-bridge
+	./build/todoforai-bridge
+
+.PHONY: login
+login: build/todoforai-bridge
+	./build/todoforai-bridge login
+
 # Foreground dev run against a local backend (localhost → dev profile, port 4000).
 # Used by scripts/ecosystem.config.js (PM2 dev orchestrator).
 .PHONY: run-dev
