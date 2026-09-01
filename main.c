@@ -2098,6 +2098,118 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             #undef WFB_STAT
             #undef wfb_close
             #undef wfb_fstat
+        } else if (fn_len == 13 && memcmp(fn, "read_file_b64", 13) == 0) {
+            // Read half of write_file_b64. args: {path, offset?: N, length?: N}
+            // Returns ONE bounded chunk per call; the backend loops and
+            // reassembles (Noise frames cap at MAX_MSG, so a whole file can't
+            // ship in one frame). `length` is clamped to RFB_CHUNK_MAX — a
+            // multiple of 3, so concatenated base64 chunks decode as one stream.
+            // Result: {bytesRead, totalSize, eof, dataB64}
+            #ifdef _WIN32
+            #  define rfb_close(fd)        _close(fd)
+            #  define rfb_fstat(fd, st)    _fstati64((fd), (st))
+            #  define RFB_STAT             struct _stati64
+            #  define RFB_ISREG(st)        (((st).st_mode & _S_IFMT) == _S_IFREG)
+            #else
+            #  define rfb_close(fd)        close(fd)
+            #  define rfb_fstat(fd, st)    fstat((fd), (st))
+            #  define RFB_STAT             struct stat
+            #  define RFB_ISREG(st)        S_ISREG((st).st_mode)
+            #endif
+            #define RFB_CHUNK_MAX 45000L
+            #define RFB_MAX_FILE  (50LL * 1000 * 1000)
+
+            #define RFB_FAIL(msg) do { \
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, (msg)); \
+                free(path); free(data); free(b64); free(result); \
+                if (fd >= 0) rfb_close(fd); \
+                return 0; \
+            } while (0)
+
+            char *path = NULL, *b64 = NULL, *result = NULL;
+            uint8_t *data = NULL;
+            int fd = -1;
+
+            const char *praw = NULL; size_t praw_len = 0;
+            if (!args || !json_get_str(args, args_len, "path", &praw, &praw_len) || praw_len == 0)
+                RFB_FAIL("read_file_b64 requires args.path");
+            path = malloc(praw_len + 1);
+            if (!path) RFB_FAIL("out of memory");
+            size_t plen = 0;
+            if (!json_get_str_decoded(args, args_len, "path", path, praw_len + 1, &plen))
+                RFB_FAIL("read_file_b64: malformed args.path");
+            (void)plen;
+
+            char *expanded = bridge_expand_tilde(path);
+            if (expanded) { free(path); path = expanded; }
+
+            // Same LLP64 caveat as write_file_b64: offsets >2GB unsupported on
+            // Windows — irrelevant under the 50MB file cap.
+            long offset = 0, length = RFB_CHUNK_MAX;
+            json_get_long(args, args_len, "offset", &offset);
+            json_get_long(args, args_len, "length", &length);
+            if (offset < 0) RFB_FAIL("read_file_b64: offset must be >= 0");
+            if (length < 1 || length > RFB_CHUNK_MAX) length = RFB_CHUNK_MAX;
+
+#ifdef _WIN32
+            fd = _open(path, _O_RDONLY | _O_BINARY);
+#else
+            fd = open(path, O_RDONLY | O_CLOEXEC);
+#endif
+            // "not found" is load-bearing: the backend adapter tries the next
+            // workspace-root candidate on this exact message.
+            if (fd < 0)
+                RFB_FAIL(errno == ENOENT ? "read_file_b64: not found" : "read_file_b64: open failed");
+
+            RFB_STAT st;
+            if (rfb_fstat(fd, &st) != 0) RFB_FAIL("read_file_b64: stat failed");
+            if (!RFB_ISREG(st)) RFB_FAIL("read_file_b64: not a regular file");
+            int64_t total = (int64_t)st.st_size;
+            if (total > RFB_MAX_FILE) RFB_FAIL("read_file_b64: file too large (max 50MB)");
+
+            data = malloc((size_t)length);
+            if (!data) RFB_FAIL("out of memory");
+
+            size_t got = 0;
+            while (got < (size_t)length) {
+                long long rn2;
+#ifdef _WIN32
+                if (got == 0 && _lseeki64(fd, (int64_t)offset, SEEK_SET) < 0)
+                    RFB_FAIL("read_file_b64: seek failed");
+                rn2 = _read(fd, (char *)data + got, (unsigned int)((size_t)length - got));
+#else
+                rn2 = pread(fd, data + got, (size_t)length - got, (off_t)offset + (off_t)got);
+                if (rn2 < 0 && errno == EINTR) continue;
+#endif
+                if (rn2 < 0) RFB_FAIL("read_file_b64: read failed");
+                if (rn2 == 0) break;  // EOF
+                got += (size_t)rn2;
+            }
+            rfb_close(fd); fd = -1;
+
+            size_t b64_cap = ((got + 2) / 3) * 4 + 1;
+            b64 = malloc(b64_cap);
+            if (!b64) RFB_FAIL("out of memory");
+            size_t bn = b64_encode(data, got, b64, b64_cap);
+            if (bn == 0 && got > 0) RFB_FAIL("read_file_b64: encode failed");
+
+            int eof = (int64_t)offset + (int64_t)got >= total;
+            size_t rcap = bn + 128;
+            result = malloc(rcap);
+            if (!result) RFB_FAIL("out of memory");
+            int rn = snprintf(result, rcap,
+                              "{\"bytesRead\":%zu,\"totalSize\":%lld,\"eof\":%s,\"dataB64\":\"%s\"}",
+                              got, (long long)total, eof ? "true" : "false", bn ? b64 : "");
+            if (rn < 0 || (size_t)rn >= rcap) RFB_FAIL("read_file_b64: result overflow");
+            send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)rn);
+            free(path); free(data); free(b64); free(result);
+            #undef RFB_FAIL
+            #undef RFB_CHUNK_MAX
+            #undef RFB_MAX_FILE
+            #undef RFB_STAT
+            #undef RFB_ISREG
+            #undef rfb_close
+            #undef rfb_fstat
         } else if (fn_len == 21 && memcmp(fn, "preview_register_port", 21) == 0) {
             // live_preview: allow the relay to serve this local port (see
             // preview.c). Probes first so the agent gets an immediate
@@ -2123,7 +2235,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         } else {
             char errmsg[160];
             snprintf(errmsg, sizeof errmsg,
-                     "Unknown function: %.*s. Available: scan_tools, write_file_b64, preview_register_port",
+                     "Unknown function: %.*s. Available: scan_tools, write_file_b64, read_file_b64, preview_register_port",
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
