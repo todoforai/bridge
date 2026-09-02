@@ -16,6 +16,7 @@
 //     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool}
 //     → {"type":"step_done","sessionId":"uuid","blockId":"...","shellPid":N,"exitCode":N|null,"timedOut":bool}
 //     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"..."}   // resumes a step waiting on stdin
+//     ← {"type":"detach","sessionId":"uuid","requestId":"..."}                  // user detach: park the running step (→ step_awaiting_input)
 //     → {"type":"ack","requestId":"..."}                            // success reply for input
 //     → {"type":"exit","sessionId":"uuid","blockId":"...","code":N}
 //     ↔ {"type":"error","sessionId":"uuid","blockId":"...","code":"ERR","message":"..."}
@@ -318,6 +319,10 @@ typedef struct {
     // PAUSE_CONFIRM_TICKS consecutive `blocked` ticks. Resumption resets implicitly.
     int64_t last_pause_poll_ms;
     int     pause_consec_ticks;
+    // Step handed back to the backend (STEP_AWAITING_INPUT sent) while the
+    // shell keeps running. Suppresses the probe and repeat detaches until
+    // input resumes the step or it finishes.
+    int     parked;
     // Stamp after bridge_pty_write_all; probe waits INPUT_GRACE_MS past it to
     // avoid false-pause during the trailing line-discipline drain.
     int64_t last_input_ms;
@@ -906,9 +911,33 @@ static void send_step_awaiting_input(edge_t *e, session_t *s, int password_promp
     send_json(e, buf, u);
 }
 
+static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n);
+static void ob_finish(edge_t *e, session_t *s);
+static void ob_reset(out_policy_t *ob);
+
+// Park a running step: hand the RUN back to the backend (STEP_AWAITING_INPUT)
+// while the shell keeps running. Used by the stdin-blocked probe and by an
+// explicit `detach` frame from the user. The session is promoted to
+// persistent and the deadline dropped, so neither STEP_DONE nor the timeout
+// tears the process down — the agent now owns its lifecycle by pid.
+static void park_step(edge_t *e, session_t *s, int password_prompt) {
+    if (s->parked) return;
+    s->parked = 1;
+    if (s->tail_len > 0) {
+        ob_append(e, s, s->tail_buf, s->tail_len);
+        s->tail_len = 0;
+    }
+    ob_finish(e, s);
+    s->one_shot = 0;
+    s->deadline_ms = 0;
+    send_step_awaiting_input(e, s, password_prompt);  // reads ob.truncated before reset
+    // Post-park output is a fresh delta (mirrors edge resetForInteraction).
+    ob_reset(&s->ob);
+}
+
 // Reset per-step state. Trailing PTY bytes still emit OUTPUT (no blockId).
 // One-shot sessions tear down here; promoted sessions (one_shot cleared in
-// send_step_awaiting_input) survive.
+// park_step) survive.
 static void run_finish(session_t *s) {
     s->state = SESS_IDLE;
     s->tail_len = 0;
@@ -918,6 +947,7 @@ static void run_finish(session_t *s) {
     s->sentinel_len = 0;
     s->draining_begin = 0;
     s->pause_consec_ticks = 0;
+    s->parked = 0;
     // LRU: command just finished; refresh the activity stamp so this session
     // is the most-recently-used.
     s->last_active_ms = monotonic_ms();
@@ -1759,6 +1789,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->last_active_ms = monotonic_ms();
         s->last_pause_poll_ms = s->last_active_ms;
         s->pause_consec_ticks = 0;
+        s->parked = 0;
 
         send_run_started(e, s, created);
 
@@ -1907,9 +1938,39 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->last_input_ms = s->last_active_ms;
         // Input consumes the prompt: process leaves n_tty_read on the next
         // tick anyway, but reset the counter eagerly to avoid a stale tick
-        // re-confirming on the same blocked-read.
+        // re-confirming on the same blocked-read. The step is live again —
+        // the probe may park it anew if it blocks on stdin later.
         s->pause_consec_ticks = 0;
+        s->parked = 0;
 
+        if (has_rid) send_ack(e, rid, rid_len);
+
+    } else if (IS("detach")) {
+        // User-initiated detach of a running step: same park path the
+        // stdin-blocked probe takes, so the backend/agent see an ordinary
+        // STEP_AWAITING_INPUT and resume/kill it by pid as usual.
+        const char *rid = NULL; size_t rid_len = 0;
+        int has_rid = json_get_str(msg, msg_len, "requestId", &rid, &rid_len)
+                      && rid_len > 0 && is_valid_id(rid, rid_len);
+        const char *sid = NULL; size_t sid_len = 0;
+        if (!json_get_str(msg, msg_len, "sessionId", &sid, &sid_len))
+            return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "MISSING_SESSION_ID", "detach requires sessionId")
+                           : send_error(e, NULL, 0, NULL, 0, "MISSING_SESSION_ID", "detach requires sessionId");
+        if (!is_valid_uuid(sid, sid_len))
+            return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "INVALID_SESSION_ID", "sessionId must be a UUID")
+                           : send_error(e, NULL, 0, NULL, 0, "INVALID_SESSION_ID", "sessionId must be a UUID");
+        session_t *s = find_session(e, sid, sid_len);
+        if (!s)
+            return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "SESSION_NOT_FOUND", "no session for sessionId")
+                           : send_error(e, sid, sid_len, NULL, 0, "SESSION_NOT_FOUND", "no session for sessionId");
+        if (s->state != SESS_RUNNING)
+            return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "NOT_RUNNING", "no step in flight to detach")
+                           : send_error(e, sid, sid_len, NULL, 0, "NOT_RUNNING", "no step in flight to detach");
+        // Idempotent: an already-parked step (probe or earlier detach) just ACKs.
+        if (!s->parked) {
+            park_step(e, s, /*password_prompt=*/0);
+            fprintf(stderr, "RUN detached by user: %s\n", s->run_block_id);
+        }
         if (has_rid) send_ack(e, rid, rid_len);
 
     } else if (IS("FUNCTION_CALL_REQUEST_AGENT")) {
@@ -2324,7 +2385,7 @@ static void service_sessions(edge_t *e) {
     // Awaiting-input probe: see PAUSE_POLL_MS / PAUSE_CONFIRM_TICKS comments above.
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
-        if (!s->active || s->state != SESS_RUNNING) continue;
+        if (!s->active || s->state != SESS_RUNNING || s->parked) continue;
         if (now - s->last_pause_poll_ms < PAUSE_POLL_MS) continue;
         s->last_pause_poll_ms = now;
 
@@ -2337,19 +2398,7 @@ static void service_sessions(edge_t *e) {
         if (!blocked) { s->pause_consec_ticks = 0; continue; }
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
 
-        if (s->tail_len > 0) {
-            ob_append(e, s, s->tail_buf, s->tail_len);
-            s->tail_len = 0;
-        }
-        ob_finish(e, s);
-        // Promote one-shot → persistent so STEP_DONE doesn't tear it down.
-        s->one_shot = 0;
-        // Drop the per-step deadline: agent owns lifecycle via awaitResume.
-        // Otherwise timeout fires STEP_DONE(timedOut) while the user is typing.
-        s->deadline_ms = 0;
-        send_step_awaiting_input(e, s, pwd);  // reads ob.truncated before reset
-        // Post-prompt output is a fresh delta (mirrors edge resetForInteraction).
-        ob_reset(&s->ob);
+        park_step(e, s, pwd);
         fprintf(stderr, "RUN awaiting input: %s fg=%ld pwd=%d\n",
                 s->run_block_id, fg, pwd);
     }
