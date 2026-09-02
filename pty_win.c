@@ -391,12 +391,26 @@ int bridge_pty_pollfd(const bridge_pty_t *p) {
 // Pgrp surrogate: per-session Job Object (shell + descendants; conhost is
 // spawned via csrss and not in the job, so no filtering needed).
 //
-// "Blocked in n_tty_read": ConPTY clients hit conhost via ALPC; the parked
-// thread shows ThreadState=Waiting + WaitReason=WrLpcReply in
-// NtQuerySystemInformation(SystemProcessInformation). WrUserRequest is too
-// generic to accept (every idle worker thread is in it).
+// "Blocked in n_tty_read": the theory was that ConPTY clients hit conhost via
+// ALPC, so the parked thread shows ThreadState=Waiting + WaitReason=WrLpcReply
+// in NtQuerySystemInformation(SystemProcessInformation).
+//
+// MEASURED FALSE (Win11, BusyBox sh + bash inside the bridge's own ConPTY):
+// a shell blocked in `read` shows State=5/WR=6 (WrExecutive) — byte-identical
+// to waiting on a child, on a socket, or on `sleep`. WrLpcReply(17) appeared
+// on exactly 5 threads system-wide, all csrss/svchost/explorer, never a shell.
+// No thread-state constant discriminates "waiting for stdin"; ConPTY simply
+// does not expose TTY semantics. The probe therefore cannot fire, and taking
+// a full system process+thread snapshot every PAUSE_POLL_MS per session was
+// pure waste — it is disabled (BRIDGE_WIN_PROBE_BLOCKED=0). Interactive
+// prompts on Windows surface via the deadline path instead (main.c parks the
+// run on timeout).
 //
 // password_prompt: ENABLE_ECHO_INPUT isn't exposed via ConPTY → always 0.
+
+#ifndef BRIDGE_WIN_PROBE_BLOCKED
+#define BRIDGE_WIN_PROBE_BLOCKED 0
+#endif
 
 #define BRIDGE_SystemProcessInformation 5
 #define BRIDGE_STATUS_INFO_LENGTH_MISMATCH ((LONG)0xC0000004L)
@@ -521,6 +535,7 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
     (void)echo_baseline;  // No ECHO introspection on Windows; see file header.
     if (fg_pid) *fg_pid = 0;
     if (password_prompt) *password_prompt = 0;
+    if (!BRIDGE_WIN_PROBE_BLOCKED) return 0;  // See comment above: cannot fire.
     if (!p || !p->alive || !p->h_job) return 0;
 
     ULONG njobpids = 0;
