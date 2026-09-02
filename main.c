@@ -920,12 +920,19 @@ static void ob_reset(out_policy_t *ob);
 // explicit `detach` frame from the user. The session is promoted to
 // persistent and the deadline dropped, so neither STEP_DONE nor the timeout
 // tears the process down — the agent now owns its lifecycle by pid.
-static void park_step(edge_t *e, session_t *s, int password_prompt) {
+static void park_step(edge_t *e, session_t *s, int password_prompt, const char *why) {
     if (s->parked) return;
     s->parked = 1;
-    if (s->tail_len > 0) {
-        ob_append(e, s, s->tail_buf, s->tail_len);
-        s->tail_len = 0;
+    // Flush held-back output, but keep the (sentinel_len - 1) hold-back: the
+    // command may be completing right now and a sentinel prefix could already
+    // sit in tail_buf (see forward_pty_output). Emitting it would make the
+    // sentinel unmatchable and leave the session RUNNING forever.
+    size_t keep = s->sentinel_len > 0 ? s->sentinel_len - 1 : 0;
+    if (s->tail_len > keep) {
+        size_t emit = s->tail_len - keep;
+        ob_append(e, s, s->tail_buf, emit);
+        memmove(s->tail_buf, s->tail_buf + emit, keep);
+        s->tail_len = keep;
     }
     ob_finish(e, s);
     s->one_shot = 0;
@@ -1968,8 +1975,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                            : send_error(e, sid, sid_len, NULL, 0, "NOT_RUNNING", "no step in flight to detach");
         // Idempotent: an already-parked step (probe or earlier detach) just ACKs.
         if (!s->parked) {
-            park_step(e, s, /*password_prompt=*/0);
-            fprintf(stderr, "RUN detached by user: %s\n", s->run_block_id);
+            park_step(e, s, /*password_prompt=*/0, "detach");
         }
         if (has_rid) send_ack(e, rid, rid_len);
 
@@ -2369,10 +2375,21 @@ static void service_sessions(edge_t *e) {
     // is left alive (agent can retry on the same sessionId). One-shot
     // sessions are torn down by run_finish() since the agent never owned
     // the id and has no way to address them.
+    //
+    // Windows: ConPTY exposes no "blocked on stdin" signal (see pty_win.c
+    // bridge_pty_probe_blocked), so an interactive prompt can only surface
+    // here, at the deadline. Killing it would make every interactive command
+    // unrecoverable (PID_NOT_FOUND on resume) — instead park it exactly like
+    // the probe does: the backend keeps the run, the agent gets a pid and can
+    // feed stdin via bridge_exec(pid, ...).
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
         if (now < s->deadline_ms) continue;
+#ifdef _WIN32
+        park_step(e, s, /*password_prompt=*/0, "timeout");
+        continue;
+#endif
         if (s->tail_len > 0) {
             ob_append(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
@@ -2398,9 +2415,7 @@ static void service_sessions(edge_t *e) {
         if (!blocked) { s->pause_consec_ticks = 0; continue; }
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
 
-        park_step(e, s, pwd);
-        fprintf(stderr, "RUN awaiting input: %s fg=%ld pwd=%d\n",
-                s->run_block_id, fg, pwd);
+        park_step(e, s, pwd, "probe");
     }
 
     // Drain PTY masters (non-blocking; returns 0 on EAGAIN). Drain each session
