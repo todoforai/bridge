@@ -13,7 +13,7 @@
 //     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
 //     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool,"cwd":"..."}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
-//     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool}
+//     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool,"reason":"probe"|"timeout"|"detach"}
 //     → {"type":"step_done","sessionId":"uuid","blockId":"...","shellPid":N,"exitCode":N|null,"timedOut":bool}
 //     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"..."}   // resumes a step waiting on stdin
 //     ← {"type":"detach","sessionId":"uuid","requestId":"..."}                  // user detach: park the running step (→ step_awaiting_input)
@@ -895,7 +895,11 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
 // Bridge → server: step's fg process is blocked in a tty read. RUN stays in
 // flight; backend resolves the promise with awaitingInput:true so the agent
 // can resume via INPUT on the same sessionId. `passwordPrompt` ⇔ ECHO off.
-static void send_step_awaiting_input(edge_t *e, session_t *s, int password_prompt) {
+// `reason`: "probe" (foreground task seen blocked on the TTY), "detach" (user
+// asked for it), or "timeout"
+// (step deadline hit with no stdin signal available — Windows/ConPTY). The
+// latter may just be a long-running command; backend surfaces it as timedOut.
+static void send_step_awaiting_input(edge_t *e, session_t *s, int password_prompt, const char *reason) {
     flush_output(e, s);  // the prompt itself is usually the last queued chunk
     char buf[512]; size_t u = 0;
     char shell_pid_buf[24]; snprintf(shell_pid_buf, sizeof shell_pid_buf, "%ld", SHELL_PID(s));
@@ -906,6 +910,7 @@ static void send_step_awaiting_input(edge_t *e, session_t *s, int password_promp
         jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "shellPid", shell_pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "passwordPrompt", password_prompt ? "true" : "false", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "reason", reason, -1, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "truncated", s->ob.truncated ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
@@ -920,7 +925,7 @@ static void ob_reset(out_policy_t *ob);
 // explicit `detach` frame from the user. The session is promoted to
 // persistent and the deadline dropped, so neither STEP_DONE nor the timeout
 // tears the process down — the agent now owns its lifecycle by pid.
-static void park_step(edge_t *e, session_t *s, int password_prompt, const char *why) {
+static void park_step(edge_t *e, session_t *s, int password_prompt, const char *reason) {
     if (s->parked) return;
     s->parked = 1;
     // Flush held-back output, but keep the (sentinel_len - 1) hold-back: the
@@ -937,9 +942,10 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
     ob_finish(e, s);
     s->one_shot = 0;
     s->deadline_ms = 0;
-    send_step_awaiting_input(e, s, password_prompt);  // reads ob.truncated before reset
+    send_step_awaiting_input(e, s, password_prompt, reason);  // reads ob.truncated before reset
     // Post-park output is a fresh delta (mirrors edge resetForInteraction).
     ob_reset(&s->ob);
+    fprintf(stderr, "RUN parked (%s): %s\n", reason, s->run_block_id);
 }
 
 // Reset per-step state. Trailing PTY bytes still emit OUTPUT (no blockId).
