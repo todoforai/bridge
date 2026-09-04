@@ -11,8 +11,10 @@
 #ifdef _WIN32
 #  include <winsock2.h>
 typedef SOCKET ws_fd_t;
+#  define WS_INVALID_FD INVALID_SOCKET
 #else
 typedef int ws_fd_t;
+#  define WS_INVALID_FD (-1)
 #endif
 
 // RFC 6455 opcodes (only the ones we use).

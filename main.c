@@ -80,6 +80,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 
 #include "args.h"      // ketopt + cli_usage helpers
 #include "identity.h"  // BRIDGE_VERSION
+#include "identity_server.h"
 #include "json.h"
 #include "noise.h"     // noise_random
 #include "noise_ws.h"
@@ -356,6 +357,11 @@ typedef struct {
     // process entirely. Only meaningful together with `mayfly`.
     const char *session_token;
     const char *user_email;  // for the auth banner; points into main()'s saved_creds
+    // Loopback 127.0.0.1:43127 listener answering GET /identity so a web
+    // frontend on this machine learns our device id (identity_server.h).
+    // Invalid fd while the port is taken (a predecessor still shutting down,
+    // the bun edge); retried on each (re)connect, never fatal.
+    ws_fd_t identity_fd;
     // Mayfly mode (--mayfly <todoId>): ephemeral, task-scoped session. Auths
     // with the normal saved credentials but registers backend-side under the
     // in-memory id `mayfly-<todoId>` — never as the persistent device row —
@@ -2531,6 +2537,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                const uint8_t pubkey[32]) {
     e->device_id = device_id;
     e->device_secret = device_secret;
+    if (e->identity_fd == WS_INVALID_FD && !e->mayfly) e->identity_fd = bridge_identity_server_open();
     // Derive the public HTTP API URL from the Noise host. In prod a TLS
     // terminator (nginx/Cloudflare) fronts the backend on 443 while the Noise
     // channel rides plain WS on port 80 — so the transport `port` must NOT leak
@@ -2565,7 +2572,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     // pfds[0] is always the WS fd; remaining slots are active sessions' PTY
     // master fds so output wakes the loop immediately instead of waiting out
     // the timeout. +1 for the WS slot.
-    struct pollfd *pfds = calloc((size_t)g_max_sessions + 1, sizeof *pfds);
+    struct pollfd *pfds = calloc((size_t)g_max_sessions + 2, sizeof *pfds);
     if (!pfds) { fail(e, "out of memory allocating pollfds"); ws_close(&e->ws); noise_ws_wipe(&e->noise); return -1; }
 
     while (!e->done) {
@@ -2585,6 +2592,11 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                 int fd = bridge_pty_pollfd(&s->pty);
                 if (fd >= 0) { pfds[nfds].fd = fd; pfds[nfds].events = POLLIN; nfds++; }
             }
+        }
+        int identity_slot = -1;
+        if (e->identity_fd != WS_INVALID_FD) {
+            identity_slot = (int)nfds;
+            pfds[nfds].fd = e->identity_fd; pfds[nfds].events = POLLIN; nfds++;
         }
         struct pollfd *pfd = &pfds[0];
         // Keep a 50ms ceiling so the awaiting-input probe and deadline checks in
@@ -2626,6 +2638,8 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             if (pfd->revents & POLLOUT) {
                 if (ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
             }
+            if (identity_slot >= 0 && (pfds[identity_slot].revents & POLLIN))
+                bridge_identity_server_serve(e->identity_fd, e->mayfly ? NULL : e->device_id);
         }
         // Deferred identity send — gives the backend's async validateDevice()
         // time to settle before the second frame lands on the post-auth handler.
@@ -3127,6 +3141,9 @@ int bridge_main(int argc, char **argv) {
     e->sessions = calloc((size_t)g_max_sessions, sizeof(*e->sessions));
     if (!e->sessions) { free(e); return 1; }
     e->user_email = saved_creds.user_email;  // safe: saved_creds outlives the run loop
+    // Mayfly sessions are invisible to the UI; only the persistent daemon
+    // answers "which device is this machine".
+    e->identity_fd = WS_INVALID_FD;  // opened in run(), after e->mayfly is known
     e->session_token = session_token;        // login-less mayfly auth (NULL otherwise)
     if (mayfly_todo_id) {
         // Todo ids are CLI-minted uuids (enforced server-side too); reject
@@ -3299,6 +3316,7 @@ int bridge_main(int argc, char **argv) {
     for (int i = 0; i < g_max_sessions; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
     }
+    bridge_identity_server_close(e->identity_fd);
     free(e->sessions);
     free(e);
     return rc == 0 ? 0 : 1;
