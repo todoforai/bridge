@@ -80,7 +80,9 @@ void bridge_prepend_tools_path_win(void) {
 #else
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 // GUI apps on macOS (Finder/Dock launch) never source ~/.zshrc or
 // ~/.zprofile, so Homebrew's shellenv (and its PATH export) never runs —
@@ -199,6 +201,78 @@ char *bridge_build_tools_path(void) {
              "%s/.local/bin%s:%s",
              home, home, home, home, extra, old);
     return path;
+}
+
+// sudo/ssh/su are setuid: /proc/<pid>/syscall is EACCES for them, so the
+// stdin probe cannot tell a password prompt from a download waiting on a
+// socket and falls back to a 2s-silence guess (main.c OPAQUE_QUIET_MS).
+// With SUDO_ASKPASS/SSH_ASKPASS set, sudo -A / ssh run THIS unprivileged
+// script instead, whose `read </dev/tty` is a plain, visible tty read — the
+// probe fires authoritatively in one tick. Only honoured when the caller
+// passes -A (sudo) or has no tty (ssh); a plain `sudo` still takes the slow
+// path, so the RUN wrapper aliases sudo to `sudo -A`.
+static const char ASKPASS_SRC[] =
+    "#!/bin/sh\n"
+    "# TODOforAI bridge askpass: makes sudo/ssh password prompts a plain tty\n"
+    "# read the bridge's stdin probe can see instantly.\n"
+    "trap 'stty echo </dev/tty 2>/dev/null' EXIT INT TERM HUP\n"
+    "printf '%s' \"${1:-Password: }\" >/dev/tty || exit 1\n"
+    "stty -echo </dev/tty 2>/dev/null\n"
+    "IFS= read -r pw </dev/tty || exit 1\n"
+    "printf '\\n' >/dev/tty\n"
+    "printf '%s\\n' \"$pw\"\n";
+
+// True iff `path` is already our script: a regular file we own, mode 0700,
+// exact content. Opened O_NOFOLLOW so a planted symlink never counts.
+static int askpass_is_current(const char *path) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct stat st;
+    int ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid()
+          && (st.st_mode & 07777) == 0700 && st.st_size == (off_t)(sizeof ASKPASS_SRC - 1);
+    char cur[sizeof ASKPASS_SRC];
+    if (ok) {
+        size_t n = 0;
+        while (n < sizeof ASKPASS_SRC - 1) {
+            ssize_t r = read(fd, cur + n, sizeof ASKPASS_SRC - 1 - n);
+            if (r <= 0) break;
+            n += (size_t)r;
+        }
+        ok = n == sizeof ASKPASS_SRC - 1 && memcmp(cur, ASKPASS_SRC, n) == 0;
+    }
+    close(fd);
+    return ok;
+}
+
+char *bridge_ensure_askpass(void) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) return NULL;
+    char dir[1024], path[1100], tmp[1120];
+    if (snprintf(dir, sizeof dir, "%s/.todoforai/bin", home) >= (int)sizeof dir) return NULL;
+    snprintf(path, sizeof path, "%s/askpass", dir);
+    if (askpass_is_current(path)) return strdup(path);
+
+    char parent[1024];
+    snprintf(parent, sizeof parent, "%s/.todoforai", home);
+    mkdir(parent, 0700);
+    mkdir(dir, 0700);
+    // Write to a fresh temp (O_EXCL, never follows anything) then rename
+    // over the destination: readers see either the old or the new script,
+    // and a symlink planted at `path` is replaced, not written through.
+    snprintf(tmp, sizeof tmp, "%s/.askpass.%ld", dir, (long)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0700);
+    if (fd < 0) return NULL;
+    size_t len = sizeof ASKPASS_SRC - 1, off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, ASKPASS_SRC + off, len - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    // O_CREAT mode is masked by umask; force the exact mode on the open fd.
+    int ok = off == len && fchmod(fd, 0700) == 0;
+    close(fd);
+    if (!ok || rename(tmp, path) != 0) { unlink(tmp); return NULL; }
+    return strdup(path);
 }
 
 #endif

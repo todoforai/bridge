@@ -95,6 +95,16 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
         // Make HostDesktop-installed tools discoverable.
         char *tools_path = bridge_build_tools_path();
         if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
+        // Route sudo -A / ssh password prompts through a visible tty read
+        // (see bridge_ensure_askpass). SSH_ASKPASS_REQUIRE=force makes ssh
+        // use it even with a tty; sudo still needs -A (RUN wrapper adds it).
+        char *askpass = bridge_ensure_askpass();
+        if (askpass) {
+            setenv("SUDO_ASKPASS", askpass, 1);
+            setenv("SSH_ASKPASS", askpass, 1);
+            setenv("SSH_ASKPASS_REQUIRE", "force", 1);
+            free(askpass);
+        }
         char *argv[] = { (char *)shell, NULL };
         execvp(shell, argv);
         _exit(1);
@@ -299,8 +309,9 @@ static int proc_is_opaque_sleeping(pid_t pid) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd >= 0) { close(fd); return 0; }  // readable → caller already checked
     if (errno != EACCES) return 0;          // dead/missing — not our case
-    char st = proc_state(pid);
-    return st == 'S' || st == 'D';
+    // 'S' only: a prompt sleeps interruptibly. 'D' is disk/IO wait — a
+    // root task grinding a package DB is not waiting for the user.
+    return proc_state(pid) == 'S';
 }
 
 // Combined check: prefer syscall (authoritative), fall back to wchan symbol,
@@ -420,30 +431,32 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
     if (fg <= 0) return 0;
 
     // Fast path: the pgrp leader is by far the most common reader (plain shell
-    // builtins like `read`, simple `cmd` invocations). Check it first.
+    // builtins like `read`, simple `cmd` invocations). Check it first. An
+    // opaque leader (2) is NOT final: `sudo -A` parks in wait() while its
+    // askpass child does the real, visible tty read — keep scanning so an
+    // authoritative 1 anywhere in the pgrp wins over the leader's guess.
     int how = proc_is_blocked_on_tty(fg);
-    if (how) {
-        if (fg_pid) *fg_pid = fg;
-    } else {
+    pid_t blocked_pid = how ? fg : 0;
+    if (how != 1) {
         // Slow path: scan /proc for any task whose pgrp matches `fg` and that
         // is parked in a tty read. Costs ~one open+read per running task,
         // gated by the caller's PAUSE_POLL_MS so it runs at most a few Hz.
         DIR *d = opendir("/proc");
         if (!d) return 0;
-        pid_t blocked_pid = 0;
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
             pid_t pid = (pid_t)atoi(e->d_name);
             if (pid <= 0 || pid == fg) continue;
             if (proc_pgrp(pid) != fg) continue;
-            how = proc_is_blocked_on_tty(pid);
-            if (how) { blocked_pid = pid; break; }
+            int h = proc_is_blocked_on_tty(pid);
+            if (h == 1 || (h == 2 && how == 0)) { how = h; blocked_pid = pid; }
+            if (how == 1) break;
         }
         closedir(d);
         if (blocked_pid == 0) return 0;
-        if (fg_pid) *fg_pid = blocked_pid;
     }
+    if (fg_pid) *fg_pid = blocked_pid;
 
     if (password_prompt && echo_baseline) {
         // ECHO off on the slave is the canonical password-prompt tell:

@@ -349,6 +349,17 @@ typedef struct {
 // this much PTY silence (no output, no input) before parking on it. Without
 // the gate a `sudo snap install` parked every 500ms mid-download.
 #define OPAQUE_QUIET_MS      2000
+// Shell function prepended to every POSIX RUN: `sudo` → `sudo -A` so the
+// password prompt goes through $SUDO_ASKPASS (a plain tty read the probe
+// sees in one tick) instead of sudo's own opaque /dev/tty read. Only when
+// the env var is set (bridge_ensure_askpass succeeded); -A with a cached
+// credential or NOPASSWD is a no-op. `-S`/`--stdin` (piped password)
+// conflicts with -A: any such flag before `--` passes the call through
+// untouched (an operand like `-u root` is skipped, not treated as the end
+// of options). Subshell body: the loop variable dies with it, and `exec`
+// bypasses the function itself, so no `command`/recursion dance.
+#define SUDO_ASKPASS_FN \
+    "[ -n \"$SUDO_ASKPASS\" ] && sudo() ( for a; do case $a in --) break;; --stdin|-S|-[!-]*S*) exec sudo \"$@\";; esac; done; exec sudo -A \"$@\" ); "
 
 typedef struct {
     ws_t ws;
@@ -1783,7 +1794,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             wn = snprintf(wrapped, wrapped_cap,
                 "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
-                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; { %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; " SUDO_ASKPASS_FN "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
@@ -1795,7 +1806,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             wn = snprintf(wrapped, wrapped_cap,
                 "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
-                "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                SUDO_ASKPASS_FN "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv,
                 fenv, cenv,
