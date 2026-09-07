@@ -33,6 +33,7 @@ typedef struct {
     // the backend matches a web frontend to a bridge with them. Best-effort.
     char cores[8];           // online logical CPUs, "" if unknown
     char displays[128];      // connected outputs "WxH,WxH" (Linux DRM / Windows), "" if unknown
+    char gpu[128];           // primary GPU name, "" if unknown
 } bridge_identity_t;
 
 void bridge_identity_gather(bridge_identity_t *id);

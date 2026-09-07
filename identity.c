@@ -208,6 +208,83 @@ static void detect_displays(char *out, size_t cap) {
 #endif
 }
 
+// Primary GPU marketing name — compared by model tokens against the browser's
+// WebGL renderer string. Linux: boot_vga PCI ids resolved through pci.ids;
+// macOS: system_profiler; Windows: display adapter DriverDesc.
+static void detect_gpu(char *out, size_t cap) {
+    out[0] = '\0';
+#ifdef _WIN32
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000",
+                      0, KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS) {
+        DWORD type = 0, n = (DWORD)(cap - 1);
+        if (RegQueryValueExA(k, "DriverDesc", NULL, &type, (LPBYTE)out, &n) == ERROR_SUCCESS && type == REG_SZ)
+            out[n < cap ? n : cap - 1] = '\0';
+        else out[0] = '\0';
+        RegCloseKey(k);
+    }
+#elif defined(__APPLE__)
+    FILE *p = popen("system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2; exit}'", "r");
+    if (p) {
+        if (fgets(out, (int)cap, p)) out[strcspn(out, "\r\n")] = '\0';
+        pclose(p);
+    }
+#else
+    // Pick the boot VGA card (falls back to the first card with a PCI device).
+    char vendor[16] = "", device[16] = "";
+    DIR *d = opendir("/sys/class/drm");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, "card", 4) != 0 || strchr(e->d_name, '-')) continue;
+        char path[300], v[16], dv[16], boot[4] = "0";
+        snprintf(path, sizeof path, "/sys/class/drm/%s/device/vendor", e->d_name);
+        FILE *f = fopen(path, "r"); if (!f) continue;
+        if (!fgets(v, sizeof v, f)) v[0] = '\0';
+        fclose(f);
+        snprintf(path, sizeof path, "/sys/class/drm/%s/device/device", e->d_name);
+        f = fopen(path, "r"); if (!f) continue;
+        if (!fgets(dv, sizeof dv, f)) dv[0] = '\0';
+        fclose(f);
+        snprintf(path, sizeof path, "/sys/class/drm/%s/device/boot_vga", e->d_name);
+        f = fopen(path, "r"); if (f) { if (!fgets(boot, sizeof boot, f)) boot[0] = '0'; fclose(f); }
+        if (!vendor[0] || boot[0] == '1') {
+            snprintf(vendor, sizeof vendor, "%.4s", v + (strncmp(v, "0x", 2) == 0 ? 2 : 0));
+            snprintf(device, sizeof device, "%.4s", dv + (strncmp(dv, "0x", 2) == 0 ? 2 : 0));
+        }
+        if (boot[0] == '1') break;
+    }
+    closedir(d);
+    if (!vendor[0]) return;
+    static const char *const dbs[] = { "/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids" };
+    FILE *f = NULL;
+    for (size_t i = 0; i < sizeof dbs / sizeof *dbs && !f; i++) f = fopen(dbs[i], "r");
+    if (!f) { snprintf(out, cap, "pci:%s:%s", vendor, device); return; }
+    char line[256], vname[64] = "";
+    int in_vendor = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        if (line[0] != '\t') {                       // vendor line: "10de  NVIDIA Corporation"
+            in_vendor = strncasecmp(line, vendor, 4) == 0;
+            if (in_vendor) { snprintf(vname, sizeof vname, "%.63s", line + 6); vname[strcspn(vname, "\r\n")] = '\0'; }
+            else if (vname[0]) break;                 // past our vendor block
+        } else if (in_vendor && line[1] != '\t' && strncasecmp(line + 1, device, 4) == 0) {
+            line[strcspn(line, "\r\n")] = '\0';
+            // "NVIDIA Corporation GA102 [GeForce RTX 3090]"
+            size_t n = strlen(vname);
+            memcpy(out, vname, n < cap - 1 ? n : cap - 1);
+            out[n < cap - 1 ? n : cap - 1] = '\0';
+            strncat(out, " ", cap - strlen(out) - 1);
+            strncat(out, line + 7, cap - strlen(out) - 1);
+            break;
+        }
+    }
+    fclose(f);
+    if (!out[0] && vname[0]) snprintf(out, cap, "%s %s", vname, device);
+#endif
+}
+
 void bridge_identity_gather(bridge_identity_t *id) {
     memset(id, 0, sizeof(*id));
 
@@ -304,13 +381,14 @@ void bridge_identity_gather(bridge_identity_t *id) {
     if (n > 0 && n < 100000) snprintf(id->cores, sizeof(id->cores), "%d", (int)n); else id->cores[0] = '\0';
 #endif
     detect_displays(id->displays, sizeof(id->displays));
+    detect_gpu(id->gpu, sizeof(id->gpu));
 
     // Sanitize all fields: replace control bytes with space — keeps the
     // resulting JSON identifiers ASCII-clean even if a hostname/distro field
     // accidentally contains a stray byte.
     char *fields[] = { id->os, id->arch, id->hostname, id->kernel, id->distro,
                        id->distro_version, id->device_type, id->user,
-                       id->shell, id->home, id->cwd, id->machine_id, id->cores, id->displays };
+                       id->shell, id->home, id->cwd, id->machine_id, id->cores, id->displays, id->gpu };
     for (size_t f = 0; f < sizeof(fields)/sizeof(fields[0]); f++) {
         for (char *p = fields[f]; *p; p++) {
             if ((unsigned char)*p < 0x20) *p = ' ';
@@ -357,6 +435,7 @@ int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     if (id.machine_id[0]) KV("machine_id", id.machine_id);
     if (id.cores[0])      KV("cores",      id.cores);
     if (id.displays[0])   KV("displays",   id.displays);
+    if (id.gpu[0])        KV("gpu",        id.gpu);
     if (json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
 
     if (!top_level && json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
