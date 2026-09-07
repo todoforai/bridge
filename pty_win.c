@@ -348,13 +348,24 @@ int bridge_pty_signal(bridge_pty_t *p, int sig) {
     return 0;
 }
 
+// Git Bash / busybox are MSYS/Cygwin binaries: a signal death is reported to
+// Win32 as a POSIX wait status, `sig << 8` (measured: `kill -1 $$` → 256,
+// `kill -9 $$` → 2304). Map that onto the POSIX backend's convention
+// (decode_status in pty_posix.c: negative = killed by signal) so the backend
+// sees -1/-9 instead of a meaningless "exit 256". Real exit codes are ≤ 255;
+// NTSTATUS crash codes (0xC0000005…) have the low byte set and pass through.
+static int decode_win_status(DWORD ec) {
+    if ((ec & 0xff) == 0 && (ec >> 8) >= 1 && (ec >> 8) <= 64) return -(int)(ec >> 8);
+    return (int)ec;
+}
+
 int bridge_pty_reap(bridge_pty_t *p, int *code) {
     if (!p->alive) return 0;
     DWORD wr = WaitForSingleObject((HANDLE)p->h_process, 0);
     if (wr != WAIT_OBJECT_0) return 0;
     DWORD ec = 0;
     GetExitCodeProcess((HANDLE)p->h_process, &ec);
-    *code = (int)ec;
+    *code = decode_win_status(ec);
     p->alive = 0;
     return 1;
 }
@@ -369,7 +380,7 @@ int bridge_pty_close(bridge_pty_t *p) {
             WaitForSingleObject((HANDLE)p->h_process, 2000);
             DWORD ec = 0;
             GetExitCodeProcess((HANDLE)p->h_process, &ec);
-            code = (int)ec;
+            code = decode_win_status(ec);
             p->alive = 0;
         }
         CloseHandle((HANDLE)p->h_process);
