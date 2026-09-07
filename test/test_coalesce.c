@@ -174,6 +174,29 @@ int main(void) {
     }
     printf("[trickle] OK (%d frames, first at %.0fms)\n", g_frames, g_first_frame_ms);
 
+    // ── Short prompt, no newline: must ship before the step ends ──
+    // `[sudo] password for six: ` is 25 bytes < sentinel_len. A flat
+    // (sentinel_len-1) hold-back kept it in tail_buf, so a step parked on a
+    // password prompt surfaced as "(no output)". Only a real sentinel prefix
+    // may be held.
+    reset_capture();
+    run_cmd(e, s, "printf 'Password: '; sleep 0.6; echo", "raw");
+    if (g_frames < 2 || g_first_frame_ms > OUT_FLUSH_MS + 250) {
+        fprintf(stderr, "[prompt] short prompt held back: %d frame(s), first at %.0fms\n",
+                g_frames, g_first_frame_ms);
+        return 1;
+    }
+    printf("[prompt] OK (%d frames, first at %.0fms)\n", g_frames, g_first_frame_ms);
+
+    // ── A genuine sentinel prefix at the tail is still held (and matched) ──
+    reset_capture();
+    run_cmd(e, s, "printf '__BRIDGE_STEP_'; sleep 0.3; printf 'x\\n'", "raw");
+    if (g_out_len != 17 || memcmp(g_out, "__BRIDGE_STEP_x\r\n", 17) != 0) {
+        fprintf(stderr, "[prefix] got %zu bytes: %.*s\n", g_out_len, (int)g_out_len, g_out);
+        return 1;
+    }
+    printf("[prefix] OK (prefix held, then emitted intact)\n");
+
     bridge_pty_close(&s->pty);
     free(e->sessions);
     free(e);

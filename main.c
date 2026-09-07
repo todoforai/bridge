@@ -939,6 +939,7 @@ static void send_step_awaiting_input(edge_t *e, session_t *s, int password_promp
 }
 
 static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n);
+static size_t sentinel_holdback(const session_t *s);
 static void ob_finish(edge_t *e, session_t *s);
 static void ob_reset(out_policy_t *ob);
 
@@ -950,11 +951,11 @@ static void ob_reset(out_policy_t *ob);
 static void park_step(edge_t *e, session_t *s, int password_prompt, const char *reason) {
     if (s->parked) return;
     s->parked = 1;
-    // Flush held-back output, but keep the (sentinel_len - 1) hold-back: the
+    // Flush held-back output, but keep any trailing sentinel prefix: the
     // command may be completing right now and a sentinel prefix could already
     // sit in tail_buf (see forward_pty_output). Emitting it would make the
     // sentinel unmatchable and leave the session RUNNING forever.
-    size_t keep = s->sentinel_len > 0 ? s->sentinel_len - 1 : 0;
+    size_t keep = sentinel_holdback(s);
     if (s->tail_len > keep) {
         size_t emit = s->tail_len - keep;
         ob_append(e, s, s->tail_buf, emit);
@@ -1002,6 +1003,19 @@ static ssize_t find_sentinel(const session_t *s) {
     if (s->tail_len < s->sentinel_len) return -1;
     void *m = memmem(s->tail_buf, s->tail_len, s->sentinel, s->sentinel_len);
     return m ? (ssize_t)((uint8_t *)m - s->tail_buf) : -1;
+}
+
+// Bytes at the end of tail_buf that are a proper prefix of the sentinel —
+// the only bytes that must be held back (they could complete on the next
+// read). Anything else is safe to emit now. Holding a flat (sentinel_len-1)
+// instead swallowed short prompts: `[sudo] password for six: ` is 25 bytes,
+// so the step parked with "(no output)" and the user never saw the prompt.
+static size_t sentinel_holdback(const session_t *s) {
+    size_t max = s->sentinel_len > 0 ? s->sentinel_len - 1 : 0;
+    if (max > s->tail_len) max = s->tail_len;
+    for (size_t k = max; k > 0; k--)
+        if (memcmp(s->tail_buf + s->tail_len - k, s->sentinel, k) == 0) return k;
+    return 0;
 }
 
 // Append `data[len]` into the tail buffer. By construction (see TAIL_CAP),
@@ -1272,10 +1286,11 @@ static long forward_pty_output(edge_t *e, session_t *s) {
 
     ssize_t found = find_sentinel(s);
     if (found < 0) {
-        // Hold back the trailing (sentinel_len - 1) bytes — they could be the
-        // start of the sentinel arriving in the next read.
-        size_t keep = s->sentinel_len > 0 ? s->sentinel_len - 1 : 0;
-        size_t emit = s->tail_len > keep ? s->tail_len - keep : 0;
+        // Hold back only a trailing sentinel prefix — it could complete in
+        // the next read. Everything else goes out now (a prompt with no
+        // newline would otherwise sit here until the step ends).
+        size_t keep = sentinel_holdback(s);
+        size_t emit = s->tail_len - keep;
         if (emit > 0) {
             ob_append(e, s, s->tail_buf, emit);
             memmove(s->tail_buf, s->tail_buf + emit, s->tail_len - emit);
