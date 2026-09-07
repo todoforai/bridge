@@ -287,6 +287,12 @@ login: build/todoforai-bridge
 run-dev: build/todoforai-bridge
 	./build/todoforai-bridge --host localhost
 
+# Production backend from a local build; --kill replaces the bridge the
+# desktop app spawned for this device (pm2: `pm2 start make --name bridge-prod -- run-prod`).
+.PHONY: run-prod
+run-prod: build/todoforai-bridge
+	./build/todoforai-bridge --kill
+
 # Local dev: build + drop into ~/.todoforai/bin/ + ensure it's on PATH + print version.
 dev: build/todoforai-bridge
 	install -m755 $< $(HOME)/.todoforai/bin/todoforai-bridge
