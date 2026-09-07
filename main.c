@@ -7,8 +7,9 @@
 //   `sessionId` (UUID it mints when a PTY is spawned via a RUN that omits
 //   `sessionId`). It has no notion of TODOs — that mapping lives in the
 //   backend. `blockId` rides on RUN frames as an RPC correlation key.
-//   A RUN without `sessionId` is one-shot: the PTY auto-closes on STEP_DONE
-//   (unless STEP_AWAITING_INPUT upgraded it to a persistent session).
+//   A RUN without `sessionId` is one-shot: the PTY auto-closes on STEP_DONE.
+//   STEP_AWAITING_INPUT only parks the *step* (resumable by pid while the
+//   backend still holds the pending run); it never makes the shell persistent.
 //     → {"type":"identity","data":{...}}
 //     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
 //     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool,"cwd":"..."}
@@ -232,9 +233,12 @@ typedef struct {
     char session_id[SESSION_ID_LEN + 1];
     bridge_pty_t pty;
     // One-shot: the RUN that spawned this session omitted `sessionId`, so
-    // the bridge owns lifecycle and will close the PTY on STEP_DONE. Cleared
-    // if the run hits STEP_AWAITING_INPUT — at that point the agent has the
-    // minted sessionId and the session becomes persistent for resume.
+    // the bridge owns lifecycle and closes the PTY on STEP_DONE — also after
+    // a park (STEP_AWAITING_INPUT): the agent may resume/peek/kill by pid
+    // while the step is in flight, but once STEP_DONE settles it the backend
+    // drops the run and nothing can address the shell any more. Keeping it
+    // alive there leaked one idle bash per timed-out RUN (Windows: every
+    // slow snapshot script) until the box ran out of CPU.
     int one_shot;
 
     // Working dir the PTY was spawned in (the explicit RUN `cwd` or the
@@ -945,9 +949,9 @@ static void ob_reset(out_policy_t *ob);
 
 // Park a running step: hand the RUN back to the backend (STEP_AWAITING_INPUT)
 // while the shell keeps running. Used by the stdin-blocked probe and by an
-// explicit `detach` frame from the user. The session is promoted to
-// persistent and the deadline dropped, so neither STEP_DONE nor the timeout
-// tears the process down — the agent now owns its lifecycle by pid.
+// explicit `detach` frame from the user. The deadline is dropped so the
+// timeout no longer fires; the agent drives the step by pid until STEP_DONE,
+// after which normal (one-shot or persistent) teardown rules apply.
 static void park_step(edge_t *e, session_t *s, int password_prompt, const char *reason) {
     if (s->parked) return;
     s->parked = 1;
@@ -963,7 +967,10 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
         s->tail_len = keep;
     }
     ob_finish(e, s);
-    s->one_shot = 0;
+    // one_shot is deliberately NOT cleared: the session only needs to outlive
+    // the *step* (agent resumes/kills by pid via the backend's pending run);
+    // once STEP_DONE settles it the backend forgets the pid, so run_finish
+    // tears a one-shot down exactly as it would without the park.
     s->deadline_ms = 0;
     send_step_awaiting_input(e, s, password_prompt, reason);  // reads ob.truncated before reset
     // Post-park output is a fresh delta (mirrors edge resetForInteraction).
@@ -972,8 +979,8 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
 }
 
 // Reset per-step state. Trailing PTY bytes still emit OUTPUT (no blockId).
-// One-shot sessions tear down here; promoted sessions (one_shot cleared in
-// park_step) survive.
+// One-shot sessions tear down here (parked or not); agent-owned sessions
+// (RUN carried a sessionId) survive.
 static void run_finish(session_t *s) {
     s->state = SESS_IDLE;
     s->tail_len = 0;
@@ -1506,7 +1513,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Sentinel-bracketed exec. Backend never wraps; bridge owns the dance.
         // Required fields: blockId, cmdB64. `sessionId` is optional — when
         // absent, the bridge spawns a one-shot PTY and auto-closes it on
-        // STEP_DONE (kept alive only if STEP_AWAITING_INPUT fires first).
+        // STEP_DONE (even if STEP_AWAITING_INPUT parked it in between).
         const char *sid = NULL; size_t sid_len = 0;
         int has_sid = json_get_str(msg, msg_len, "sessionId", &sid, &sid_len) && sid_len > 0;
         if (!has_bid || bid_len == 0)

@@ -193,6 +193,18 @@ test-initdrain: | build
 	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-initdrain
 
+# One-shot PTY lifecycle: a RUN without sessionId must release its shell at
+# STEP_DONE even after being parked (STEP_AWAITING_INPUT); a full session
+# table answers with an explicit MAX_SESSIONS error. Asserts the bridge's
+# child count stays flat across many one-shots.
+.PHONY: test-oneshot-leak
+test-oneshot-leak: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-oneshot-leak \
+	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-oneshot-leak
+
 # Auto-update gating: only a supervised release build steps forward to a newer
 # release. Built twice — the "a dev build never auto-updates" rule depends on
 # the version baked in, so the test reads its own BRIDGE_VERSION and asserts
