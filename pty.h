@@ -76,7 +76,11 @@ int bridge_pty_pollfd(const bridge_pty_t *p);
 //   *password_prompt  ← 1 iff slave ECHO is off AND echo_baseline was on
 //                     (i.e. the user command turned echo off — getpass/sudo)
 //
-// Returns 1 if blocked-on-tty-read, 0 otherwise.
+// Returns 1 if blocked-on-tty-read, 0 otherwise. Linux may return 2: the
+// foreground task is a ptrace-opaque setuid child (sudo/ssh/su) that is
+// asleep, but /proc can't tell on WHAT — a password prompt looks the same as
+// a snap download waiting on its daemon socket. Treat 2 as a hint that needs
+// corroboration (PTY silence), never as proof.
 // fg_pid is a process id (signed, large enough for any platform's pid).
 int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
                              long *fg_pid, int *password_prompt);

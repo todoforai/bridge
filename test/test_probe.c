@@ -77,6 +77,23 @@ int main(void) {
         msleep(100);
         bridge_pty_close(&p);
     }
+    // 5) ptrace-opaque sleeper — PR_SET_DUMPABLE=0 makes /proc/<pid>/syscall
+    // EACCES exactly like a setuid sudo/snap child, while the task only sleeps
+    // on a timer and never touches stdin. Must come back as 2 (hint), never 1:
+    // main.c corroborates 2 with PTY silence before parking.
+    if (system("command -v python3 >/dev/null 2>&1") == 0) {
+        bridge_pty_t p;
+        if (bridge_pty_spawn(&p, "/bin/bash", NULL, /*no_echo=*/1) != 0) { fprintf(stderr, "spawn failed\n"); return 1; }
+        const char *cmd = "python3 -c 'import ctypes,time; ctypes.CDLL(None).prctl(4,0); time.sleep(30)'\n";
+        bridge_pty_write_all(&p, cmd, strlen(cmd));
+        drain(&p, 1500);
+        long fg=0; int pwd=0;
+        int r = bridge_pty_probe_blocked(&p, /*echo_baseline=*/0, &fg, &pwd);
+        printf("[opaque sleep] blocked=%d fg=%ld (expect blocked=2 on linux, 0 elsewhere)\n", r, fg); fflush(stdout);
+        if (r == 1) { fprintf(stderr, "FAIL: opaque sleeper reported as authoritative tty read\n"); return 1; }
+        bridge_pty_signal(&p, 9);
+        bridge_pty_close(&p);
+    }
     // 4) busy command — should NOT be blocked
     {
         bridge_pty_t p;

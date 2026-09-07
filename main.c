@@ -344,6 +344,11 @@ typedef struct {
 // Grace after write covers the ldisc drain (~tens of ms on Linux n_tty);
 // stays well below PAUSE_POLL_MS*PAUSE_CONFIRM_TICKS so prompt latency is unaffected.
 #define INPUT_GRACE_MS       500
+// Probe result 2 = ptrace-opaque sleeper (sudo/snap/apt as root): could be a
+// password prompt or a socket/timer wait. Only a prompt goes quiet — require
+// this much PTY silence (no output, no input) before parking on it. Without
+// the gate a `sudo snap install` parked every 500ms mid-download.
+#define OPAQUE_QUIET_MS      2000
 
 typedef struct {
     ws_t ws;
@@ -2424,6 +2429,7 @@ static void service_sessions(edge_t *e) {
 
         long fg = 0; int pwd = 0;
         int blocked = bridge_pty_probe_blocked(&s->pty, /*echo_baseline=*/0, &fg, &pwd);
+        if (blocked == 2 && now - s->last_active_ms < OPAQUE_QUIET_MS) blocked = 0;
         if (!blocked) { s->pause_consec_ticks = 0; continue; }
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
 

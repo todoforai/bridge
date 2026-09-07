@@ -305,10 +305,12 @@ static int proc_is_opaque_sleeping(pid_t pid) {
 
 // Combined check: prefer syscall (authoritative), fall back to wchan symbol,
 // then to the ptrace-opaque-sleeping heuristic for setuid children.
+// Returns 1 for an authoritative tty-read, 2 for the opaque guess (the task
+// is asleep on SOMETHING we cannot see — tty, socket, timer, wait() — so the
+// caller must corroborate, e.g. with PTY silence), 0 otherwise.
 static int proc_is_blocked_on_tty(pid_t pid) {
-    return proc_syscall_is_tty_read(pid) ||
-           proc_wchan_is_tty_read(pid)   ||
-           proc_is_opaque_sleeping(pid);
+    if (proc_syscall_is_tty_read(pid) || proc_wchan_is_tty_read(pid)) return 1;
+    return proc_is_opaque_sleeping(pid) ? 2 : 0;
 }
 
 // Read field 5 (pgrp) of /proc/<pid>/stat. The `comm` field (#2) may contain
@@ -419,7 +421,8 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
 
     // Fast path: the pgrp leader is by far the most common reader (plain shell
     // builtins like `read`, simple `cmd` invocations). Check it first.
-    if (proc_is_blocked_on_tty(fg)) {
+    int how = proc_is_blocked_on_tty(fg);
+    if (how) {
         if (fg_pid) *fg_pid = fg;
     } else {
         // Slow path: scan /proc for any task whose pgrp matches `fg` and that
@@ -434,7 +437,8 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
             pid_t pid = (pid_t)atoi(e->d_name);
             if (pid <= 0 || pid == fg) continue;
             if (proc_pgrp(pid) != fg) continue;
-            if (proc_is_blocked_on_tty(pid)) { blocked_pid = pid; break; }
+            how = proc_is_blocked_on_tty(pid);
+            if (how) { blocked_pid = pid; break; }
         }
         closedir(d);
         if (blocked_pid == 0) return 0;
@@ -452,7 +456,7 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
             *password_prompt = 1;
         }
     }
-    return 1;
+    return how;
 #else
     (void)p;
     return 0;
