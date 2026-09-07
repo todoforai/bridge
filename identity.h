@@ -29,6 +29,10 @@ typedef struct {
     char home[256];
     char cwd[512];
     char machine_id[65];     // /etc/machine-id | IOPlatformUUID | Win MachineGuid (empty if unavailable)
+    // Host-shape signals a browser can also see (hardwareConcurrency, screen):
+    // the backend matches a web frontend to a bridge with them. Best-effort.
+    char cores[8];           // online logical CPUs, "" if unknown
+    char displays[128];      // connected outputs "WxH,WxH" (Linux DRM / Windows), "" if unknown
 } bridge_identity_t;
 
 void bridge_identity_gather(bridge_identity_t *id);
