@@ -175,18 +175,23 @@ static void detect_device_type(const char *os_sysname, char *out, size_t cap) {
     snprintf(out, cap, "UNKNOWN");
 }
 
-// Connected display modes: Linux via sysfs DRM (no X/Wayland needed),
-// Windows via the virtual screen. macOS needs CoreGraphics — left empty.
-static void detect_displays(char *out, size_t cap) {
+// Primary display mode "WxH": Windows virtual primary screen, macOS
+// system_profiler, Linux the first connected DRM output (no X/Wayland needed).
+static void detect_screen(char *out, size_t cap) {
     out[0] = '\0';
 #ifdef _WIN32
     snprintf(out, cap, "%dx%d", GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+#elif defined(__APPLE__)
+    FILE *p = popen("system_profiler SPDisplaysDataType 2>/dev/null | awk '/Resolution:/{print $2\"x\"$4; exit}'", "r");
+    if (p) {
+        if (fgets(out, (int)cap, p)) out[strcspn(out, "\r\n")] = '\0';
+        pclose(p);
+    }
 #else
     DIR *d = opendir("/sys/class/drm");
     if (!d) return;
-    size_t u = 0;
     struct dirent *e;
-    while ((e = readdir(d)) && u + 16 < cap) {
+    while ((e = readdir(d)) && !out[0]) {
         if (!strchr(e->d_name, '-')) continue;  // card1-DP-1, not card1
         char path[300], buf[64] = {0};
         snprintf(path, sizeof path, "/sys/class/drm/%s/status", e->d_name);
@@ -198,10 +203,7 @@ static void detect_displays(char *out, size_t cap) {
         snprintf(path, sizeof path, "/sys/class/drm/%s/modes", e->d_name);
         f = fopen(path, "r");
         if (!f) continue;
-        if (fgets(buf, sizeof buf, f)) {
-            buf[strcspn(buf, "\r\n")] = '\0';
-            u += (size_t)snprintf(out + u, cap - u, "%s%s", u ? "," : "", buf);
-        }
+        if (fgets(buf, sizeof buf, f)) { buf[strcspn(buf, "\r\n")] = '\0'; snprintf(out, cap, "%.23s", buf); }
         fclose(f);
     }
     closedir(d);
@@ -380,7 +382,7 @@ void bridge_identity_gather(bridge_identity_t *id) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n > 0 && n < 100000) snprintf(id->cores, sizeof(id->cores), "%d", (int)n); else id->cores[0] = '\0';
 #endif
-    detect_displays(id->displays, sizeof(id->displays));
+    detect_screen(id->screen, sizeof(id->screen));
     detect_gpu(id->gpu, sizeof(id->gpu));
 
     // Sanitize all fields: replace control bytes with space — keeps the
@@ -388,7 +390,7 @@ void bridge_identity_gather(bridge_identity_t *id) {
     // accidentally contains a stray byte.
     char *fields[] = { id->os, id->arch, id->hostname, id->kernel, id->distro,
                        id->distro_version, id->device_type, id->user,
-                       id->shell, id->home, id->cwd, id->machine_id, id->cores, id->displays, id->gpu };
+                       id->shell, id->home, id->cwd, id->machine_id, id->cores, id->screen, id->gpu };
     for (size_t f = 0; f < sizeof(fields)/sizeof(fields[0]); f++) {
         for (char *p = fields[f]; *p; p++) {
             if ((unsigned char)*p < 0x20) *p = ' ';
@@ -434,7 +436,7 @@ int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     KV("cwd",            id.cwd);
     if (id.machine_id[0]) KV("machine_id", id.machine_id);
     if (id.cores[0])      KV("cores",      id.cores);
-    if (id.displays[0])   KV("displays",   id.displays);
+    if (id.screen[0])     KV("screen",     id.screen);
     if (id.gpu[0])        KV("gpu",        id.gpu);
     if (json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
 
