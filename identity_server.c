@@ -57,6 +57,8 @@ ws_fd_t bridge_identity_server_open(void) {
 // this only decides whether a page may READ the (non-secret) id.
 static int origin_allowed(const char *origin, size_t n) {
     return (n > 8 && memcmp(origin, "https://", 8) == 0)
+        || (n > 19 && memcmp(origin, "chrome-extension://", 19) == 0)
+        || (n > 16 && memcmp(origin, "moz-extension://", 16) == 0)
         || (n > 17 && memcmp(origin, "http://localhost:", 17) == 0)
         || (n > 17 && memcmp(origin, "http://127.0.0.1:", 17) == 0);
 }
