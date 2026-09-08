@@ -27,11 +27,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c \
+COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h \
+HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
