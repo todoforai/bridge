@@ -237,6 +237,16 @@ test-probe: | build
 	$(CC) -O0 -g -Wall -I. -o build/test-probe test/test_probe.c $(TEST_DEPS) -lutil
 	./build/test-probe
 
+# Prompt-shaped output tail: the corroboration that stops a merely-slow command
+# (macOS has no wait channel, so the probe alone cannot tell) from being parked.
+.PHONY: test-prompt-tail
+test-prompt-tail: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-prompt-tail \
+	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-prompt-tail
+
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
 BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c

@@ -367,10 +367,15 @@ static int darwin_pid_has_tty_fd(pid_t pid) {
     return hit;
 }
 
-// True iff `pid` has no thread currently on-CPU. Darwin doesn't expose
-// per-syscall info like /proc/<pid>/syscall, so we approximate:
-// "no running thread + holds a pty fd". Combined with the tcgetpgrp gate
-// from the caller this matches the Linux signal in practice.
+// True iff `pid` has no thread currently on-CPU. Darwin exposes no
+// per-syscall info: /proc/<pid>/syscall has no equivalent, and the wait
+// channel (kinfo_proc.kp_eproc.e_wmesg, which would say "ttyin") comes back
+// EMPTY on modern XNU — measured on macOS 26: a task blocked in a tty read,
+// a plain `sleep`, and a `sleep` holding a pty fd are byte-identical in
+// p_stat, p_flag, wmesg and pti_numrunning. So "not on-CPU + holds a pty fd"
+// is all we can see, and that is true of every process merely waiting on the
+// network or on a child — hence this is only ever a hint (probe result 2),
+// never proof. See bridge_pty_probe_blocked.
 static int darwin_pid_is_waiting(pid_t pid) {
     struct proc_taskallinfo ti;
     int r = proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, &ti, sizeof ti);
@@ -415,13 +420,19 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
     }
     if (fg_pid) *fg_pid = blocked_pid;
 
-    if (password_prompt && echo_baseline) {
+    // Echo turned off under us (getpass/sudo/askpass) is a real, positive
+    // signal that a prompt is up — the only authoritative one Darwin gives.
+    if (echo_baseline) {
         struct termios t;
         if (tcgetattr(p->master_fd, &t) == 0 && !(t.c_lflag & ECHO)) {
-            *password_prompt = 1;
+            if (password_prompt) *password_prompt = 1;
+            return 1;
         }
     }
-    return 1;
+    // Otherwise: merely "asleep holding a pty fd" — indistinguishable from a
+    // download, a build or a wait() on a child. Hint only; the caller must
+    // corroborate (see OPAQUE_QUIET_MS / prompt-shaped tail in main.c).
+    return 2;
 #elif defined(__linux__)
     // Foreground process *group* on our PTY. tcgetpgrp returns a pgid, NOT the
     // pid of the actual reader — for `sudo cmd`, the shell may be in wait()

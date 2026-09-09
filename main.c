@@ -11,7 +11,7 @@
 //   STEP_AWAITING_INPUT only parks the *step* (resumable by pid while the
 //   backend still holds the pending run); it never makes the shell persistent.
 //     → {"type":"identity","data":{...}}
-//     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N}
+//     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N,"noInput":bool?}
 //     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool,"cwd":"..."}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
 //     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool,"reason":"probe"|"timeout"|"detach"}
@@ -168,6 +168,10 @@ static char *bridge_expand_tilde(const char *p) {
 // the tail; the next read appends ≤ BUF_SIZE bytes. SENTINEL_CAP overshoots
 // `sentinel_len - 1` and rounds the buffer to a power of two.
 #define TAIL_CAP       (BUF_SIZE + SENTINEL_CAP)
+// Trailing OUTPUT bytes retained to recognise a prompt (see session.otail /
+// output_tail_is_prompt). Only the last line matters; 256 covers a wrapped
+// question with room to spare.
+#define PROMPT_TAIL_CAP 256
 
 // ── Output policy (mirrors packages/shared-fbe/src/outputLimits.ts) ──
 // The bridge owns ALL shell-output management for the RUN path now: it streams
@@ -318,6 +322,12 @@ typedef struct {
     // read() chunks).
     uint8_t tail_buf[TAIL_CAP];
     size_t  tail_len;
+    // Last bytes actually emitted as OUTPUT, kept to judge whether the stream
+    // ends mid-line on something question-shaped (see output_tail_is_prompt).
+    // Corroborates the awaiting-input probe where the OS can't say what a
+    // sleeping task is blocked on. Reset per step.
+    uint8_t otail[PROMPT_TAIL_CAP];
+    size_t  otail_len;
     // LRU key for idle-session eviction. SESS_RUNNING is never evicted.
     int64_t last_active_ms;
     // Awaiting-input probe: poll wchan every PAUSE_POLL_MS, fire after
@@ -328,6 +338,10 @@ typedef struct {
     // shell keeps running. Suppresses the probe and repeat detaches until
     // input resumes the step or it finishes.
     int     parked;
+    // RUN said noInput: nothing will ever be typed at this step, so the
+    // awaiting-input probe is off and it runs to exit or timeout. Set per
+    // RUN (a persistent session may alternate). See RunMessage.noInput.
+    int     no_input;
     // Stamp after bridge_pty_write_all; probe waits INPUT_GRACE_MS past it to
     // avoid false-pause during the trailing line-discipline drain.
     int64_t last_input_ms;
@@ -342,16 +356,64 @@ typedef struct {
     int64_t obuf_since_ms;  // 0 = empty; else when the oldest byte was queued
 } session_t;
 
+// Does the emitted output end on an unanswered question? A program that wants
+// input prints a prompt and leaves the cursor on it: the stream ends WITHOUT a
+// newline, and the last line reads like a question. Anything that merely went
+// quiet (download, build, wait on a child) has ended its last line normally.
+//
+// This is the corroboration for probe result 2 on platforms that cannot say
+// what a sleeping task is blocked on (all of macOS; setuid children on Linux).
+// Deliberately narrow: a missed prompt costs the deadline (the step parks at
+// timeout anyway), a false one interrupts a healthy command.
+static int output_tail_is_prompt(const session_t *s) {
+    size_t n = s->otail_len;
+    if (n == 0) return 0;
+
+    // Trailing spaces are part of the prompt ("Password: "), not a terminator.
+    while (n > 0 && (s->otail[n - 1] == ' ' || s->otail[n - 1] == '\t')) n--;
+    if (n == 0) return 0;
+    // Cursor moved to a fresh line ⇒ nothing is waiting on this line.
+    if (s->otail[n - 1] == '\n' || s->otail[n - 1] == '\r') return 0;
+
+    size_t start = n;
+    while (start > 0 && s->otail[start - 1] != '\n' && s->otail[start - 1] != '\r') start--;
+    const char *line = (const char *)s->otail + start;
+    size_t line_len = n - start;
+    if (line_len == 0 || line_len > 200) return 0;  // a long unterminated line is a progress bar
+
+    // Ends on punctuation that invites an answer: "Password:", "Continue?",
+    // "Ok to proceed? (y)", "Overwrite [y/N]", "Choose >".
+    char last = line[line_len - 1];
+    if (last == ':' || last == '?' || last == '>' || last == ')' || last == ']') return 1;
+
+    // Or says so in words, case-insensitively, anywhere on the line.
+    static const char *const words[] = {
+        "password", "passphrase", "username", "y/n", "yes/no", "[y", "(y", NULL
+    };
+    char low[201];
+    for (size_t i = 0; i < line_len; i++) {
+        char c = line[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    low[line_len] = '\0';
+    for (int i = 0; words[i]; i++) if (strstr(low, words[i])) return 1;
+    return 0;
+}
+
 // 2 ticks × 250 ms ⇒ ~250-500 ms latency, FP rate ~1-2%.
 #define PAUSE_POLL_MS        250
 #define PAUSE_CONFIRM_TICKS  2
 // Grace after write covers the ldisc drain (~tens of ms on Linux n_tty);
 // stays well below PAUSE_POLL_MS*PAUSE_CONFIRM_TICKS so prompt latency is unaffected.
 #define INPUT_GRACE_MS       500
-// Probe result 2 = ptrace-opaque sleeper (sudo/snap/apt as root): could be a
-// password prompt or a socket/timer wait. Only a prompt goes quiet — require
-// this much PTY silence (no output, no input) before parking on it. Without
-// the gate a `sudo snap install` parked every 500ms mid-download.
+// Probe result 2 = sleeper the OS can't explain (Linux: ptrace-opaque
+// sudo/snap/apt as root; macOS: everything, no wait channel): could be a
+// password prompt or a socket/timer wait. Two corroborations are required
+// before parking on it: this much PTY silence (no output, no input) AND the
+// output ending on a prompt-shaped line (output_tail_is_prompt). Silence alone
+// parked `sudo snap install` mid-download on Linux and, on macOS, every
+// command longer than ~0.5s — `npm install` was Ctrl-C'd during registry
+// fetches and reported as "stopped at an interactive prompt".
 #define OPAQUE_QUIET_MS      2000
 // Shell function prepended to every POSIX RUN: `sudo` → `sudo -A` so the
 // password prompt goes through $SUDO_ASKPASS (a plain tty read the probe
@@ -850,9 +912,27 @@ static void flush_output(edge_t *e, session_t *s) {
 // verbose command pushed thousands of frames/s into the backend's serial
 // per-socket processor → head-of-line blocking. Coalesce into ≤OUT_FLUSH_BYTES
 // batches, flushed by size here and by OUT_FLUSH_MS age in service_sessions().
+// Keep the last PROMPT_TAIL_CAP emitted bytes so the awaiting-input probe can
+// ask whether the command left the cursor on an unanswered question.
+static void otail_append(session_t *s, const uint8_t *data, size_t len) {
+    if (len >= sizeof s->otail) {
+        memcpy(s->otail, data + (len - sizeof s->otail), sizeof s->otail);
+        s->otail_len = sizeof s->otail;
+        return;
+    }
+    if (s->otail_len + len > sizeof s->otail) {
+        size_t drop = s->otail_len + len - sizeof s->otail;
+        memmove(s->otail, s->otail + drop, s->otail_len - drop);
+        s->otail_len -= drop;
+    }
+    memcpy(s->otail + s->otail_len, data, len);
+    s->otail_len += len;
+}
+
 static void send_output_bytes(edge_t *e, session_t *s,
                               const uint8_t *data, size_t len) {
     if (len == 0) return;
+    otail_append(s, data, len);
     // Single emission bigger than the whole buffer: keep ordering, send as-is.
     // Bypasses obuf, so it needs its own redaction pass (callers own the
     // buffer and expect it scrubbed either way — see redact_token).
@@ -1841,8 +1921,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             return send_error(e, NULL, 0, bid, bid_len, "INTERNAL", "wrapper too large");
         }
 
+        int no_input_val = 0;
+        s->no_input = json_get_bool(msg, msg_len, "noInput", &no_input_val) && no_input_val;
+
         s->state = SESS_RUNNING;
         s->tail_len = 0;
+        s->otail_len = 0;
         s->last_active_ms = monotonic_ms();
         s->last_pause_poll_ms = s->last_active_ms;
         s->pause_consec_ticks = 0;
@@ -2437,8 +2521,12 @@ static void service_sessions(edge_t *e) {
         if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
         if (now < s->deadline_ms) continue;
 #ifdef _WIN32
-        park_step(e, s, /*password_prompt=*/0, "timeout");
-        continue;
+        // ...unless the RUN declared itself non-interactive: nothing can be
+        // typed, so a park would strand the step instead of reporting it.
+        if (!s->no_input) {
+            park_step(e, s, /*password_prompt=*/0, "timeout");
+            continue;
+        }
 #endif
         if (s->tail_len > 0) {
             ob_append(e, s, s->tail_buf, s->tail_len);
@@ -2452,7 +2540,7 @@ static void service_sessions(edge_t *e) {
     // Awaiting-input probe: see PAUSE_POLL_MS / PAUSE_CONFIRM_TICKS comments above.
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
-        if (!s->active || s->state != SESS_RUNNING || s->parked) continue;
+        if (!s->active || s->state != SESS_RUNNING || s->parked || s->no_input) continue;
         if (now - s->last_pause_poll_ms < PAUSE_POLL_MS) continue;
         s->last_pause_poll_ms = now;
 
@@ -2462,7 +2550,7 @@ static void service_sessions(edge_t *e) {
 
         long fg = 0; int pwd = 0;
         int blocked = bridge_pty_probe_blocked(&s->pty, /*echo_baseline=*/0, &fg, &pwd);
-        if (blocked == 2 && now - s->last_active_ms < OPAQUE_QUIET_MS) blocked = 0;
+        if (blocked == 2 && (now - s->last_active_ms < OPAQUE_QUIET_MS || !output_tail_is_prompt(s))) blocked = 0;
         if (!blocked) { s->pause_consec_ticks = 0; continue; }
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
 
