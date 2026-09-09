@@ -1673,8 +1673,18 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             }
 #endif
             if (bridge_pty_spawn(&s->pty, DEFAULT_SHELL, spawn_cwd, /*no_echo=*/1) != 0) {
+                // OS pty/fd limits (macOS kern.tty.ptmx_max, RLIMIT_NOFILE)
+                // can be exhausted below our own session cap, so report both
+                // the reason and the tracked session count — a bare "failed to
+                // spawn PTY" can't tell the two apart.
+                int err = errno;
+                int live = 0;
+                for (int j = 0; j < g_max_sessions; j++) live += e->sessions[j].active;
+                char why[160];
+                snprintf(why, sizeof why, "failed to spawn PTY: %s (%d/%d sessions live)",
+                         strerror(err), live, g_max_sessions);
                 free(cmd);
-                return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", "failed to spawn PTY");
+                return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", why);
             }
             // Best-effort echo/prompt suppression (see draining_begin in
             // session_t). Written immediately; the RUN wrapper below queues

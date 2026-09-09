@@ -187,7 +187,10 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     COORD size = { 80, 24 };
     HPCON hpc = NULL;
     HRESULT hr = CreatePseudoConsole(size, in_read, out_write, 0, &hpc);
-    if (FAILED(hr)) goto fail;
+    // Carry the reason into GetLastError so the `fail:` translation below
+    // reports it (the HRESULT wraps a Win32 code for the cases we can hit:
+    // handle/memory exhaustion).
+    if (FAILED(hr)) { SetLastError(HRESULT_CODE(hr)); goto fail; }
 
     // ConPTY duplicates the handles; close our copies of the child-side ends.
     CloseHandle(in_read);  in_read = NULL;
@@ -285,12 +288,26 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     (void)no_echo;  // ConPTY has no direct ECHO toggle; bash -c handles it.
     return 0;
 
-fail:
+fail: {
+    // CloseHandle can clobber GetLastError, so translate first. Mirrors
+    // bridge_pty_write_all: the caller diagnoses with strerror(errno), which
+    // on Windows would otherwise print "No error" for a failed spawn.
+    DWORD ge = GetLastError();
+    switch (ge) {
+        case ERROR_TOO_MANY_OPEN_FILES: errno = EMFILE;  break;
+        case ERROR_NOT_ENOUGH_MEMORY:
+        case ERROR_OUTOFMEMORY:         errno = ENOMEM;  break;
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:      errno = ENOENT;  break;
+        case ERROR_ACCESS_DENIED:       errno = EACCES;  break;
+        default:                        errno = EIO;     break;
+    }
     if (in_read)   CloseHandle(in_read);
     if (in_write)  CloseHandle(in_write);
     if (out_read)  CloseHandle(out_read);
     if (out_write) CloseHandle(out_write);
     return -1;
+}
 }
 
 void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols) {
