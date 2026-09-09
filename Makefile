@@ -247,6 +247,16 @@ test-prompt-tail: | build
 	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-prompt-tail
 
+# Awaiting-input end-to-end on the real loop: a quiet command must finish, a
+# real prompt must park, and noInput must never park.
+.PHONY: test-park
+test-park: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-park \
+	    test/test_park.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-park
+
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
 BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c

@@ -398,6 +398,22 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
     pid_t fg = tcgetpgrp(p->master_fd);
     if (fg <= 0) return 0;
 
+    // Echo turned off under us (getpass/sudo/askpass) is the one authoritative
+    // prompt signal Darwin gives, so it is checked FIRST and on its own: the
+    // sleeping-task heuristic below is timing-dependent (a thread briefly on
+    // CPU reads as "not blocked"), and gating the echo check behind it made
+    // password prompts detected or missed at random.
+    int echo_off = 0;
+    if (echo_baseline) {
+        struct termios t;
+        echo_off = tcgetattr(p->master_fd, &t) == 0 && !(t.c_lflag & ECHO);
+    }
+    if (echo_off) {
+        if (fg_pid) *fg_pid = fg;
+        if (password_prompt) *password_prompt = 1;
+        return 1;
+    }
+
     pid_t blocked_pid = 0;
     if (darwin_is_blocked_on_tty(fg)) {
         blocked_pid = fg;
@@ -420,16 +436,7 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
     }
     if (fg_pid) *fg_pid = blocked_pid;
 
-    // Echo turned off under us (getpass/sudo/askpass) is a real, positive
-    // signal that a prompt is up — the only authoritative one Darwin gives.
-    if (echo_baseline) {
-        struct termios t;
-        if (tcgetattr(p->master_fd, &t) == 0 && !(t.c_lflag & ECHO)) {
-            if (password_prompt) *password_prompt = 1;
-            return 1;
-        }
-    }
-    // Otherwise: merely "asleep holding a pty fd" — indistinguishable from a
+    // Echo is on, so this is merely "asleep holding a pty fd" — indistinguishable from a
     // download, a build or a wait() on a child. Hint only; the caller must
     // corroborate (see OPAQUE_QUIET_MS / prompt-shaped tail in main.c).
     return 2;

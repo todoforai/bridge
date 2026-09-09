@@ -365,6 +365,11 @@ typedef struct {
 // what a sleeping task is blocked on (all of macOS; setuid children on Linux).
 // Deliberately narrow: a missed prompt costs the deadline (the step parks at
 // timeout anyway), a false one interrupts a healthy command.
+//
+// Returns 0 = not a prompt, 1 = question, 2 = secret (password/passphrase).
+// The tail is also the ONLY password signal a RUN step has: RUN spawns its PTY
+// with ECHO already off (sentinel scanning needs it), so the echo-off
+// transition bridge_pty_probe_blocked reports is invisible here by construction.
 static int output_tail_is_prompt(const session_t *s) {
     size_t n = s->otail_len;
     if (n == 0) return 0;
@@ -381,21 +386,24 @@ static int output_tail_is_prompt(const session_t *s) {
     size_t line_len = n - start;
     if (line_len == 0 || line_len > 200) return 0;  // a long unterminated line is a progress bar
 
-    // Ends on punctuation that invites an answer: "Password:", "Continue?",
-    // "Ok to proceed? (y)", "Overwrite [y/N]", "Choose >".
-    char last = line[line_len - 1];
-    if (last == ':' || last == '?' || last == '>' || last == ')' || last == ']') return 1;
-
-    // Or says so in words, case-insensitively, anywhere on the line.
-    static const char *const words[] = {
-        "password", "passphrase", "username", "y/n", "yes/no", "[y", "(y", NULL
-    };
     char low[201];
     for (size_t i = 0; i < line_len; i++) {
         char c = line[i];
         low[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
     }
     low[line_len] = '\0';
+
+    // A secret is asked for by name — the words are what turns echo off.
+    static const char *const secret_words[] = { "password", "passphrase", "secret", NULL };
+    for (int i = 0; secret_words[i]; i++) if (strstr(low, secret_words[i])) return 2;
+
+    // Ends on punctuation that invites an answer: "Continue?",
+    // "Ok to proceed? (y)", "Overwrite [y/N]", "Choose >", "Username:".
+    char last = line[line_len - 1];
+    if (last == ':' || last == '?' || last == '>' || last == ')' || last == ']') return 1;
+
+    // Or says so in words, case-insensitively, anywhere on the line.
+    static const char *const words[] = { "username", "y/n", "yes/no", "[y", "(y", NULL };
     for (int i = 0; words[i]; i++) if (strstr(low, words[i])) return 1;
     return 0;
 }
@@ -2550,11 +2558,14 @@ static void service_sessions(edge_t *e) {
 
         long fg = 0; int pwd = 0;
         int blocked = bridge_pty_probe_blocked(&s->pty, /*echo_baseline=*/0, &fg, &pwd);
-        if (blocked == 2 && (now - s->last_active_ms < OPAQUE_QUIET_MS || !output_tail_is_prompt(s))) blocked = 0;
+        // RUN's PTY starts with ECHO off, so the probe's echo-off password
+        // signal can never fire here — the prompt text itself is the tell.
+        int tail = output_tail_is_prompt(s);
+        if (blocked == 2 && (now - s->last_active_ms < OPAQUE_QUIET_MS || !tail)) blocked = 0;
         if (!blocked) { s->pause_consec_ticks = 0; continue; }
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
 
-        park_step(e, s, pwd, "probe");
+        park_step(e, s, pwd || tail == 2, "probe");
     }
 
     // Drain PTY masters (non-blocking; returns 0 on EAGAIN). Drain each session

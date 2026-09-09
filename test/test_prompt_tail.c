@@ -57,13 +57,16 @@ static void check(const char *label, const char *text, int expect) {
 
 int main(void) {
     // Waiting on the user: cursor parked on an unfinished question.
-    check("sudo password",   "[sudo] password for six: ", 1);
+    // 2 = the line asks for a secret; that is the only passwordPrompt signal a
+    // RUN step has (its PTY spawns with ECHO already off, so the probe's
+    // echo-off transition can never fire).
+    check("sudo password",   "[sudo] password for six: ", 2);
     check("npm proceed",     "Need to install the following packages:\n  cowsay@1.6.0\nOk to proceed? (y) ", 1);
     check("yes/no words",    "Do you want to continue [Y/n]? ", 1);
     check("bare colon",      "Username: ", 1);
     check("angle prompt",    "sqlite> ", 1);
     check("overwrite",       "File exists. Overwrite [y/N]", 1);
-    check("no trailing sp",  "Enter passphrase:", 1);
+    check("no trailing sp",  "Enter passphrase:", 2);
 
     // Busy, not waiting: every line properly terminated.
     check("npm registry",    "npm http fetch GET 200 https://registry.npmjs.org/zod 319ms\n", 0);
@@ -90,7 +93,7 @@ int main(void) {
     for (int i = 0; i < 200; i++)
         n += (size_t)snprintf(flood + n, sizeof flood - n, "line %d of noise\n", i);
     snprintf(flood + n, sizeof flood - n, "Password: ");
-    check("prompt after flood", flood, 1);
+    check("prompt after flood", flood, 2);
 
     // Same flood, but ending on a complete line: still not a prompt.
     n = 0;
