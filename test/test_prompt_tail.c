@@ -101,6 +101,23 @@ int main(void) {
         n += (size_t)snprintf(flood + n, sizeof flood - n, "line %d of noise\n", i);
     check("flood, no prompt", flood, 0);
 
+    // Past the head limit the bytes are only kept for the truncation tail and
+    // never re-emitted live, so the prompt tail must be fed where every step
+    // byte passes (ob_append), not from the live emission path alone.
+    {
+        edge_t *e = calloc(1, sizeof *e);
+        session_t *s = calloc(1, sizeof *s);
+        ob_resolve(&s->ob, "safe", 4);
+        char line[64];
+        memset(line, 'x', sizeof line - 2); line[sizeof line - 2] = '\n'; line[sizeof line - 1] = 0;
+        for (int i = 0; i < 400; i++) ob_append(e, s, (const uint8_t *)line, strlen(line));
+        ob_append(e, s, (const uint8_t *)"Continue? [y/N] ", 16);
+        if (!s->ob.truncated) { fprintf(stderr, "FAIL [setup: head limit not reached]\n"); failures++; }
+        else if (output_tail_is_prompt(s) != 1) { fprintf(stderr, "FAIL [prompt past head limit invisible]\n"); failures++; }
+        else printf("ok   [prompt past head limit] → 1\n");
+        free(s); free(e);
+    }
+
     if (failures) { fprintf(stderr, "%d case(s) failed\n", failures); return 1; }
     printf("all prompt-tail cases passed\n");
     return 0;

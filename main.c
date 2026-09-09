@@ -940,7 +940,6 @@ static void otail_append(session_t *s, const uint8_t *data, size_t len) {
 static void send_output_bytes(edge_t *e, session_t *s,
                               const uint8_t *data, size_t len) {
     if (len == 0) return;
-    otail_append(s, data, len);
     // Single emission bigger than the whole buffer: keep ordering, send as-is.
     // Bypasses obuf, so it needs its own redaction pass (callers own the
     // buffer and expect it scrubbed either way — see redact_token).
@@ -1263,6 +1262,10 @@ static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
     out_policy_t *ob = &s->ob;
     if (n == 0) return;
     ob->total_len += n;
+    // Prompt tail sees every step byte, including those past head_limit that
+    // are only kept for the truncation tail — otherwise a prompt printed after
+    // 10k of build log would be invisible to the awaiting-input probe.
+    otail_append(s, d, n);
     const uint8_t *p = d; size_t rem = n;
     if (ob->head_limit == OB_NOLIMIT || ob->head_len < ob->head_limit) {
         size_t room = (ob->head_limit == OB_NOLIMIT) ? rem : ob->head_limit - ob->head_len;
