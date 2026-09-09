@@ -183,7 +183,7 @@ int bridge_login_run(const char *device_name, const char *token,
 
 int cmd_login(int argc, char **argv) {
     // Note: --profile is intentionally undocumented (advanced/dev multi-account).
-    static const char *USAGE = "login [--device-name NAME] [--token TOKEN]";
+    static const char *USAGE = "login [--device-name NAME] [--token TOKEN] [--no-browser]";
     const char *device_name = NULL;
     const char *token       = NULL;
     const char *host        = NULL;
@@ -196,12 +196,14 @@ int cmd_login(int argc, char **argv) {
         { "host",          ko_required_argument, 'H' },
         { "port",          ko_required_argument, 'p' },
         { "profile",       ko_required_argument, 'P' },
+        { "no-browser",    ko_no_argument,       'B' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
     while ((c = ketopt(&opt, argc, argv, 1, "hn:t:H:p:P:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return CMD_RC_HELP; }
+        else if (c == 'B') login_set_open_browser(0);
         else if (c == 'n') device_name = opt.arg;
         else if (c == 't') token = opt.arg;
         else if (c == 'H') host = opt.arg;
@@ -337,7 +339,7 @@ void print_help(void) {
     printf("todoforai-bridge " BRIDGE_VERSION " — TODO for AI bridge\n\n"
            "Usage: todoforai-bridge [command] [options]\n\n"
            "  (no args)            run the bridge (logs in on first run)\n"
-           "  login                log in this device  [--token T] [--device-name NAME]\n"
+           "  login                log in this device  [--token T] [--device-name NAME] [--no-browser]\n"
            "  logout               remove credentials\n"
            "  whoami               show current user/device\n"
            "  enroll               print a token to provision another device\n"
