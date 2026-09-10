@@ -213,6 +213,9 @@ static int vt_cases(void) {
         { "a\x1b(Bb",                    "ab" },               // charset select
         { "a\x1b=b",                     "ab" },               // 2-byte ESC seq
         { "plain\ttext\r\n",             "plain\ttext\r\n" },  // nothing to strip
+        { "a\x1b[1G\x1b[0Kb",            "a\rb" },              // npm spinner: column-1 kept as \r, erase dropped
+        { "a\x1b[Gb",                    "a\rb" },              // bare CSI G
+        { "a\x1b[12Gb",                  "ab" },                 // other column: plain move
     };
     int fails = 0;
     for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {

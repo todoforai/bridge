@@ -197,6 +197,33 @@ int main(void) {
     }
     printf("[prefix] OK (prefix held, then emitted intact)\n");
 
+    // ── Spinner redraws: the output policy counts what a terminal shows ──
+    // 4000 × "⠙<CSI 1G><CSI 0K>" = ~44KB of raw redraw frames, then the real
+    // log. Raw accounting would fill the 10k head with spinner junk, mark
+    // the step truncated and shove the real lines into the tail; collapsed
+    // accounting sees a few bytes of spinner + the log and never truncates.
+    reset_capture();
+    run_cmd(e, s, "i=1; while [ $i -le 4000 ]; do printf '\\342\\240\\231\\033[1G\\033[0K'; i=$((i+1)); done; "
+                  "echo; i=1; while [ $i -le 20 ]; do echo real-line-$i; i=$((i+1)); done", "safe");
+    if (memmem(g_out, g_out_len, "[truncated", 10)) {
+        fprintf(stderr, "[spinner] truncated on redraw junk (head_len=%zu total=%zu)\n", s->ob.head_len, s->ob.total_len);
+        return 1;
+    }
+    if (!memmem(g_out, g_out_len, "real-line-20", 12)) { fprintf(stderr, "[spinner] real log missing\n"); return 1; }
+    if (s->ob.total_len > 2000) { fprintf(stderr, "[spinner] effective accounting too high: %zu\n", s->ob.total_len); return 1; }
+    printf("[spinner] OK (%zu raw bytes streamed, %zu effective)\n", g_out_len, s->ob.total_len);
+
+    // ── Spinner inside a flood: the tail is stored collapsed, so the real
+    // trailing lines survive instead of being evicted by redraw frames ──
+    reset_capture();
+    run_cmd(e, s, "i=1; while [ $i -le 3000 ]; do echo flood-$i; i=$((i+1)); done; "
+                  "i=1; while [ $i -le 3000 ]; do printf 'step %d\\r' $i; i=$((i+1)); done; echo; "
+                  "i=1; while [ $i -le 5 ]; do echo tail-line-$i; i=$((i+1)); done", "safe");
+    if (!memmem(g_out, g_out_len, "[truncated", 10)) { fprintf(stderr, "[cr-tail] expected truncation\n"); return 1; }
+    if (!memmem(g_out, g_out_len, "flood-2500\n", 11)) { fprintf(stderr, "[cr-tail] collapsed tail lost pre-spinner lines\n"); return 1; }
+    if (!memmem(g_out, g_out_len, "step 3000\ntail-line-1", 20)) { fprintf(stderr, "[cr-tail] spinner not collapsed to final frame; last 300 bytes:\n%.*s\n", 300, g_out + (g_out_len > 300 ? g_out_len - 300 : 0)); return 1; }
+    printf("[cr-tail] OK (tail holds collapsed lines)\n");
+
     bridge_pty_close(&s->pty);
     free(e->sessions);
     free(e);

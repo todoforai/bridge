@@ -186,6 +186,25 @@ static char *bridge_expand_tilde(const char *p) {
 // Tail buffer: holds the rolling last OB_STREAM_LAST bytes plus one full PTY
 // read of slack so a single append never overflows before we trim.
 #define OB_TAIL_CAP     (OB_STREAM_LAST + BUF_SIZE)
+// Current (unterminated) tail line, collapsed. Longer lines lose their overflow.
+#define OB_TCUR_CAP     4096
+
+// ── Carriage-return / cursor collapse (mirrors collapseCarriageReturns in
+// packages/shared-fbe/src/outputLimits.ts) ──
+// Progress bars and spinners redraw one line in place via `\r` or CSI `G`
+// (cursor to column 1) + CSI `K` (erase line): npm emits ~10 bytes per frame,
+// thousands of frames per install. A terminal shows one line; the output
+// policy must count what a terminal would show, not every frame, or a 30s
+// install fills the 10k head with spinner junk and pushes the real log into
+// the truncated tail. The head is still streamed raw (the frontend renders
+// the live redraws; the backend collapses the final stdout) — only the
+// accounting and the tail buffer see the collapsed view.
+typedef struct {
+    uint8_t st;      // 0 text, 1 ESC, 2 CSI, 3 OSC, 4 OSC+ESC
+    uint8_t csi[8];  // CSI parameter bytes (enough for "1", "0", "?25")
+    uint8_t csi_len;
+} cr_tok_t;
+typedef enum { CR_TEXT, CR_NL, CR_CR, CR_ERASE, CR_ESC } cr_act_t;
 
 // ── OUTPUT frame coalescing ──
 // Batch PTY bytes into fewer, larger OUTPUT frames (see send_output_bytes).
@@ -204,11 +223,18 @@ typedef struct {
     int    notice_sent;  // truncation notice already emitted
     // Streaming line-width state (head phase): suppress bytes past line_limit on
     // the current line; emit " ...[+N chars]" when the newline arrives.
-    size_t col;          // column within the current line (head stream)
+    size_t col;          // terminal column within the current line (head stream)
+    size_t line_len;     // visible length of the current head line
+    size_t line_charged; // high-water mark of line_len already counted as effective
     size_t line_dropped; // bytes dropped on the current (over-long) line
-    // Rolling tail of the last `last_limit` bytes (raw, not line-capped yet).
+    cr_tok_t head_tok;   // escape tokenizer for the head stream
+    // Rolling tail of the last `last_limit` EFFECTIVE bytes: completed lines are
+    // stored collapsed (see cr_tok_t); the current line builds in tcur.
     uint8_t tail[OB_TAIL_CAP];
     size_t  tail_len;
+    uint8_t tcur[OB_TCUR_CAP];
+    size_t  tcur_len, tcur_col, tcur_charged;
+    cr_tok_t tail_tok;
 } out_policy_t;
 
 
@@ -222,7 +248,9 @@ typedef struct {
 typedef enum {
     VT_TEXT = 0,   // ordinary bytes
     VT_ESC,        // saw ESC, awaiting the sequence type
-    VT_CSI,        // ESC [ … final byte in 0x40..0x7E
+    VT_CSI,        // ESC [ … final byte in 0x40..0x7E (no parameters yet)
+    VT_CSI_COL1,   // ESC [ 1 or ESC [ 0 — a "G" here is cursor-to-column-1
+    VT_CSI_OTHER,  // ESC [ <other parameters>
     VT_OSC,        // ESC ] … terminated by BEL or ST
     VT_OSC_ESC,    // inside OSC, saw ESC (expecting the ST backslash)
     VT_CHARSET,    // ESC ( / ) / * / + <one byte>
@@ -1177,6 +1205,43 @@ static int begin_drain_scan(session_t *s) {
 // at the end. Mirrors edge's OutputBuffer (edge/bun/src/shell.ts) so both
 // transports cut identically. The backend just concatenates OUTPUT bytes.
 
+// Feed one byte; returns what a terminal would do with it. CR_ESC = part of an
+// escape sequence that neither moves the cursor nor erases (colors etc.):
+// pass through, count nothing.
+static cr_act_t cr_feed(cr_tok_t *t, uint8_t c) {
+    switch (t->st) {
+    case 0:
+        if (c == 0x1b) { t->st = 1; return CR_ESC; }
+        if (c == '\n') return CR_NL;
+        if (c == '\r') return CR_CR;
+        return CR_TEXT;
+    case 1:
+        if (c == '[') { t->st = 2; t->csi_len = 0; }
+        else if (c == ']') t->st = 3;
+        else t->st = 0;  // 2-byte ESC sequence (charset selects take one more byte we count as text; harmless)
+        return CR_ESC;
+    case 2:
+        if (c >= 0x40 && c <= 0x7e) {
+            t->st = 0;
+            int plain = t->csi_len == 0;
+            int one = t->csi_len == 1 && t->csi[0] == '1';
+            int zero = t->csi_len == 1 && t->csi[0] == '0';
+            if (c == 'G' && (plain || one)) return CR_CR;     // cursor to column 1
+            if (c == 'K' && (plain || zero)) return CR_ERASE; // erase to end of line
+            return CR_ESC;
+        }
+        if (t->csi_len < sizeof t->csi) t->csi[t->csi_len++] = c;
+        return CR_ESC;
+    case 3:
+        if (c == 0x07) t->st = 0;
+        else if (c == 0x1b) t->st = 4;
+        return CR_ESC;
+    default:
+        t->st = (c == '\\') ? 0 : 3;
+        return CR_ESC;
+    }
+}
+
 // Resolve the RUN's `output` mode to concrete limits. Mirrors
 // resolveOutputPolicy(): unknown/absent ⇒ "safe".
 static void ob_resolve(out_policy_t *ob, const char *mode, size_t mode_len) {
@@ -1200,19 +1265,21 @@ static void ob_resolve(out_policy_t *ob, const char *mode, size_t mode_len) {
     if (cap == OB_NOLIMIT) lastlim = last;
     else { size_t room = (head >= cap) ? 0 : cap - head; lastlim = last < room ? last : room; }
     ob->head_limit = head; ob->last_limit = lastlim; ob->line_limit = line;
-    ob->head_len = 0; ob->total_len = 0; ob->truncated = 0; ob->notice_sent = 0;
-    ob->col = 0; ob->line_dropped = 0; ob->tail_len = 0;
+    ob_reset(ob);
 }
 
 // Clear counters/tail but keep the resolved limits (used at STEP_AWAITING_INPUT,
 // mirroring edge's resetForInteraction so post-prompt output is a fresh delta).
 static void ob_reset(out_policy_t *ob) {
     ob->head_len = 0; ob->total_len = 0; ob->truncated = 0; ob->notice_sent = 0;
-    ob->col = 0; ob->line_dropped = 0; ob->tail_len = 0;
+    ob->col = 0; ob->line_len = 0; ob->line_charged = 0; ob->line_dropped = 0;
+    memset(&ob->head_tok, 0, sizeof ob->head_tok);
+    ob->tail_len = 0; ob->tcur_len = 0; ob->tcur_col = 0; ob->tcur_charged = 0;
+    memset(&ob->tail_tok, 0, sizeof ob->tail_tok);
 }
 
-// Append to the rolling tail, keeping only the last `last_limit` bytes.
-static void ob_tail_push(out_policy_t *ob, const uint8_t *d, size_t n) {
+// Append raw bytes to the rolling tail, keeping only the last `last_limit` bytes.
+static void ob_tail_push_raw(out_policy_t *ob, const uint8_t *d, size_t n) {
     size_t cap = ob->last_limit;
     if (cap == 0) return;
     if (cap > OB_TAIL_CAP) cap = OB_TAIL_CAP;  // defensive; last_limit ≤ OB_STREAM_LAST today
@@ -1226,34 +1293,102 @@ static void ob_tail_push(out_policy_t *ob, const uint8_t *d, size_t n) {
     ob->tail_len += n;
 }
 
-// Emit `n` bytes through the per-line width cap (col/line_dropped persist across
-// calls so a line can span PTY reads). line_limit == OB_NOLIMIT ⇒ pass through.
-static void ob_emit_capped(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
-    out_policy_t *ob = &s->ob;
-    if (n == 0) return;
-    if (ob->line_limit == OB_NOLIMIT) { send_output_bytes(e, s, d, n); return; }
-    size_t cap = n * 2 + 64;
-    uint8_t *out = malloc(cap);
-    if (!out) { send_output_bytes(e, s, d, n); return; }  // degrade to uncapped
-    size_t u = 0;
+// Feed bytes into the tail through the terminal collapse: the current line
+// builds in tcur (overwritten in place on `\r`), and moves into the rolling
+// tail once its `\n` arrives, so the tail holds what a terminal would show.
+static size_t ob_tail_push(out_policy_t *ob, const uint8_t *d, size_t n) {
+    size_t effective = 0;
     for (size_t i = 0; i < n; i++) {
         uint8_t c = d[i];
-        if (c == '\n') {
+        switch (cr_feed(&ob->tail_tok, c)) {
+        case CR_NL:
+            ob_tail_push_raw(ob, ob->tcur, ob->tcur_len);
+            ob_tail_push_raw(ob, (const uint8_t *)"\n", 1);
+            ob->tcur_len = 0; ob->tcur_col = 0; ob->tcur_charged = 0;
+            effective++;
+            break;
+        case CR_CR:    ob->tcur_col = 0; break;
+        case CR_ERASE: ob->tcur_len = ob->tcur_col; break;
+        case CR_ESC:   break;
+        case CR_TEXT:
+            if (ob->tcur_col >= OB_TCUR_CAP) {
+                // ponytail: a >4k line spills to the raw tail uncollapsed —
+                // content is kept, only redraws on such a line stay verbatim.
+                ob_tail_push_raw(ob, ob->tcur, ob->tcur_len);
+                ob->tcur_len = 0; ob->tcur_col = 0; ob->tcur_charged = 0;
+            }
+            ob->tcur[ob->tcur_col++] = c;
+            if (ob->tcur_col > ob->tcur_len) ob->tcur_len = ob->tcur_col;
+            if (ob->tcur_len > ob->tcur_charged) { ob->tcur_charged = ob->tcur_len; effective++; }
+            break;
+        }
+    }
+    return effective;
+}
+
+// Flush the unterminated tail line (end of step / before a pause).
+static void ob_tail_flush(out_policy_t *ob) {
+    if (ob->tcur_len == 0) return;
+    ob_tail_push_raw(ob, ob->tcur, ob->tcur_len);
+    ob->tcur_len = 0; ob->tcur_col = 0; ob->tcur_charged = 0;
+}
+
+// Emit `n` raw bytes through the per-line width cap, tracking the terminal
+// column (col/line_len/head_tok persist across calls so a line can span PTY
+// reads). Escapes pass through uncounted; `\r` / CSI G rewind the column so a
+// redrawn line is capped on its visible width, not on the sum of its frames.
+// Returns the number of EFFECTIVE bytes added — what a terminal would end up
+// showing — which is what the head/total accounting counts.
+static size_t ob_emit_capped(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
+    out_policy_t *ob = &s->ob;
+    if (n == 0) return 0;
+    size_t cap = n * 2 + 64;
+    uint8_t *out = malloc(cap);
+    if (!out) { send_output_bytes(e, s, d, n); return n; }  // degrade to uncapped
+    size_t u = 0, effective = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = d[i];
+        switch (cr_feed(&ob->head_tok, c)) {
+        case CR_NL:
             if (ob->line_dropped > 0) {
                 int m = snprintf((char *)out + u, cap - u, " ...[+%zu chars]", ob->line_dropped);
                 if (m > 0 && (size_t)m < cap - u) u += (size_t)m;
                 ob->line_dropped = 0;
             }
             out[u++] = '\n';
+            ob->col = 0; ob->line_len = 0; ob->line_charged = 0;
+            effective++;
+            break;
+        case CR_CR:
+            out[u++] = c;
             ob->col = 0;
-        } else if (ob->col < ob->line_limit) {
-            out[u++] = c; ob->col++;
-        } else {
-            ob->line_dropped++;
+            break;
+        case CR_ERASE:
+            out[u++] = c;
+            ob->line_len = ob->col;
+            break;
+        case CR_ESC:
+            out[u++] = c;
+            break;
+        case CR_TEXT:
+            if (ob->col < ob->line_limit) {
+                out[u++] = c;
+                if (ob->col == ob->line_len) ob->line_len++;  // extends the visible line
+                // A redraw (erase + rewrite) is free: only new high-water width counts.
+                // ponytail: an erased-then-shorter line is never refunded — a
+                // small over-count, never an under-count, so "truncated" is
+                // if anything conservative.
+                if (ob->line_len > ob->line_charged) { ob->line_charged = ob->line_len; effective++; }
+                ob->col++;
+            } else {
+                ob->line_dropped++;
+            }
+            break;
         }
     }
     if (u > 0) send_output_bytes(e, s, out, u);
     free(out);
+    return effective;
 }
 
 // Feed RUN output bytes: stream the head (line-capped), roll the rest into the
@@ -1261,22 +1396,30 @@ static void ob_emit_capped(edge_t *e, session_t *s, const uint8_t *d, size_t n) 
 static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
     out_policy_t *ob = &s->ob;
     if (n == 0) return;
-    ob->total_len += n;
     // Prompt tail sees every step byte, including those past head_limit that
     // are only kept for the truncation tail — otherwise a prompt printed after
     // 10k of build log would be invisible to the awaiting-input probe.
     otail_append(s, d, n);
     const uint8_t *p = d; size_t rem = n;
-    if (ob->head_limit == OB_NOLIMIT || ob->head_len < ob->head_limit) {
-        size_t room = (ob->head_limit == OB_NOLIMIT) ? rem : ob->head_limit - ob->head_len;
+    if (ob->head_limit == OB_NOLIMIT) {
+        ob->total_len += ob_emit_capped(e, s, p, rem);
+        return;
+    }
+    // Stream raw bytes while the EFFECTIVE head is under the limit. The limit
+    // is checked per PTY read (not per byte), so the head may overshoot by
+    // one read — same slack the tail buffer has.
+    while (rem > 0 && ob->head_len < ob->head_limit) {
+        // Feed at most `room` raw bytes: effective ≤ raw, so this cannot
+        // overshoot the limit by more than one chunk's worth of redraws.
+        size_t room = ob->head_limit - ob->head_len;
         size_t take = rem < room ? rem : room;
-        ob_emit_capped(e, s, p, take);
-        ob->head_len += take;
+        size_t eff = ob_emit_capped(e, s, p, take);
+        ob->head_len += eff; ob->total_len += eff;
         p += take; rem -= take;
     }
     if (rem > 0) {
         ob->truncated = 1;
-        ob_tail_push(ob, p, rem);
+        ob->total_len += ob_tail_push(ob, p, rem);
     }
 }
 
@@ -1287,6 +1430,7 @@ static void ob_finish(edge_t *e, session_t *s) {
     out_policy_t *ob = &s->ob;
     if (!ob->truncated || ob->notice_sent) return;
     ob->notice_sent = 1;
+    ob_tail_flush(ob);
     size_t dropped = ob->total_len > ob->head_len + ob->tail_len
                    ? ob->total_len - ob->head_len - ob->tail_len : 0;
     char notice[96];
@@ -1294,7 +1438,8 @@ static void ob_finish(edge_t *e, session_t *s) {
     if (m > 0) send_output_bytes(e, s, (const uint8_t *)notice, (size_t)m);
     if (ob->tail_len > 0) {
         // Tail is its own block — start a fresh line-cap column state.
-        ob->col = 0; ob->line_dropped = 0;
+        ob->col = 0; ob->line_len = 0; ob->line_charged = 0; ob->line_dropped = 0;
+        memset(&ob->head_tok, 0, sizeof ob->head_tok);
         ob_emit_capped(e, s, ob->tail, ob->tail_len);
         if (ob->line_limit != OB_NOLIMIT && ob->line_dropped > 0) {
             char suf[32];
@@ -1325,6 +1470,17 @@ static size_t vt_strip(vt_state_t *st, uint8_t *buf, size_t len) {
             break;
         case VT_CSI:
             // Parameter/intermediate bytes 0x20..0x3F, final byte 0x40..0x7E.
+            // CSI G (cursor to column 1) is how ConPTY/npm redraw a line;
+            // keep that one as a `\r` so the output policy still sees the
+            // redraw (erase-line is dropped: an equal-width rewrite covers it).
+            if (c >= 0x40 && c <= 0x7e) { *st = VT_TEXT; if (c == 'G') buf[w++] = '\r'; }
+            else *st = (c == '0' || c == '1') ? VT_CSI_COL1 : VT_CSI_OTHER;
+            break;
+        case VT_CSI_COL1:
+            if (c >= 0x40 && c <= 0x7e) { *st = VT_TEXT; if (c == 'G') buf[w++] = '\r'; }
+            else *st = VT_CSI_OTHER;  // second parameter byte ⇒ not column 1
+            break;
+        case VT_CSI_OTHER:
             if (c >= 0x40 && c <= 0x7e) *st = VT_TEXT;
             break;
         case VT_OSC:
