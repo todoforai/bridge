@@ -14,11 +14,17 @@ endif
 # "dev" outside a git checkout (e.g. tarball builds).
 BRIDGE_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
+# Hardening (no runtime cost): stack canaries + PIE/RELRO so ASLR covers text.
+HARDEN_CFLAGS = -fstack-protector-strong -fPIE
+HARDEN_LD     = -pie -Wl,-z,relro,-z,now
+HARDEN_LD_WIN = -Wl,--dynamicbase,--nxcompat,--high-entropy-va
+
 CFLAGS  ?= -Os -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wno-unused-function \
            -ffunction-sections -fdata-sections -fomit-frame-pointer \
+           $(HARDEN_CFLAGS) \
            -DBRIDGE_VERSION=\"$(BRIDGE_VERSION)\" \
            -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
-LDFLAGS ?= -Wl,--gc-sections
+LDFLAGS ?= -Wl,--gc-sections $(HARDEN_LD)
 LIBS    ?= -lutil -lpthread
 
 UNAME_S := $(shell uname -s)
@@ -62,7 +68,7 @@ build:
 # Requires `zig` in PATH.
 .PHONY: static
 static: | build
-	zig cc -target x86_64-linux-musl -static $(CFLAGS) -o build/todoforai-bridge-static \
+	zig cc -target x86_64-linux-musl -static $(CFLAGS) $(HARDEN_LD) -o build/todoforai-bridge-static \
 	    $(SRCS) -lutil
 	strip build/todoforai-bridge-static 2>/dev/null || true
 
@@ -73,11 +79,11 @@ static: | build
 .PHONY: release-linux-x64 release-linux-arm64 release-darwin-x64 release-darwin-arm64 release-windows-x64
 
 release-linux-x64: | build
-	zig cc -target x86_64-linux-musl -static $(CFLAGS) -o build/todoforai-bridge-linux-x64 $(SRCS) -lutil
+	zig cc -target x86_64-linux-musl -static $(CFLAGS) $(HARDEN_LD) -o build/todoforai-bridge-linux-x64 $(SRCS) -lutil
 	strip build/todoforai-bridge-linux-x64 2>/dev/null || true
 
 release-linux-arm64: | build
-	zig cc -target aarch64-linux-musl -static $(CFLAGS) -o build/todoforai-bridge-linux-arm64 $(SRCS) -lutil
+	zig cc -target aarch64-linux-musl -static $(CFLAGS) $(HARDEN_LD) -o build/todoforai-bridge-linux-arm64 $(SRCS) -lutil
 	strip build/todoforai-bridge-linux-arm64 2>/dev/null || true
 
 # macOS: link to system libc (no static option on darwin); Xcode's clang picks the SDK.
@@ -105,7 +111,7 @@ release-windows-x64: | build
 	    -U_WIN32_WINNT -UNTDDI_VERSION -UWINVER \
 	    -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006 -DWINVER=0x0A00 \
 	    -Wno-macro-redefined \
-	    $(CFLAGS) \
+	    $(CFLAGS) $(HARDEN_LD_WIN) \
 	    -o build/todoforai-bridge-windows-x64.exe $(WIN_SRCS) \
 	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
 	strip build/todoforai-bridge-windows-x64.exe 2>/dev/null || true
@@ -139,6 +145,12 @@ test-run: | build
 test-tools: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-tools test/test_tools.c tools.c json.c env_path.c -lpthread
 	./build/test-tools
+
+# JSON parser: hostile nesting depth is rejected instead of recursed into.
+.PHONY: test-json
+test-json: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-json test/test_json.c json.c
+	ulimit -s 512; ./build/test-json
 
 # Off-loop jobs: the loop keeps ticking while a slow worker runs; frame
 # reassembly, deadlines, slot cap and teardown reaping.
