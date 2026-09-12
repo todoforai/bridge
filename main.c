@@ -156,6 +156,7 @@ static char *bridge_expand_tilde(const char *p) {
 #define DEFAULT_MAX_SESSIONS 256
 #define SESSION_ID_LEN       36
 #define BLOCK_ID_CAP         64
+#define MODEL_ID_CAP         128   // model slugs: id charset plus ":" and "/"
 #define MAX_MSG              (64 * 1024)
 
 
@@ -292,6 +293,12 @@ typedef struct {
     // inherits the parent agent. Cleared when RUN sends an empty value.
     char agent_settings_id[BLOCK_ID_CAP + 1];
     size_t agent_settings_id_len;
+
+    // Model of the calling run ("provider:author/model" or an alias). Exported
+    // as TODOFORAI_MODEL_ID so a tfa-* child can pick a different vendor.
+    // Same set/clear semantics as agent_settings_id.
+    char model_id[MODEL_ID_CAP + 1];
+    size_t model_id_len;
 
     // Tab that started this TODO's run, and its kind hint. Exported as
     // TODOFORAI_FRONTEND_ID / _KIND so tfa-surface has a default target.
@@ -676,6 +683,19 @@ static int is_valid_id(const char *s, size_t len) {
         char c = s[i];
         int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                  (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+// Model slugs ("openai:openai/gpt-6-astra") add ':' and '/' — both still
+// shell- and JSON-safe unquoted, so they interpolate raw like the ids.
+static int is_valid_model_id(const char *s, size_t len) {
+    if (len == 0 || len > MODEL_ID_CAP) return 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == ':' || c == '/';
         if (!ok) return 0;
     }
     return 1;
@@ -1895,6 +1915,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->todo_id[0] = '\0';
             s->agent_settings_id_len = 0;
             s->agent_settings_id[0] = '\0';
+            s->model_id_len = 0;
+            s->model_id[0] = '\0';
             s->frontend_id_len = 0;
             s->frontend_id[0] = '\0';
             s->frontend_kind_len = 0;
@@ -1931,7 +1953,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Absent ⇒ present=0 (keep the session's value); explicit "" ⇒
         // present with len 0 (clear it).
         struct run_id { const char *p; size_t len; int present; };
-        struct run_id todo = {0}, agent = {0}, fid = {0}, fkind = {0}, grp = {0},
+        struct run_id todo = {0}, agent = {0}, model = {0}, fid = {0}, fkind = {0}, grp = {0},
                       proj = {0}, cmsg = {0}, cblk = {0};
 
         #define RUN_ID(dst, key, code, what) do { \
@@ -1945,6 +1967,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
         RUN_ID(todo,  "todoId",          "INVALID_TODO_ID",       "todoId");
         RUN_ID(agent, "agentSettingsId", "INVALID_AGENT_ID",      "agentSettingsId");
+        model.present = json_get_str(msg, msg_len, "modelId", &model.p, &model.len);
+        if (model.present && model.len > 0 && !is_valid_model_id(model.p, model.len)) {
+            free(cmd); RUN_FAIL_CLEANUP();
+            return send_error(e, NULL, 0, bid, bid_len, "INVALID_MODEL_ID",
+                              "modelId must be 1-128 chars of [A-Za-z0-9_.:/-]");
+        }
         RUN_ID(fid,   "frontendId",      "INVALID_FRONTEND_ID",   "frontendId");
         RUN_ID(fkind, "frontendKind",    "INVALID_FRONTEND_KIND", "frontendKind");
         RUN_ID(grp,   "groupTag",        "INVALID_GROUP_ID",      "groupTag");
@@ -1965,6 +1993,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
         RUN_ID_COMMIT(todo,  todo_id);
         RUN_ID_COMMIT(agent, agent_settings_id);
+        RUN_ID_COMMIT(model, model_id);
         RUN_ID_COMMIT(fid,   frontend_id);
         RUN_ID_COMMIT(fkind, frontend_kind);
         RUN_ID_COMMIT(grp,   group_tag);
@@ -2044,7 +2073,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // as the per-todo agent-browser session so parallel todos get isolated
         // sockets. Unlike fenv/cenv these keep the old "absent ⇒ leave whatever
         // the persistent shell has" behaviour.
-        char idenv[4 * (BLOCK_ID_CAP + 48)];
+        char idenv[4 * (BLOCK_ID_CAP + 48) + MODEL_ID_CAP + 48];
         {
             size_t n = 0;
             #define ID_APPEND(key, val) do { \
@@ -2059,6 +2088,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             ID_APPEND("TODOFORAI_GROUP_ID", s->group_tag);
             ID_APPEND("TODOFORAI_PROJECT_ID", s->project_id);
             ID_APPEND("TODOFORAI_TODO_ID", s->todo_id);
+            ID_APPEND("TODOFORAI_MODEL_ID", s->model_id);
             ID_APPEND("AGENT_BROWSER_SESSION", s->todo_id);
             #undef ID_APPEND
         }

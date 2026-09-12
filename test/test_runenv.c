@@ -66,7 +66,7 @@ static int test_capture(const char *json, size_t len) {
 static void run_step(edge_t *e, const char *session_id, const char *extra) {
     static const char *CMD =
         "echo \"T=[$TODOFORAI_TODO_ID] G=[$TODOFORAI_GROUP_ID] P=[$TODOFORAI_PROJECT_ID] A=[$AGENT_BROWSER_SESSION]"
-        " M=[$TODOFORAI_MESSAGE_ID] B=[$TODOFORAI_BLOCK_ID] F=[$TODOFORAI_FRONTEND_ID]\"";
+        " M=[$TODOFORAI_MESSAGE_ID] B=[$TODOFORAI_BLOCK_ID] F=[$TODOFORAI_FRONTEND_ID] MODEL=[$TODOFORAI_MODEL_ID]\"";
     char cmd_b64[512];
     size_t bn = b64_encode((const uint8_t *)CMD, strlen(CMD), cmd_b64, sizeof cmd_b64);
     assert(bn > 0);
@@ -125,9 +125,11 @@ int main(void) {
 
     // ── The pair is exported when sent ──
     run_step(e, SID, "\"todoId\":\"todo-1\",\"groupTag\":\"grp-1\",\"projectId\":\"proj-1\","
+                "\"modelId\":\"openai:openai/gpt-6-astra\","
                 "\"chatMessageId\":\"msg-1\",\"chatBlockId\":\"blk-1\"");
     expect("pair exported", "M=[msg-1] B=[blk-1]");
     expect("session ids exported", "T=[todo-1] G=[grp-1] P=[proj-1]");
+    expect("model slug exported raw", "MODEL=[openai:openai/gpt-6-astra]");
     expect("todoId aliases the browser session", "A=[todo-1]");
     ok("chat ids + session ids are exported into the PTY");
 
@@ -137,7 +139,13 @@ int main(void) {
     run_step(e, SID, "\"todoId\":\"todo-1\"");
     expect("chat ids cleared", "M=[] B=[]");
     expect("session ids survive", "T=[todo-1] G=[grp-1] P=[proj-1]");
+    expect("model survives", "MODEL=[openai:openai/gpt-6-astra]");
     ok("omitted chat ids are unset, session ids keep their value");
+
+    // ── A model with shell metacharacters is rejected before anything runs ──
+    run_step(e, SID, "\"todoId\":\"todo-1\",\"modelId\":\"x;echo pwned\"");
+    if (strcmp(g_error, "INVALID_MODEL_ID") != 0) { fprintf(stderr, "FAIL model rejected: got error=[%s]\n", g_error); g_fails++; }
+    else ok("unsafe modelId is rejected");
 
     // ── A half-set pair links nothing, so it must not half-export ──
     run_step(e, SID, "\"chatMessageId\":\"msg-2\"");
