@@ -2425,7 +2425,9 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 #else
             int flags = O_WRONLY | O_CREAT | O_CLOEXEC;
             if (offset < 0) flags |= O_APPEND;
-            fd = open(path, flags, 0644);
+            // 0600: the backend writes secrets/configs it can't classify;
+            // owner-only is the safe default, the caller can chmod wider.
+            fd = open(path, flags, 0600);
 #endif
             if (fd < 0) WFB_FAIL("write_file_b64: open failed");
 
