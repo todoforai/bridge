@@ -21,7 +21,11 @@ static const char *skip_ws(const char *p, const char *e) {
 
 // Skip over one JSON value starting at *p. Returns pointer past the value,
 // or NULL on malformed input / end-of-buffer.
-static const char *skip_value(const char *p, const char *e);
+// Nesting cap for the recursive skippers: a hostile `[[[[…` frame must not
+// blow the stack. Our wire never nests past a handful of levels.
+#define JSON_MAX_DEPTH 128
+
+static const char *skip_value(const char *p, const char *e, int depth);
 
 static const char *skip_string(const char *p, const char *e) {
     if (p >= e || *p != '"') return NULL;
@@ -50,7 +54,7 @@ static const char *skip_number(const char *p, const char *e) {
     return p;
 }
 
-static const char *skip_object(const char *p, const char *e) {
+static const char *skip_object(const char *p, const char *e, int depth) {
     if (p >= e || *p != '{') return NULL;
     p++;
     p = skip_ws(p, e);
@@ -63,7 +67,7 @@ static const char *skip_object(const char *p, const char *e) {
         if (p >= e || *p != ':') return NULL;
         p++;
         p = skip_ws(p, e);
-        p = skip_value(p, e);
+        p = skip_value(p, e, depth + 1);
         if (!p) return NULL;
         p = skip_ws(p, e);
         if (p >= e) return NULL;
@@ -74,14 +78,14 @@ static const char *skip_object(const char *p, const char *e) {
     return NULL;
 }
 
-static const char *skip_array(const char *p, const char *e) {
+static const char *skip_array(const char *p, const char *e, int depth) {
     if (p >= e || *p != '[') return NULL;
     p++;
     p = skip_ws(p, e);
     if (p < e && *p == ']') return p + 1;
     while (p < e) {
         p = skip_ws(p, e);
-        p = skip_value(p, e);
+        p = skip_value(p, e, depth + 1);
         if (!p) return NULL;
         p = skip_ws(p, e);
         if (p >= e) return NULL;
@@ -92,12 +96,12 @@ static const char *skip_array(const char *p, const char *e) {
     return NULL;
 }
 
-static const char *skip_value(const char *p, const char *e) {
-    if (p >= e) return NULL;
+static const char *skip_value(const char *p, const char *e, int depth) {
+    if (p >= e || depth > JSON_MAX_DEPTH) return NULL;
     char c = *p;
     if (c == '"') return skip_string(p, e);
-    if (c == '{') return skip_object(p, e);
-    if (c == '[') return skip_array(p, e);
+    if (c == '{') return skip_object(p, e, depth);
+    if (c == '[') return skip_array(p, e, depth);
     if (c == 't' && e - p >= 4 && memcmp(p, "true",  4) == 0) return p + 4;
     if (c == 'f' && e - p >= 5 && memcmp(p, "false", 5) == 0) return p + 5;
     if (c == 'n' && e - p >= 4 && memcmp(p, "null",  4) == 0) return p + 4;
@@ -144,7 +148,7 @@ static int json_find(const char *buf, size_t len, const char *key,
         else if (c == 'n')                             t = JT_NULL;
         else if (c == '-' || (c >= '0' && c <= '9'))   t = JT_NUM;
         else return 0;
-        const char *vend = skip_value(p, e);
+        const char *vend = skip_value(p, e, 0);
         if (!vend) return 0;
 
         if (matched) {
@@ -207,7 +211,7 @@ int json_obj_iter(const char *obj, size_t obj_len, size_t *pos,
     p = skip_ws(p + 1, e);
     if (p >= e) return 0;
     const char *vs = p;
-    const char *ve = skip_value(p, e);
+    const char *ve = skip_value(p, e, 0);
     if (!ve) return 0;
     char c = *vs;
     json_type_t t;
