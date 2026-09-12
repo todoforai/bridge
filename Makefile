@@ -33,11 +33,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c \
+COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h \
+HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -117,7 +117,9 @@ release-windows-x64: | build
 	strip build/todoforai-bridge-windows-x64.exe 2>/dev/null || true
 
 # PTY helpers used by the test harnesses (pty_posix.c calls into env_path.c).
-TEST_DEPS = pty_posix.c env_path.c
+TEST_DEPS = pty_posix.c env_path.c policy.c json.c
+# Full-daemon tests list json.c themselves; policy.c needs it too.
+DAEMON_TEST_DEPS = pty_posix.c env_path.c policy.c
 
 # Windows ConPTY smoke test. Cross-compiles from Linux/macOS with `zig`, but
 # the produced .exe must be RUN on a real Windows host (windows-latest in CI)
@@ -143,7 +145,7 @@ test-run: | build
 # Tool scan + custom_tools.json overlay: hidden/override/non-catalog probing.
 .PHONY: test-tools
 test-tools: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-tools test/test_tools.c tools.c json.c env_path.c -lpthread
+	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-tools test/test_tools.c tools.c json.c env_path.c policy.c -lpthread
 	./build/test-tools
 
 # JSON parser: hostile nesting depth is rejected instead of recursed into.
@@ -151,6 +153,12 @@ test-tools: | build
 test-json: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-json test/test_json.c json.c
 	ulimit -s 512; ./build/test-json
+
+# Device policy: prefix/symlink checks + Landlock jail on a real PTY child.
+.PHONY: test-policy
+test-policy: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-policy test/test_policy.c $(TEST_DEPS) -lutil
+	./build/test-policy
 
 # Off-loop jobs: the loop keeps ticking while a slow worker runs; frame
 # reassembly, deadlines, slot cap and teardown reaping.
@@ -179,7 +187,7 @@ test-coalesce: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
 	    test/test_coalesce.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
-	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-coalesce
 
 # Per-RUN env exported into the PTY: the chat message/block pair is always
@@ -191,7 +199,7 @@ test-runenv: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
 	    test/test_runenv.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
-	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
 # Spawn-time init drain: with PTY echo ON (simulating ConPTY, which has no
@@ -202,7 +210,7 @@ test-initdrain: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-initdrain \
 	    test/test_initdrain.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
-	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-initdrain
 
 # One-shot PTY lifecycle: a RUN without sessionId must release its shell at
@@ -214,7 +222,7 @@ test-oneshot-leak: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-oneshot-leak \
 	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
-	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-oneshot-leak
 
 # Auto-update gating: only a supervised release build steps forward to a newer
@@ -256,7 +264,7 @@ test-prompt-tail: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-prompt-tail \
 	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
-	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-prompt-tail
 
 # Awaiting-input end-to-end on the real loop: a quiet command must finish, a
@@ -266,12 +274,12 @@ test-park: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-park \
 	    test/test_park.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
-	    $(TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-park
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c
+BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 

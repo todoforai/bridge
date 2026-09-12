@@ -92,6 +92,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "subcmd.h"
 #include "tools.h"
 #include "update.h"
+#include "policy.h"
 #include "login.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
@@ -1684,6 +1685,7 @@ static int preview_job_body(const char *payload, size_t payload_len,
 // Worker entry: `<self> __job <kind>`. Runs before any daemon setup, so a
 // worker never opens a socket, loads credentials or touches the WS state.
 static int cmd_job_worker(const char *kind_s) {
+    bridge_policy_load();   // scan bodies shell out: they're jailed like a RUN
     switch (atoi(kind_s)) {
         case BRIDGE_JOB_SCAN:    return bridge_job_worker_main(scan_job_body);
         case BRIDGE_JOB_PREVIEW: return bridge_job_worker_main(preview_job_body);
@@ -1796,6 +1798,14 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // Paths can legitimately contain JSON-escaped bytes; decode properly.
             char cwd_buf[1024]; cwd_buf[0] = '\0'; size_t cwd_len = 0;
             int has_cwd = json_get_str_decoded(msg, msg_len, "cwd", cwd_buf, sizeof(cwd_buf), &cwd_len);
+            // Unusable policy: no shell at all, cwd or not — the child would
+            // _exit(3) anyway, but say why instead of a silent dead PTY.
+            if (g_policy.active && g_policy.broken) {
+                free(cmd);
+                char em[2200];
+                return send_error(e, NULL, 0, bid, bid_len, "POLICY_DENIED",
+                                  bridge_policy_deny_msg(has_cwd ? cwd_buf : "(shell)", em, sizeof em));
+            }
             if (has_cwd) {
                 // Validate up front so a bad path surfaces as ERROR before we
                 // spawn a doomed PTY (otherwise chdir silently fails in child).
@@ -1810,10 +1820,18 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                              " — fix the workspace path in agent settings", cwd_buf);
                     return send_error(e, NULL, 0, bid, bid_len, "INVALID_CWD", em);
                 }
+                if (!bridge_policy_path_allowed(cwd_buf)) {
+                    free(cmd);
+                    char em[sizeof cwd_buf * 2 + 128];
+                    return send_error(e, NULL, 0, bid, bid_len, "POLICY_DENIED",
+                                      bridge_policy_deny_msg(cwd_buf, em, sizeof em));
+                }
             }
             // No cwd from agent → fall back to <tmpdir>/todoforai (mirrors edge),
             // so we don't leak whatever pwd the bridge daemon was launched in.
-            const char *spawn_cwd = has_cwd ? cwd_buf : resolve_default_cwd();
+            const char *spawn_cwd = has_cwd ? cwd_buf
+                                  : bridge_policy_default_cwd() ? bridge_policy_default_cwd()
+                                  : resolve_default_cwd();
             // Windows last-resort detection: resolution landing on cmd.exe
             // means no POSIX shell yet (busybox provisioning pending/failed).
             // RUN proceeds in cmd-dialect (see session_t.cmd_mode) so the
@@ -2421,15 +2439,21 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 #ifdef _WIN32
             int flags = _O_WRONLY | _O_CREAT | _O_BINARY;
             if (offset < 0) flags |= _O_APPEND;
-            fd = _open(path, flags, _S_IREAD | _S_IWRITE);
+            fd = bridge_policy_open(path, flags, _S_IREAD | _S_IWRITE);
 #else
-            int flags = O_WRONLY | O_CREAT | O_CLOEXEC;
+            int flags = O_WRONLY | O_CREAT;
             if (offset < 0) flags |= O_APPEND;
             // 0600: the backend writes secrets/configs it can't classify;
             // owner-only is the safe default, the caller can chmod wider.
-            fd = open(path, flags, 0600);
+            fd = bridge_policy_open(path, flags, 0600);
 #endif
-            if (fd < 0) WFB_FAIL("write_file_b64: open failed");
+            if (fd < 0) {
+                if (errno == EACCES && g_policy.active) {
+                    char em[2200];
+                    WFB_FAIL(bridge_policy_deny_msg(path, em, sizeof em));
+                }
+                WFB_FAIL("write_file_b64: open failed");
+            }
 
             // Write in a loop — handle short writes / EINTR on regular files.
             // pwrite/write on a regular file rarely short-writes, but be safe.
@@ -2532,14 +2556,19 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (length < 1 || length > RFB_CHUNK_MAX) length = RFB_CHUNK_MAX;
 
 #ifdef _WIN32
-            fd = _open(path, _O_RDONLY | _O_BINARY);
+            fd = bridge_policy_open(path, _O_RDONLY | _O_BINARY, 0);
 #else
-            fd = open(path, O_RDONLY | O_CLOEXEC);
+            fd = bridge_policy_open(path, O_RDONLY, 0);
 #endif
             // "not found" is load-bearing: the backend adapter tries the next
             // workspace-root candidate on this exact message.
-            if (fd < 0)
+            if (fd < 0) {
+                if (errno == EACCES && g_policy.active) {
+                    char em[2200];
+                    RFB_FAIL(bridge_policy_deny_msg(path, em, sizeof em));
+                }
                 RFB_FAIL(errno == ENOENT ? "read_file_b64: not found" : "read_file_b64: open failed");
+            }
 
             RFB_STAT st;
             if (rfb_fstat(fd, &st) != 0) RFB_FAIL("read_file_b64: stat failed");
@@ -3235,6 +3264,9 @@ int bridge_main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "whoami") == 0) {
         return cmd_whoami(argc - 1, argv + 1);
     }
+    if (argc >= 2 && strcmp(argv[1], "policy") == 0) {
+        return cmd_policy(argc - 1, argv + 1);
+    }
     // `--update` is accepted as an alias: it's the first thing people try.
     if (argc >= 2 && (strcmp(argv[1], "update") == 0 || strcmp(argv[1], "--update") == 0)) {
         return cmd_update(argc - 1, argv + 1);
@@ -3439,6 +3471,13 @@ int bridge_main(int argc, char **argv) {
     // rather than "id truncated". Full id is in ~/.config/todoforai/credentials.json.
     fprintf(stderr, "Connecting to %s:%u (device: %.8s…, bridge %s) ...\n",
             host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
+    bridge_policy_load();
+    if (g_policy.active && g_policy.broken)
+        fprintf(stderr, "policy: %s is UNUSABLE (%s) — denying all paths and shells until fixed\n",
+                g_policy.path, g_policy.err);
+    else if (g_policy.active)
+        fprintf(stderr, "policy: %d workspace(s) from %s (jail %s)\n",
+                g_policy.n, g_policy.path, g_policy.jail ? "on" : "off");
 
     g_max_sessions = resolve_max_sessions();
     // Each session needs a master fd + a few transient pipes in the child

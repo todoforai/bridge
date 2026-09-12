@@ -186,6 +186,58 @@ int json_get_obj(const char *buf, size_t len, const char *key,
     return t == JT_OBJ;
 }
 
+int json_validate_doc(const char *buf, size_t len) {
+    const char *e = buf + len;
+    const char *p = skip_ws(buf, e);
+    if (p >= e) return 0;
+    p = skip_value(p, e, 0);
+    if (!p) return 0;
+    return skip_ws(p, e) == e;
+}
+
+int json_get_arr(const char *buf, size_t len, const char *key,
+                 const char **out, size_t *out_len) {
+    json_type_t t;
+    if (!json_find(buf, len, key, &t, out, out_len)) return 0;
+    return t == JT_ARR;
+}
+
+static json_type_t type_of(char c) {
+    if (c == '"') return JT_STR;
+    if (c == '{') return JT_OBJ;
+    if (c == '[') return JT_ARR;
+    if (c == 't') return JT_BOOL_T;
+    if (c == 'f') return JT_BOOL_F;
+    if (c == 'n') return JT_NULL;
+    return JT_NUM;
+}
+
+int json_arr_iter(const char *arr, size_t arr_len, size_t *pos,
+                  const char **val, size_t *val_len, json_type_t *vtype) {
+    const char *e = arr + arr_len;
+    const char *p;
+    if (*pos == 0) {
+        p = skip_ws(arr, e);
+        if (p >= e || *p != '[') return -1;
+        p = skip_ws(p + 1, e);
+        if (p < e && *p == ']') return 0;
+    } else {
+        p = skip_ws(arr + *pos, e);
+        if (p < e && *p == ']') return 0;
+        if (p >= e || *p != ',') return -1;
+        p = skip_ws(p + 1, e);
+    }
+    if (p >= e) return -1;
+    const char *vs = p;
+    const char *ve = skip_value(p, e, 0);
+    if (!ve) return -1;
+    *vtype = type_of(*vs);
+    if (*vtype == JT_STR) { *val = vs + 1; *val_len = (size_t)(ve - vs) - 2; }
+    else                  { *val = vs;     *val_len = (size_t)(ve - vs); }
+    *pos = (size_t)(ve - arr);
+    return 1;
+}
+
 int json_obj_iter(const char *obj, size_t obj_len, size_t *pos,
                   const char **key, size_t *key_len,
                   const char **val, size_t *val_len, json_type_t *vtype) {
@@ -235,6 +287,11 @@ int json_get_bool(const char *buf, size_t len, const char *key, int *out) {
     if (t == JT_BOOL_T) { *out = 1; return 1; }
     if (t == JT_BOOL_F) { *out = 0; return 1; }
     return 0;
+}
+
+json_type_t json_get_type(const char *buf, size_t len, const char *key) {
+    json_type_t t; const char *vp; size_t vl;
+    return json_find(buf, len, key, &t, &vp, &vl) ? t : JT_NONE;
 }
 
 int json_get_long(const char *buf, size_t len, const char *key, long *out) {

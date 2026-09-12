@@ -2,6 +2,7 @@
 #define _DEFAULT_SOURCE
 #include "pty.h"
 #include "env_path.h"
+#include "policy.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -105,6 +106,10 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
             setenv("SSH_ASKPASS_REQUIRE", "force", 1);
             free(askpass);
         }
+        // Device policy: confine this process tree (Linux Landlock). A jail
+        // that can't be applied is fatal — running unconfined would silently
+        // void the policy.
+        if (bridge_policy_jail_child() != 0) _exit(3);
         char *argv[] = { (char *)shell, NULL };
         execvp(shell, argv);
         _exit(1);

@@ -34,6 +34,21 @@ int json_obj_iter(const char *obj, size_t obj_len, size_t *pos,
                   const char **key, size_t *key_len,
                   const char **val, size_t *val_len, json_type_t *vtype);
 
+// Value must be an array; *out spans `[...]` inclusive.
+int json_get_arr(const char *buf, size_t len, const char *key,
+                 const char **out, size_t *out_len);
+
+// Iterate the elements of an array span. Init *pos = 0; returns 1 per
+// element (strings exclude quotes but keep escapes), 0 when done. -1 when
+// the array is malformed — callers that must fail closed check for it.
+int json_arr_iter(const char *arr, size_t arr_len, size_t *pos,
+                  const char **val, size_t *val_len, json_type_t *vtype);
+
+// 1 if buf[0..len) is exactly one well-formed JSON value (plus whitespace),
+// nothing before or after. Structural check only: use it before trusting
+// json_obj_iter's "0 = done" on input that must fail closed.
+int json_validate_doc(const char *buf, size_t len);
+
 // Unescape a raw JSON string span into dst[cap], NUL-terminated.
 // Returns decoded length, or -1 on overflow/malformed escape.
 long json_unescape_span(const char *src, size_t src_len, char *dst, size_t dst_cap);
@@ -43,6 +58,8 @@ int json_get_obj(const char *buf, size_t len, const char *key,
                  const char **out, size_t *out_len);
 
 int json_get_bool(const char *buf, size_t len, const char *key, int *out);
+// Type of `key`'s value, JT_NONE if absent (or the object is malformed up to it).
+json_type_t json_get_type(const char *buf, size_t len, const char *key);
 int json_get_long(const char *buf, size_t len, const char *key, long *out);
 
 // Append a quoted, escaped string. `s_len = -1` ⇒ strlen(s). -1 on overflow.

@@ -18,6 +18,7 @@
 #define _DEFAULT_SOURCE
 
 #include "tools.h"
+#include "policy.h"
 #include "json.h"
 #include "env_path.h"
 #ifdef _WIN32
@@ -201,6 +202,8 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
         }
         // New process group so we can kill the whole shell pipeline on timeout.
         setpgid(0, 0);
+        // Backend-authored probe command: same jail as a RUN shell.
+        if (bridge_policy_jail_child() != 0) _exit(127);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
