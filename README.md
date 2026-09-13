@@ -50,6 +50,7 @@ Server side: `backend/src/api/ws/handlers/BridgeHandler.ts`.
 | `pty.c` / `pty.h`     | `forkpty` session: read/write/resize/signal         |
 | `identity.c` / `.h`   | Host identity gathering (`uname`, `pwd`, cwd)       |
 | `tools.c` / `.h`      | Probe installed CLI tools via `scan_tools` function-call |
+| `policy.c` / `.h`     | Device policy: workspace confinement + Landlock jail |
 
 | `ws.c` / `ws.h`       | RFC 6455 WebSocket client (sync connect, poll loop) |
 | `json.c` / `json.h`   | Minimal JSON parser/writer + base64                 |
@@ -103,6 +104,50 @@ to `credentials.json` as `backendPubkey`. All later connections (daemon run,
 `enroll`) pin against it. No flag, no env, no hardcoded default — same flow in
 dev, prod, and self-hosted. If the server's identity changes (key rotation,
 new deployment), `login` again to re-learn.
+
+## Device policy (optional)
+
+By default the backend has the full access of the user running the bridge.
+A **policy file** confines it to listed workspaces on this machine — the
+backend is trusted for *what* to run, not *where*. It's written only by a
+local actor, never by the wire, so a compromised backend or stolen device
+secret can't widen it.
+
+```sh
+todoforai-bridge policy init            # allow the current directory
+todoforai-bridge policy add ~/repo/x    # allow more
+todoforai-bridge policy list
+# restart the bridge to apply
+```
+
+File: `~/.config/todoforai/policy.json` (`/etc/todoforai/policy.json` wins if
+present — for IT-managed machines):
+
+```json
+{ "jail": true, "workspaces": ["/home/me/repo/x"] }
+```
+
+What it enforces:
+
+- `read_file` / `write_file` / RUN `cwd` must lie inside a workspace.
+  Opens resolve beneath the workspace root (`openat2 RESOLVE_BENEATH`), so a
+  symlink swapped in after the check can't escape.
+- **Linux 6.2+**: every shell the backend drives (RUN PTYs, tool-scan
+  probes) is Landlock-jailed at spawn. `$HOME` is dark except workspaces,
+  toolchain/cache dirs (`~/.cache ~/.local ~/.cargo ~/.npm …`, writable —
+  installs need them) and shell rc files (read-only). The rest of the
+  system is readable; `/tmp` and `/dev` writable. `"jail": false` turns
+  this off (required on kernels < 6.2).
+- **macOS / Windows**: path checks only — the shell itself is *not*
+  confined.
+
+Fail closed: an empty, malformed or unknown-key policy, or a workspace
+overlapping the config dir (credentials, this file), makes the bridge deny
+every path and refuse every shell, with the reason on stderr at startup.
+No policy file ⇒ inactive ⇒ today's behaviour.
+
+Known tradeoff: toolchain dirs are writable inside the jail, so a jailed run
+can poison a tool the user later runs unjailed.
 
 ## Environment variables
 
