@@ -73,6 +73,17 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     }
 
     if (pid == 0) {
+        // SIG_IGN dispositions survive exec. A bridge launched by nohup / a
+        // service manager / `&` under a non-interactive shell ignores SIGINT
+        // (and HUP/QUIT), so every PTY child inherited "ignore ^C" and the
+        // interrupt path (`\x03` → VINTR → SIGINT to the fg pgrp) was inert.
+        // Reset to default in the child so the shell and its commands are
+        // interruptible; this is what a login shell does for its children.
+        signal(SIGINT,  SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGHUP,  SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
         if (cwd && *cwd) {
             // Caller validates cwd up-front; failure here is unexpected.
             if (chdir(cwd) != 0) _exit(2);

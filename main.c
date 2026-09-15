@@ -163,7 +163,10 @@ static char *bridge_expand_tilde(const char *p) {
 // ── Session ─────────────────────────────────────────────────────────────────
 
 // Per-step sentinel envelope (bridge owns this; backend never sees raw bytes).
-//   Wrapper:    { <user-cmd>\n}; __RC=$?; printf '\n<sentinel>:%d\n' "$__RC"\n
+//   Wrapper:    trap : INT; ( <user-cmd>\n); __RC=$?; printf '\n<sentinel>:%d\n' "$__RC"\n
+//   The user command runs in a subshell so ^C (SIGINT to the fg pgrp) kills it
+//   and the *outer* shell survives (trap) to print the sentinel with rc=130.
+//   A brace group would die with the shell and the step would never settle.
 //   Sentinel:   __BRIDGE_STEP_<32 hex>__   → 16 + 32 + 2 = 50 chars; pad to 64.
 #define SENTINEL_CAP   64
 // Upper bound: previous read may have left up to (sentinel_len - 1) bytes in
@@ -2121,7 +2124,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             wn = snprintf(wrapped, wrapped_cap,
                 "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
-                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; " SUDO_ASKPASS_FN "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; " SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
@@ -2133,7 +2136,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             wn = snprintf(wrapped, wrapped_cap,
                 "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
-                SUDO_ASKPASS_FN "{ %.*s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv,
                 fenv, cenv,

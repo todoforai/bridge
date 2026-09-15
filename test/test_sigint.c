@@ -5,8 +5,13 @@
 //
 // Also asserts the shell survives the interrupt (same pid, still runs commands)
 // and that ^Z stays disabled (no job control ⇒ a stopped run would hang).
+//
+// Runs with SIGINT ignored in the test process, as it is in a bridge started
+// via nohup / a service manager: SIG_IGN survives fork+exec, so the spawn must
+// reset it or every PTY child is born immune to ^C.
 #define _POSIX_C_SOURCE 200809L
 #include "pty.h"
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
@@ -40,6 +45,7 @@ static void check(int ok, const char *what) {
 
 int main(void) {
     bridge_pty_t p;
+    signal(SIGINT, SIG_IGN);   // what nohup/systemd hand us
     if (bridge_pty_spawn(&p, "/bin/sh", NULL, /*no_echo=*/1) != 0) {
         fprintf(stderr, "spawn failed\n");
         return 1;
