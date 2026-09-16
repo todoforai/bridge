@@ -5,11 +5,12 @@
 // Simplicity rules:
 //   - shell does the heavy lifting (every cmd is already `sh -c`-ready)
 //   - each cmd runs with a wall-clock deadline via fork + waitpid + kill
-//   - POSIX: pthread pool of PARALLEL_WORKERS drains a shared job queue.
-//     The PATH is exported once up front so the fork children only call
-//     async-signal-safe libc (dup2/setpgid/execl) — anything else could
-//     deadlock on a lock another probe thread held at fork time.
-//     Windows path stays serial.
+//   - a pool of PARALLEL_WORKERS threads drains a shared job queue on every
+//     platform (pthreads / _beginthreadex). POSIX: the PATH is exported once
+//     up front so the fork children only call async-signal-safe libc
+//     (dup2/setpgid/execl) — anything else could deadlock on a lock another
+//     probe thread held at fork time. Windows: the shell is resolved once up
+//     front (bridge_pty_resolve_shell returns a static buffer).
 //   - "installed" = versionCmd exited 0 with non-empty stdout,
 //                   OR (no versionCmd AND statusCmd exited 0)
 //   - "authenticated" = statusCmd exited 0 (absent statusCmd ⇒ true)
@@ -36,6 +37,7 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <process.h>
 #else
 #  include <fcntl.h>
 #  include <poll.h>
@@ -59,40 +61,51 @@
 // Locate a POSIX-ish shell via the one shared resolver (pty_win.c), so tool
 // probing, identity and RUN always agree. Catalog commands assume `sh -c`
 // semantics, so a cmd.exe resolution means "no usable shell" here.
-static const char *win_shell(void) {
+// Resolved once per scan, before the worker threads start:
+// bridge_pty_resolve_shell writes a static buffer and is not thread-safe.
+static char g_win_shell[MAX_PATH];
+// Serializes pipe creation + CreateProcess across worker threads: inheritable
+// handles are process-wide, so without this a concurrent child would inherit
+// another probe's pipe write end and hold it open. Only the spawn is locked;
+// the wait/collect part runs in parallel.
+static CRITICAL_SECTION g_spawn_mu;
+
+static void win_shell_resolve(void) {
+    static int mu_ready = 0;
+    if (!mu_ready) { InitializeCriticalSection(&g_spawn_mu); mu_ready = 1; }
+    g_win_shell[0] = '\0';
+    bridge_prepend_tools_path_win();
     const char *sh = bridge_pty_resolve_shell(NULL);
-    if (!sh || !*sh) return NULL;
+    if (!sh || !*sh) return;
     const char *base = sh + strlen(sh);
     while (base > sh && base[-1] != '\\' && base[-1] != '/') base--;
-    if (_stricmp(base, "cmd.exe") == 0 || _stricmp(base, "cmd") == 0) return NULL;
-    return sh;
+    if (_stricmp(base, "cmd.exe") == 0 || _stricmp(base, "cmd") == 0) return;
+    snprintf(g_win_shell, sizeof(g_win_shell), "%s", sh);
 }
 
 static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
     if (cap) out[0] = '\0';
-    bridge_prepend_tools_path_win();
-    const char *sh = win_shell();
-    if (!sh) return -1;
-
-    SECURITY_ATTRIBUTES sa = { .nLength = sizeof(sa), .bInheritHandle = TRUE };
-    HANDLE r = NULL, w = NULL;
-    if (!CreatePipe(&r, &w, &sa, 0)) return -1;
-    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+    const char *sh = g_win_shell;
+    if (!*sh) return -1;
 
     char cmdline[2048];
     // Quote shell path; pass `cmd` as a single argument to `-c`.
     int n = snprintf(cmdline, sizeof(cmdline), "\"%s\" -c \"%s\"", sh, cmd);
-    if (n <= 0 || (size_t)n >= sizeof(cmdline)) { CloseHandle(r); CloseHandle(w); return -1; }
+    if (n <= 0 || (size_t)n >= sizeof(cmdline)) return -1;
 
+    SECURITY_ATTRIBUTES sa = { .nLength = sizeof(sa), .bInheritHandle = TRUE };
+    HANDLE r = NULL, w = NULL;
+    PROCESS_INFORMATION pi = {0};
+    EnterCriticalSection(&g_spawn_mu);
+    if (!CreatePipe(&r, &w, &sa, 0)) { LeaveCriticalSection(&g_spawn_mu); return -1; }
+    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
     STARTUPINFOA si = { .cb = sizeof(si), .dwFlags = STARTF_USESTDHANDLES,
                         .hStdOutput = w, .hStdError = w, .hStdInput = NULL };
-    PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        CloseHandle(r); CloseHandle(w);
-        return -1;
-    }
-    CloseHandle(w);  // child holds the only writer now
+    BOOL spawned = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                                  CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(w);  // child holds the only writer now (or nobody, if spawn failed)
+    LeaveCriticalSection(&g_spawn_mu);
+    if (!spawned) { CloseHandle(r); return -1; }
 
     DWORD start = GetTickCount();
     size_t used = 0;
@@ -496,26 +509,72 @@ static int probe_append_json(const probe_t *p, int first,
     return 0;
 }
 
-#ifndef _WIN32
 // Shared job queue: workers pop the next index until exhausted.
 typedef struct {
     probe_t *probes;
     int      n;
     int      next;
+#ifdef _WIN32
+    CRITICAL_SECTION mu;
+#else
     pthread_mutex_t mu;
+#endif
 } job_pool_t;
 
-static void *worker_main(void *arg) {
-    job_pool_t *jp = arg;
+static void worker_drain(job_pool_t *jp) {
     for (;;) {
+#ifdef _WIN32
+        EnterCriticalSection(&jp->mu);
+        int i = jp->next < jp->n ? jp->next++ : -1;
+        LeaveCriticalSection(&jp->mu);
+#else
         pthread_mutex_lock(&jp->mu);
         int i = jp->next < jp->n ? jp->next++ : -1;
         pthread_mutex_unlock(&jp->mu);
-        if (i < 0) return NULL;
+#endif
+        if (i < 0) return;
         probe_run(&jp->probes[i]);
     }
 }
+
+#ifdef _WIN32
+static unsigned __stdcall worker_main(void *arg) { worker_drain(arg); return 0; }
+#else
+static void *worker_main(void *arg) { worker_drain(arg); return NULL; }
 #endif
+
+// Run every probe on a pool of up to PARALLEL_WORKERS threads. Thread
+// creation failures are absorbed: the calling thread drains what's left.
+static void run_probes(probe_t *probes, int n) {
+    int nworkers = n < PARALLEL_WORKERS ? n : PARALLEL_WORKERS;
+    if (nworkers <= 1) {
+        for (int i = 0; i < n; i++) probe_run(&probes[i]);
+        return;
+    }
+    job_pool_t jp = { .probes = probes, .n = n, .next = 0 };
+    int started = 0;
+#ifdef _WIN32
+    InitializeCriticalSection(&jp.mu);
+    HANDLE tids[PARALLEL_WORKERS];
+    for (int i = 0; i < nworkers; i++) {
+        uintptr_t h = _beginthreadex(NULL, 0, worker_main, &jp, 0, NULL);
+        if (h) tids[started++] = (HANDLE)h;
+    }
+    if (started < nworkers) worker_drain(&jp);
+    if (started > 0) WaitForMultipleObjects((DWORD)started, tids, TRUE, INFINITE);
+    for (int i = 0; i < started; i++) CloseHandle(tids[i]);
+    DeleteCriticalSection(&jp.mu);
+#else
+    pthread_mutex_init(&jp.mu, NULL);
+    pthread_t tids[PARALLEL_WORKERS];
+    for (int i = 0; i < nworkers; i++) {
+        if (pthread_create(&tids[started], NULL, worker_main, &jp) == 0) started++;
+    }
+    if (started < nworkers) worker_drain(&jp);
+    for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
+    pthread_mutex_destroy(&jp.mu);
+#endif
+}
 
 // Parse all catalog lines into a heap-allocated probe_t[], folding in user
 // custom tools: disabled customs drop their catalog probe, matching customs
@@ -583,7 +642,7 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
     if (!probes) { free(customs); return -1; }
 
 #ifdef _WIN32
-    for (int i = 0; i < n; i++) probe_run(&probes[i]);
+    win_shell_resolve();
 #else
     // Export the tools PATH once, here, while we're still single-threaded:
     // every probe wants the same value, and doing it in each fork child would
@@ -594,23 +653,8 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
         char *tools_path = bridge_build_tools_path();
         if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
     }
-    int nworkers = n < PARALLEL_WORKERS ? n : PARALLEL_WORKERS;
-    if (nworkers <= 1) {
-        for (int i = 0; i < n; i++) probe_run(&probes[i]);
-    } else {
-        job_pool_t jp = { .probes = probes, .n = n, .next = 0 };
-        pthread_mutex_init(&jp.mu, NULL);
-        pthread_t tids[PARALLEL_WORKERS];
-        int started = 0;
-        for (int i = 0; i < nworkers; i++) {
-            if (pthread_create(&tids[i], NULL, worker_main, &jp) == 0) started++;
-        }
-        // If thread creation partially failed, drain remainder on this thread.
-        if (started < nworkers) worker_main(&jp);
-        for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
-        pthread_mutex_destroy(&jp.mu);
-    }
 #endif
+    run_probes(probes, n);
 
     // Assemble JSON object (just the {<key>:{...},...} dict, no envelope).
     size_t used = 0;
