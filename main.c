@@ -354,6 +354,9 @@ typedef struct {
     int cmd_mode;
     char sentinel[SENTINEL_CAP];
     size_t sentinel_len;
+    // Windows: path of the staged wrapper file (see stage_wrapper_file), owned
+    // by the session and unlinked when the step ends. Empty when unused.
+    char wrapper_path[512];
     // Per-step routing (echoed in OUTPUT/STEP_DONE while running).
     char run_block_id[BLOCK_ID_CAP + 1];
     size_t run_block_id_len;
@@ -1114,6 +1117,65 @@ static size_t sentinel_holdback(const session_t *s);
 static void ob_finish(edge_t *e, session_t *s);
 static void ob_reset(out_policy_t *ob);
 
+// ── Wrapper staging (Windows) ───────────────────────────────────────────────
+// MSYS bash reads console input a character at a time and pays ~0.32 ms per
+// character (measured on Git for Windows: a 700-byte line costs 236 ms, while
+// eight commands in 66 bytes cost 31 ms — the price is per byte, not per
+// command). The wrapper is ~400-800 bytes of exports and sentinels, so typing
+// it in dominates every Windows step. Writing it to a file and sending only
+// `. '<path>'` cuts a captured production wrapper from 127 ms to 31 ms.
+//
+// The file is not self-deleting: bash re-reads a sourced file as it executes,
+// so an `rm` on its first line hangs the step. The bridge unlinks it in
+// run_finish (and before staging the next one).
+//
+// It carries the same device token the shell's environment gets, so it lives
+// in the per-user temp dir with a random name and 0600 permissions — no worse
+// exposure than the env block, and gone when the step ends.
+static void unstage_wrapper_file(session_t *s) {
+#ifdef _WIN32
+    if (s->wrapper_path[0]) { (void)remove(s->wrapper_path); s->wrapper_path[0] = '\0'; }
+#else
+    (void)s;
+#endif
+}
+
+#ifdef _WIN32
+// Writes `wrapped` to a fresh temp file and returns the shell line that
+// sources it (`. '<path>'`), or NULL if staging failed — the caller then
+// sends the wrapper inline, which is slow but correct.
+static int stage_wrapper_file(session_t *s, const char *wrapped, size_t wn,
+                              char *out, size_t out_cap) {
+    unstage_wrapper_file(s);
+    char dir[MAX_PATH];
+    DWORD dn = GetTempPathA((DWORD)sizeof dir, dir);
+    if (dn == 0 || dn >= sizeof dir) return -1;
+    uint8_t rnd[8];
+    noise_random(rnd, sizeof rnd);
+    char hex[17];
+    hex_encode(hex, rnd, sizeof rnd);
+    // Forward slashes: the path goes through bash, which treats `\` as an
+    // escape even inside a single-quoted Windows path like C:\Users\...
+    for (DWORD i = 0; i < dn; i++) if (dir[i] == '\\') dir[i] = '/';
+    if (snprintf(s->wrapper_path, sizeof s->wrapper_path, "%stfa-run-%s.sh", dir, hex)
+            >= (int)sizeof s->wrapper_path) { s->wrapper_path[0] = '\0'; return -1; }
+    // CREATE_NEW: never adopt a file another process planted at this name.
+    HANDLE h = CreateFileA(s->wrapper_path, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                           FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (h == INVALID_HANDLE_VALUE) { s->wrapper_path[0] = '\0'; return -1; }
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, wrapped, (DWORD)wn, &written, NULL) && written == (DWORD)wn;
+    CloseHandle(h);
+    if (!ok) { unstage_wrapper_file(s); return -1; }
+    // The path is bridge-generated (temp dir + hex), so it holds no quote to
+    // escape; refuse it rather than build a broken command if that ever fails.
+    if (strchr(s->wrapper_path, '\'')) { unstage_wrapper_file(s); return -1; }
+    int n = snprintf(out, out_cap, ". '%s'\n", s->wrapper_path);
+    if (n <= 0 || (size_t)n >= out_cap) { unstage_wrapper_file(s); return -1; }
+    return n;
+}
+#endif
+
 // Park a running step: hand the RUN back to the backend (STEP_AWAITING_INPUT)
 // while the shell keeps running. Used by the stdin-blocked probe and by an
 // explicit `detach` frame from the user. The deadline is dropped so the
@@ -1150,6 +1212,7 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
 // (RUN carried a sessionId) survive.
 static void run_finish(session_t *s) {
     s->state = SESS_IDLE;
+    unstage_wrapper_file(s);
     s->tail_len = 0;
     s->deadline_ms = 0;
     s->run_block_id_len = 0;
@@ -2260,7 +2323,19 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // raw bytes through the canonical path (PENDIN) and hits MAX_CANON
         // again, and Linux likewise over ~4 kB.
         (void)bridge_pty_set_canon(&s->pty, 0);
-        if (bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) != 0) {
+        const char *deliver = wrapped;
+        size_t deliver_len = (size_t)wn;
+#ifdef _WIN32
+        // Type in a one-line `. '<file>'` instead of the whole wrapper; see
+        // stage_wrapper_file. cmd.exe has no `.`, and a failed staging falls
+        // back to the inline wrapper.
+        char srcline[sizeof s->wrapper_path + 8];
+        if (!s->cmd_mode) {
+            int sn = stage_wrapper_file(s, wrapped, (size_t)wn, srcline, sizeof srcline);
+            if (sn > 0) { deliver = srcline; deliver_len = (size_t)sn; }
+        }
+#endif
+        if (bridge_pty_write_all(&s->pty, deliver, deliver_len) != 0) {
             int werr = errno;
             free(wrapped);
             // STEP_DONE is the terminal response (RUN_STARTED was already sent);
@@ -3802,6 +3877,7 @@ int bridge_main(int argc, char **argv) {
 
     for (int i = 0; i < g_max_sessions; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
+        unstage_wrapper_file(&e->sessions[i]);
     }
     pty_pool_shutdown();
     bridge_identity_server_close(e->identity_fd);
