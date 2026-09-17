@@ -33,7 +33,7 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c \
+COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
@@ -119,7 +119,7 @@ release-windows-x64: | build
 # PTY helpers used by the test harnesses (pty_posix.c calls into env_path.c).
 TEST_DEPS = pty_posix.c env_path.c policy.c json.c
 # Full-daemon tests list json.c themselves; policy.c needs it too.
-DAEMON_TEST_DEPS = pty_posix.c env_path.c policy.c
+DAEMON_TEST_DEPS = pty_posix.c pty_pool.c env_path.c policy.c
 
 # Windows ConPTY smoke test. Cross-compiles from Linux/macOS with `zig`, but
 # the produced .exe must be RUN on a real Windows host (windows-latest in CI)
@@ -279,7 +279,7 @@ test-park: | build
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c
+BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 
@@ -362,3 +362,12 @@ dev: build/todoforai-bridge
 
 clean:
 	rm -rf build
+
+# Pre-warmed PTY pool: adopt / cd prefix / refill / reap / teardown.
+.PHONY: test-pool
+test-pool: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-pool \
+	    test/test_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-pool

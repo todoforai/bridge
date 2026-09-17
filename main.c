@@ -89,6 +89,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "jobs.h"
 #include "preview.h"
 #include "pty.h"
+#include "pty_pool.h"
 #include "subcmd.h"
 #include "tools.h"
 #include "update.h"
@@ -1821,6 +1822,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // Resolve / allocate session. Missing sessionId ⇒ spawn one-shot.
         session_t *s = NULL;
         int created = 0;
+        int adopted = 0;   // one-shot took a pre-warmed shell → wrapper needs `cd`
         if (!has_sid) {
             s = free_slot(e);
             // Array full: evict the LRU idle session to make room. Only RUN
@@ -1883,7 +1885,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                     s->cmd_mode = 1;
             }
 #endif
-            if (bridge_pty_spawn(&s->pty, DEFAULT_SHELL, spawn_cwd, /*no_echo=*/1) != 0) {
+            // Pre-warmed shell (pty_pool.h): already spawned + init'd at its
+            // prompt; the wrapper below gets a `cd` prefix instead. cmd.exe
+            // never adopts (different init dialect).
+            adopted = !s->cmd_mode && pty_pool_take(&s->pty);
+            if (!adopted && bridge_pty_spawn(&s->pty, DEFAULT_SHELL, spawn_cwd, /*no_echo=*/1) != 0) {
                 // OS pty/fd limits (macOS kern.tty.ptmx_max, RLIMIT_NOFILE)
                 // can be exhausted below our own session cap, so report both
                 // the reason and the tracked session count — a bare "failed to
@@ -1902,7 +1908,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // right behind it — the shell executes lines sequentially, so no
             // extra round-trip latency. Shells that ignore it (busybox-w32,
             // cmd) are still covered by the per-step begin drain.
-            {
+            if (!adopted) {
                 char init_line[96];
                 size_t in_n = s->cmd_mode
                     ? build_init_line_cmd(init_line, sizeof init_line)
@@ -1945,7 +1951,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             s->last_active_ms = monotonic_ms();
             s->one_shot = 1;
             created = 1;
-            fprintf(stderr, "PTY spawned %s (run, one-shot)\n", s->session_id);
+            fprintf(stderr, "PTY %s %s (run, one-shot)\n", adopted ? "adopted" : "spawned", s->session_id);
         } else {
             if (!is_valid_uuid(sid, sid_len)) { free(cmd); return send_error(e, NULL, 0, bid, bid_len, "INVALID_SESSION_ID", "sessionId must be a UUID"); }
             s = find_session(e, sid, sid_len);
@@ -2116,10 +2122,19 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // when a device session token is set so tfa-* CLIs authenticate
         // without a real API key. Token (`dst_` + 64 hex), agent id, and
         // api_url are all validated charset-safe.
+        // Adopted pool shell: it sits in the default cwd, so `cd` first.
+        // cwd was stat-validated above; a vanish in between makes `exit 1`
+        // kill the shell → reap → STEP_DONE code≠0.
+        char cdpre[sizeof s->cwd * 4 + 32];
+        cdpre[0] = '\0';
+        if (adopted && !pty_pool_cd_prefix(s->cwd, cdpre, sizeof cdpre)) {
+            free(cmd); RUN_FAIL_CLEANUP();
+            return send_error(e, NULL, 0, bid, bid_len, "INTERNAL", "cwd too long");
+        }
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + s->begin_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
                              + sizeof(idenv) + sizeof(e->api_url)
-                             + sizeof(fenv) + sizeof(cenv) + 384;
+                             + sizeof(fenv) + sizeof(cenv) + strlen(cdpre) + 384;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
@@ -2136,9 +2151,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 (int)cmd_len, cmd, s->sentinel + 9);
         } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
-                CANON_ON "printf '\\n__BRIDGE_''%s\\n'; "
+                CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
                 "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; " SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
@@ -2148,9 +2164,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
-                CANON_ON "printf '\\n__BRIDGE_''%s\\n'; "
+                CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
                 SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv,
                 fenv, cenv,
@@ -3043,6 +3060,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             e->identity_sent = 1;
         }
         service_sessions(e);
+        pty_pool_service(monotonic_ms());
         // Forward anything the off-loop workers produced (tool scan results,
         // preview chunks). Never blocks; sending stays on this thread.
         bridge_jobs_poll(&e->jobs, monotonic_ms(), jobs_frame_cb, jobs_done_cb, e);
@@ -3532,6 +3550,13 @@ int bridge_main(int argc, char **argv) {
     else if (g_policy.active)
         fprintf(stderr, "policy: %d workspace(s) from %s (jail %s)\n",
                 g_policy.n, g_policy.path, g_policy.jail ? "on" : "off");
+    {
+        // Pre-warmed one-shot shells (pty_pool.h). Same init line a cold
+        // one-shot gets, so an adopted shell is indistinguishable at its prompt.
+        char init_line[96];
+        size_t in_n = build_init_line(init_line, sizeof init_line);
+        pty_pool_init(DEFAULT_SHELL, init_line, in_n);
+    }
 
     g_max_sessions = resolve_max_sessions();
     // Each session needs a master fd + a few transient pipes in the child
@@ -3718,6 +3743,7 @@ int bridge_main(int argc, char **argv) {
     for (int i = 0; i < g_max_sessions; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
     }
+    pty_pool_shutdown();
     bridge_identity_server_close(e->identity_fd);
     free(e->sessions);
     free(e);
