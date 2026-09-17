@@ -12,6 +12,10 @@
 static const char *OPTIONAL_HOME_DIRS[] = {
 #ifdef _WIN32
     ".bun\\bin", ".deno\\bin", ".cargo\\bin", "go\\bin", ".volta\\bin",
+    // npm global prefixes: the default per-user location, plus the common
+    // `npm config set prefix ~/npm-global` convention (often PATH'd only in
+    // ~/.bashrc, which non-interactive scan shells never source).
+    "AppData\\Roaming\\npm", "npm-global",
 #else
     ".bun/bin", ".deno/bin", ".cargo/bin", "go/bin", ".volta/bin",
     ".local/share/pnpm",
