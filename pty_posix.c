@@ -29,7 +29,27 @@
 #  include <sys/proc_info.h>
 #endif
 
+// Child environment that is the same for every spawn, computed ONCE in the
+// parent. bridge_build_tools_path() stats a dozen candidate dirs and walks
+// ~/.nvm; bridge_ensure_askpass() reads/rewrites a script. Doing that in the
+// forked child before exec put it on every RUN's critical path — measured
+// ~0.8 s per spawn on a swapped Intel Mac, versus 3 ms for forkpty+sh — and
+// meant malloc/stat/mkdir after fork. The result cannot change while the
+// bridge runs except by the user installing a package manager, which the
+// next bridge start picks up.
+static const char *g_tools_path;
+static const char *g_askpass;
+static int g_env_ready;
+
+static void spawn_env_init(void) {
+    if (g_env_ready) return;
+    g_env_ready = 1;
+    g_tools_path = bridge_build_tools_path();   // NULL ok: keep inherited PATH
+    g_askpass = bridge_ensure_askpass();        // NULL ok: no askpass routing
+}
+
 int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no_echo) {
+    spawn_env_init();
     // Pre-build termios so the slave starts in the desired mode. Setting echo
     // from the child after fork races against the parent's first write.
     //
@@ -112,18 +132,15 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
         setenv("MANPAGER", "cat", 1);
         setenv("SYSTEMD_PAGER", "cat", 1);
         setenv("AWS_PAGER", "", 1);
-        // Make HostDesktop-installed tools discoverable.
-        char *tools_path = bridge_build_tools_path();
-        if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
+        // Make HostDesktop-installed tools discoverable (cached, see spawn_env_init).
+        if (g_tools_path) setenv("PATH", g_tools_path, 1);
         // Route sudo -A / ssh password prompts through a visible tty read
         // (see bridge_ensure_askpass). SSH_ASKPASS_REQUIRE=force makes ssh
         // use it even with a tty; sudo still needs -A (RUN wrapper adds it).
-        char *askpass = bridge_ensure_askpass();
-        if (askpass) {
-            setenv("SUDO_ASKPASS", askpass, 1);
-            setenv("SSH_ASKPASS", askpass, 1);
+        if (g_askpass) {
+            setenv("SUDO_ASKPASS", g_askpass, 1);
+            setenv("SSH_ASKPASS", g_askpass, 1);
             setenv("SSH_ASKPASS_REQUIRE", "force", 1);
-            free(askpass);
         }
         // Device policy: confine this process tree (Linux Landlock). A jail
         // that can't be applied is fatal — running unconfined would silently
