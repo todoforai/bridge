@@ -53,6 +53,7 @@
 #define STATUS_TIMEOUT_MS  10000
 #define OUT_CAP            2048  // trim captured output — multi-account tools (e.g. zele whoami) need >200B
 #define VERSION_CAP        100
+#define PRESENCE_FP_CAP    512
 
 // Run a shell command with a deadline. Captures up to `cap` bytes of combined
 // stdout+stderr into `out` (NUL-terminated, trimmed of trailing whitespace).
@@ -88,7 +89,7 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
     const char *sh = g_win_shell;
     if (!*sh) return -1;
 
-    char cmdline[2048];
+    char cmdline[16384];  // presence_scan passes every catalog binary in one line
     // Quote shell path; pass `cmd` as a single argument to `-c`.
     int n = snprintf(cmdline, sizeof(cmdline), "\"%s\" -c \"%s\"", sh, cmd);
     if (n <= 0 || (size_t)n >= sizeof(cmdline)) return -1;
@@ -362,10 +363,8 @@ static int custom_name_safe(const char *s) {
     return 1;
 }
 
-// Read $HOME/.todoforai/custom_tools.json (≤ CUSTOM_FILE_CAP). Heap-allocated
-// custom_tool_t[]; *out_n receives count. NULL when absent/unreadable/empty.
-static custom_tool_t *load_custom_tools(int *out_n) {
-    *out_n = 0;
+// "$HOME/.todoforai/<file>" into path[cap]. 0 on failure (no home / too long).
+static int todoforai_path(char *path, size_t cap, const char *file) {
 #ifdef _WIN32
     // USERPROFILE first — matches the edge's os.homedir(); Git/MSYS may set
     // HOME elsewhere.
@@ -374,19 +373,34 @@ static custom_tool_t *load_custom_tools(int *out_n) {
 #else
     const char *home = getenv("HOME");
 #endif
-    if (!home || !*home) return NULL;
+    if (!home || !*home) return 0;
+    int pn = snprintf(path, cap, "%s/.todoforai/%s", home, file);
+    return pn > 0 && (size_t)pn < cap;
+}
 
-    char path[1024];
-    int pn = snprintf(path, sizeof(path), "%s/.todoforai/custom_tools.json", home);
-    if (pn <= 0 || (size_t)pn >= sizeof(path)) return NULL;
-
+// Whole file into a malloc'd buffer (NUL-terminated, *len = bytes). NULL when
+// absent, empty or ≥ cap.
+static char *read_file(const char *path, size_t cap, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    char *buf = malloc(CUSTOM_FILE_CAP);
+    char *buf = malloc(cap);
     if (!buf) { fclose(f); return NULL; }
-    size_t len = fread(buf, 1, CUSTOM_FILE_CAP, f);
+    *len = fread(buf, 1, cap, f);
     fclose(f);
-    if (len == 0 || len >= CUSTOM_FILE_CAP) { free(buf); return NULL; } // empty or oversized
+    if (*len == 0 || *len >= cap) { free(buf); return NULL; }
+    buf[*len] = '\0';
+    return buf;
+}
+
+// Read $HOME/.todoforai/custom_tools.json (≤ CUSTOM_FILE_CAP). Heap-allocated
+// custom_tool_t[]; *out_n receives count. NULL when absent/unreadable/empty.
+static custom_tool_t *load_custom_tools(int *out_n) {
+    *out_n = 0;
+    char path[1024];
+    if (!todoforai_path(path, sizeof(path), "custom_tools.json")) return NULL;
+    size_t len = 0;
+    char *buf = read_file(path, CUSTOM_FILE_CAP, &len);
+    if (!buf) return NULL;
 
     custom_tool_t *customs = calloc(CUSTOM_MAX, sizeof(*customs));
     if (!customs) { free(buf); return NULL; }
@@ -440,15 +454,263 @@ typedef struct {
     int  installed, authed;
     int  synthetic;             // non-catalog custom (command -v presence probe)
     const custom_tool_t *cust;  // user override for this key, or NULL
+    // Presence short-circuit (see presence_scan): the bare binary the
+    // versionCmd starts with, whether one `command -v` pass found it
+    // (-1 = unknown ⇒ run the versionCmd as-is), and its fingerprint
+    // "<resolved path>\t<ls -ldL line>" for the version cache.
+    char bin[64];
+    int  present;
+    char fp[PRESENCE_FP_CAP];
+    int  cacheable;             // version may be served from / saved to the cache
+    int  v_cached;              // version_out came from the cache
 } probe_t;
 
-// Run versionCmd + statusCmd. Pure: no shared state.
+// ── Version cache (~/.todoforai/tools_cache.json) ───────────────────────────
+// `<tool> --version` is the expensive half of a probe (node/python startup,
+// 5 s deadline) and its answer only changes when the binary does. Keyed by
+// tool; an entry is reused when the fingerprint (resolved path + `ls -ldL`
+// line: perms, size, mtime to the minute) AND the versionCmd match. A
+// same-size, same-minute in-place replacement would keep a stale version
+// string — never a stale installed/auth answer. Auth status is never cached
+// — tokens expire.
+#define CACHE_MAX      256
+#define CACHE_FILE_CAP 131072
+
+typedef struct {
+    char key[64];
+    char fp[PRESENCE_FP_CAP];
+    char vcmd[512];
+    char version[VERSION_CAP + 1];
+} cache_ent_t;
+
+static cache_ent_t *load_cache(int *out_n) {
+    *out_n = 0;
+    char path[1024];
+    if (!todoforai_path(path, sizeof(path), "tools_cache.json")) return NULL;
+    size_t len = 0;
+    char *buf = read_file(path, CACHE_FILE_CAP, &len);
+    if (!buf) return NULL;
+    cache_ent_t *ents = calloc(CACHE_MAX, sizeof(*ents));
+    if (!ents) { free(buf); return NULL; }
+    int n = 0;
+    size_t pos = 0;
+    const char *k, *v; size_t kl, vl; json_type_t vt;
+    while (n < CACHE_MAX && json_obj_iter(buf, len, &pos, &k, &kl, &v, &vl, &vt)) {
+        if (vt != JT_OBJ) continue;
+        cache_ent_t *c = &ents[n];
+        if (json_unescape_span(k, kl, c->key, sizeof(c->key)) <= 0) continue;
+        size_t dl;
+        if (!json_get_str_decoded(v, vl, "fp",   c->fp,   sizeof(c->fp),   &dl)) continue;
+        if (!json_get_str_decoded(v, vl, "vcmd", c->vcmd, sizeof(c->vcmd), &dl)) continue;
+        if (!json_get_str_decoded(v, vl, "version", c->version, sizeof(c->version), &dl) || !c->version[0]) continue;
+        n++;
+    }
+    free(buf);
+    if (n == 0) { free(ents); return NULL; }
+    *out_n = n;
+    return ents;
+}
+
+static const cache_ent_t *cache_find(const cache_ent_t *ents, int n, const probe_t *p) {
+    for (int i = 0; i < n; i++) {
+        if (strcmp(ents[i].key, p->key) == 0 && strcmp(ents[i].fp, p->fp) == 0 &&
+            strcmp(ents[i].vcmd, p->vcmd) == 0) return &ents[i];
+    }
+    return NULL;
+}
+
+// Rewrite the cache from this run's successful version probes. Failures are
+// never cached: `python3 -c 'import x'` starts working after a pip install
+// that leaves python3's fingerprint untouched. Best effort: any failure just
+// means a re-probe next time.
+static void save_cache(const probe_t *probes, int n) {
+    char path[1024], tmp[1040];
+    if (!todoforai_path(path, sizeof(path), "tools_cache.json")) return;
+    char *buf = malloc(CACHE_FILE_CAP);
+    if (!buf) return;
+    size_t used = 0;
+    int emitted = 0, ok = json_emit_raw(buf, CACHE_FILE_CAP, &used, "{", 1) == 0;
+    for (int i = 0; ok && i < n; i++) {
+        const probe_t *p = &probes[i];
+        if (p->present != 1 || !p->cacheable || p->v_exit != 0 || !p->version_out[0]) continue;
+        ok = (emitted == 0 || json_emit_raw(buf, CACHE_FILE_CAP, &used, ",", 1) == 0) &&
+             json_emit_str(buf, CACHE_FILE_CAP, &used, p->key, -1) == 0 &&
+             json_emit_raw(buf, CACHE_FILE_CAP, &used, ":{\"fp\":", 7) == 0 &&
+             json_emit_str(buf, CACHE_FILE_CAP, &used, p->fp, -1) == 0 &&
+             json_emit_raw(buf, CACHE_FILE_CAP, &used, ",\"vcmd\":", 8) == 0 &&
+             json_emit_str(buf, CACHE_FILE_CAP, &used, p->vcmd, -1) == 0 &&
+             json_emit_raw(buf, CACHE_FILE_CAP, &used, ",\"version\":", 11) == 0 &&
+             json_emit_str(buf, CACHE_FILE_CAP, &used, p->version_out, -1) == 0 &&
+             json_emit_raw(buf, CACHE_FILE_CAP, &used, "}", 1) == 0;
+        emitted++;
+    }
+    ok = ok && json_emit_raw(buf, CACHE_FILE_CAP, &used, "}\n", 2) == 0;
+    if (ok) {
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            ok = fwrite(buf, 1, used, f) == used;
+            ok = (fclose(f) == 0) && ok;
+#ifdef _WIN32
+            if (ok) ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+#else
+            if (ok) ok = rename(tmp, path) == 0;
+#endif
+            if (!ok) remove(tmp);
+        }
+    }
+    free(buf);
+}
+
+// ── Presence pass ───────────────────────────────────────────────────────────
+// Most versionCmds are `<bin> --version ...`. One shell pass answers "is
+// <bin> on PATH" for all of them at once (same shell + PATH the probes use,
+// so it can't disagree with them), which turns the ~80 absent tools of a
+// typical host from 80 spawns into zero. Present tools get their resolved
+// path + `ls -ldL` line as a cache fingerprint. Names are plain tokens
+// (custom_name_safe) and go unquoted; resolved paths are single-quoted
+// (double quotes don't survive the Windows command line).
+//
+#define PRESENCE_TIMEOUT_MS 10000
+#define PRESENCE_OUT_CAP    32768
+
+// A versionCmd that starts with an interpreter (`node -p "...shopify..."`)
+// really versions some other package: the interpreter's presence is still a
+// valid precondition, but its fingerprint says nothing about that package,
+// so such probes are never served from the cache.
+static int is_interpreter(const char *bin) {
+    static const char *const names[] = { "node", "bun", "deno", "python", "python3", "py", "ruby", "perl", "sh", "bash", NULL };
+    for (int i = 0; names[i]; i++) if (strcmp(bin, names[i]) == 0) return 1;
+    return 0;
+}
+
+static void probe_set_bin(probe_t *p) {
+    p->present = -1;
+    const char *src = p->synthetic ? p->key : p->vcmd;
+    if (!p->have_v) return;
+    // `a --version || b --version`: absence of `a` says nothing. Probe as-is.
+    if (!p->synthetic && strstr(src, "||")) return;
+    size_t n = strcspn(src, " \t|;&<>");
+    if (n == 0 || n >= sizeof(p->bin)) return;
+    memcpy(p->bin, src, n); p->bin[n] = '\0';
+    if (!custom_name_safe(p->bin)) { p->bin[0] = '\0'; return; }
+    p->present = 0;
+    p->cacheable = !p->synthetic && !is_interpreter(p->bin);
+}
+
+static probe_t *probe_by_bin(probe_t *probes, int n, const char *name, size_t len) {
+    for (int i = 0; i < n; i++) {
+        if (probes[i].present == 0 && strlen(probes[i].bin) == len &&
+            memcmp(probes[i].bin, name, len) == 0) return &probes[i];
+    }
+    return NULL;
+}
+
+// Two shell spawns total: pass 1 is fork-free (`command -v` is a builtin),
+// pass 2 is one `ls` over every hit. A `$(...)` per name would cost ~30 ms
+// each under MSYS and eat the whole win.
+static void presence_scan(probe_t *probes, int n) {
+    char *cmd = malloc(8192), *out = malloc(PRESENCE_OUT_CAP);
+    if (!cmd || !out) goto unknown;
+    size_t used = (size_t)snprintf(cmd, 8192, "set -f; IFS=; for n in");
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+        if (probes[i].present != 0) continue;
+        int m = snprintf(cmd + used, 8192 - used, " %s", probes[i].bin);
+        if (m < 0 || (size_t)m >= 8192 - used) goto unknown;
+        used += (size_t)m; any = 1;
+    }
+    if (!any) goto done;
+    int m = snprintf(cmd + used, 8192 - used,
+        "; do printf '%%s\\t' $n; command -v $n 2>/dev/null || echo; done; echo END");
+    if (m < 0 || (size_t)m >= 8192 - used) goto unknown;
+    if (run_shell(cmd, PRESENCE_TIMEOUT_MS, out, PRESENCE_OUT_CAP) != 0) goto unknown;
+    // run_shell drops output past its cap silently; a missing sentinel means
+    // the tail (and every tool in it) went unseen — fall back to probing.
+    size_t ol = strlen(out);
+    if (ol < 3 || strcmp(out + ol - 3, "END") != 0 || (ol > 3 && out[ol - 4] != '\n')) goto unknown;
+
+    int hits = 0;
+    for (char *line = out; *line; ) {
+        char *eol = strchr(line, '\n');
+        size_t ll = eol ? (size_t)(eol - line) : strlen(line);
+        char *t = memchr(line, '\t', ll);
+        probe_t *p = t ? probe_by_bin(probes, n, line, (size_t)(t - line)) : NULL;
+        size_t pl = t ? ll - (size_t)(t + 1 - line) : 0;
+        if (p && pl > 0) {
+            p->present = 1; hits++;
+            // Path too long to fingerprint ⇒ known present, just not cacheable.
+            if (pl < sizeof(p->fp) / 2) { memcpy(p->fp, t + 1, pl); p->fp[pl] = '\0'; }
+            else p->cacheable = 0;
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+    if (!hits) goto done;
+
+    // Pass 2: fingerprint the hits. A hit that gets no ls line (shell
+    // builtin, oversized command, unreadable path) stays present but is
+    // excluded from the cache — the path alone is not a safe key.
+    used = (size_t)snprintf(cmd, 8192, "ls -ldL --");
+    for (int i = 0; i < n; i++) {
+        if (probes[i].present != 1 || !probes[i].cacheable) continue;
+        if (used + 2 >= 8192) goto done;
+        cmd[used++] = ' '; cmd[used++] = '\'';
+        for (const char *c = probes[i].fp; *c; c++) {
+            if (*c == '\'') { if (used + 4 >= 8192) goto done; memcpy(cmd + used, "'\\''", 4); used += 4; }
+            else { if (used + 1 >= 8192) goto done; cmd[used++] = *c; }
+        }
+        if (used + 2 >= 8192) goto done;
+        cmd[used++] = '\''; cmd[used] = '\0';
+    }
+    // ls exits nonzero if any operand failed but still lists the rest.
+    if (run_shell(cmd, PRESENCE_TIMEOUT_MS, out, PRESENCE_OUT_CAP) < 0) goto done;
+    for (char *line = out; *line; ) {
+        char *eol = strchr(line, '\n');
+        size_t ll = eol ? (size_t)(eol - line) : strlen(line);
+        // ls line ends with the path we passed; several tools may share one.
+        for (int i = 0; i < n; i++) {
+            probe_t *p = &probes[i];
+            if (p->present != 1 || !p->cacheable || strchr(p->fp, '\t')) continue;
+            size_t pl = strlen(p->fp);
+            if (ll <= pl || line[ll - pl - 1] != ' ' || memcmp(line + ll - pl, p->fp, pl) != 0) continue;
+            if (pl + 1 + ll >= sizeof(p->fp)) continue;
+            p->fp[pl] = '\t'; memcpy(p->fp + pl + 1, line, ll); p->fp[pl + 1 + ll] = '\0';
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+    for (int i = 0; i < n; i++)
+        if (probes[i].present == 1 && !strchr(probes[i].fp, '\t')) probes[i].cacheable = 0;
+    goto done;
+unknown:
+    for (int i = 0; i < n; i++) if (probes[i].present == 0) probes[i].present = -1;
+done:
+    free(cmd); free(out);
+}
+
+// Run versionCmd (unless presence/cache already answered it) + statusCmd.
+// Pure: no shared state.
 static void probe_run(probe_t *p) {
-    p->v_exit = p->s_exit = -1;
-    if (p->have_v) p->v_exit = run_shell(p->vcmd, VERSION_TIMEOUT_MS, p->version_out, sizeof(p->version_out));
-    if (p->have_s) p->s_exit = run_shell(p->scmd, STATUS_TIMEOUT_MS,  p->status_out,  sizeof(p->status_out));
-    p->installed = (p->have_v && p->v_exit == 0 && p->version_out[0] != '\0') ||
-                   (!p->have_v && p->have_s && p->s_exit == 0);
+    p->s_exit = -1;
+    if (p->present == 0) {
+        p->v_exit = 1;
+    } else if (p->present == 1 && p->synthetic) {
+        // `command -v <name>` already ran: its answer is the path in fp.
+        size_t pl = strcspn(p->fp, "\t");
+        if (pl > VERSION_CAP) pl = VERSION_CAP;
+        memcpy(p->version_out, p->fp, pl); p->version_out[pl] = '\0';
+        p->v_exit = 0;
+    } else if (!p->v_cached) {
+        p->v_exit = -1;
+        if (p->have_v) p->v_exit = run_shell(p->vcmd, VERSION_TIMEOUT_MS, p->version_out, sizeof(p->version_out));
+    }
+    p->installed = (p->have_v && p->v_exit == 0 && p->version_out[0] != '\0');
+    // statusCmd only matters once installed (or as the sole installed-check
+    // when there's no versionCmd); a known-absent tool's auth is never emitted.
+    if (p->have_s && (p->installed || !p->have_v))
+        p->s_exit = run_shell(p->scmd, STATUS_TIMEOUT_MS, p->status_out, sizeof(p->status_out));
+    if (!p->have_v && p->have_s && p->s_exit == 0) p->installed = 1;
     p->authed = p->have_s ? (p->s_exit == 0) : p->installed;
 }
 
@@ -654,7 +916,22 @@ int bridge_scan_tools(const char *entries, size_t entries_len,
         if (tools_path) { setenv("PATH", tools_path, 1); free(tools_path); }
     }
 #endif
+    for (int i = 0; i < n; i++) probe_set_bin(&probes[i]);
+    presence_scan(probes, n);
+    int n_cache = 0;
+    cache_ent_t *cache = load_cache(&n_cache);
+    for (int i = 0; i < n; i++) {
+        probe_t *p = &probes[i];
+        if (p->present != 1 || !p->cacheable) continue;
+        const cache_ent_t *c = cache_find(cache, n_cache, p);
+        if (!c) continue;
+        snprintf(p->version_out, sizeof(p->version_out), "%s", c->version);
+        p->v_exit = 0;
+        p->v_cached = 1;
+    }
+    free(cache);
     run_probes(probes, n);
+    save_cache(probes, n);
 
     // Assemble JSON object (just the {<key>:{...},...} dict, no envelope).
     size_t used = 0;
