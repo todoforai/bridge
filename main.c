@@ -354,9 +354,11 @@ typedef struct {
     int cmd_mode;
     char sentinel[SENTINEL_CAP];
     size_t sentinel_len;
-    // Windows: path of the staged wrapper file (see stage_wrapper_file), owned
-    // by the session and unlinked when the step ends. Empty when unused.
+#ifdef _WIN32
+    // Path of the staged wrapper file (see stage_wrapper_file), owned by the
+    // session and unlinked when the step ends. Empty when unused.
     char wrapper_path[512];
+#endif
     // Per-step routing (echoed in OUTPUT/STEP_DONE while running).
     char run_block_id[BLOCK_ID_CAP + 1];
     size_t run_block_id_len;
@@ -1136,37 +1138,128 @@ static void ob_reset(out_policy_t *ob);
 // planted at the name — but TMP is user-settable, so a shared temp dir keeps
 // only the random name, not access control. Exposure window is one step.
 #ifdef _WIN32
-// Deletion can fail while the shell still has the file open — a RUN that
-// timed out keeps executing, and its shell holds the wrapper. Dropping the
-// path there would leak a token-bearing file forever, so a failed unlink
-// parks the path here and every later unstage retries the whole set.
-#define WRAPPER_PENDING_MAX 32
-static char g_wrapper_pending[WRAPPER_PENDING_MAX][sizeof(((session_t *)0)->wrapper_path)];
+// All staged wrappers live in one directory owned by this bridge instance,
+// held by an exclusively-opened .lock file. That makes cleanup a property of
+// the directory rather than of any single unlink: a file in there is garbage
+// unless a live session still points at it, so wrapper_sweep() — run once a
+// second and at shutdown — retries every failed unlink forever, with no
+// bookkeeping to overflow. A step whose shell hangs on to its wrapper (timed
+// out but still running) simply gets collected when that shell dies.
+//
+// The lock also answers "is that other directory abandoned?" without guessing
+// from timestamps: crash residue is a directory whose lock can be opened
+// exclusively, which a running instance's never can.
+static char   g_wrapper_dir[MAX_PATH];   // "…/tfa-run-<pid>-<hex>/" or empty
+static HANDLE g_wrapper_lock = INVALID_HANDLE_VALUE;
 
-static void wrapper_pending_retry(void) {
-    for (int i = 0; i < WRAPPER_PENDING_MAX; i++) {
-        if (!g_wrapper_pending[i][0]) continue;
-        if (remove(g_wrapper_pending[i]) == 0 || errno == ENOENT) g_wrapper_pending[i][0] = '\0';
-    }
+// Opening the lock with no sharing is the liveness test: it fails for the
+// owner's live handle, succeeds for a dead instance's leftovers.
+static HANDLE wrapper_lock_open(const char *dir, DWORD disposition) {
+    char p[MAX_PATH + 8];
+    if (snprintf(p, sizeof p, "%s.lock", dir) >= (int)sizeof p) return INVALID_HANDLE_VALUE;
+    return CreateFileA(p, GENERIC_WRITE, 0, NULL, disposition,
+                       FILE_ATTRIBUTE_TEMPORARY, NULL);
 }
 
-static void wrapper_pending_park(const char *path) {
-    for (int i = 0; i < WRAPPER_PENDING_MAX; i++) {
-        if (g_wrapper_pending[i][0]) continue;
-        snprintf(g_wrapper_pending[i], sizeof g_wrapper_pending[i], "%s", path);
-        return;
+// Deletes everything in `dir` except paths an active session still needs.
+// `keep`/`nkeep` is empty when reclaiming another instance's residue.
+static void wrapper_dir_clear(const char *dir, session_t *keep, int nkeep) {
+    char pat[MAX_PATH + 8];
+    if (snprintf(pat, sizeof pat, "%s*.sh", dir) >= (int)sizeof pat) return;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char path[MAX_PATH * 2];
+        if (snprintf(path, sizeof path, "%s%s", dir, fd.cFileName) >= (int)sizeof path) continue;
+        int in_use = 0;
+        for (int i = 0; i < nkeep && !in_use; i++)
+            if (keep[i].wrapper_path[0] && _stricmp(keep[i].wrapper_path, path) == 0) in_use = 1;
+        if (!in_use) (void)remove(path);   // fails while a shell holds it; next sweep retries
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static void wrapper_sweep(session_t *sessions, int nsessions) {
+    if (g_wrapper_dir[0]) wrapper_dir_clear(g_wrapper_dir, sessions, nsessions);
+}
+
+// Reclaim directories left by bridges that died before cleaning up.
+static void wrapper_reclaim_abandoned(void) {
+    char base[MAX_PATH], pat[MAX_PATH + 16];
+    DWORD bn = GetTempPathA((DWORD)sizeof base, base);
+    if (bn == 0 || bn >= sizeof base) return;
+    if (snprintf(pat, sizeof pat, "%stfa-run-*", base) >= (int)sizeof pat) return;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        char dir[MAX_PATH * 2];
+        if (snprintf(dir, sizeof dir, "%s%s\\", base, fd.cFileName) >= (int)sizeof dir) continue;
+        if (g_wrapper_dir[0] && _stricmp(dir, g_wrapper_dir) == 0) continue;
+        HANDLE lk = wrapper_lock_open(dir, OPEN_EXISTING);
+        if (lk == INVALID_HANDLE_VALUE) continue;   // still owned (or unreadable): leave it
+        CloseHandle(lk);
+        wrapper_dir_clear(dir, NULL, 0);
+        char lockp[MAX_PATH * 2];
+        if (snprintf(lockp, sizeof lockp, "%s.lock", dir) < (int)sizeof lockp) (void)remove(lockp);
+        (void)RemoveDirectoryA(dir);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+// Creates this instance's staging directory. Failure leaves g_wrapper_dir
+// empty, which makes every step fall back to the (slow but correct) inline
+// wrapper — staging is an optimization, never a requirement.
+static void wrapper_dir_init(void) {
+    char base[MAX_PATH];
+    DWORD bn = GetTempPathA((DWORD)sizeof base, base);
+    if (bn == 0 || bn >= sizeof base) return;
+    // The path is created through the ANSI API but typed into a UTF-8 ConPTY:
+    // outside ASCII the two disagree and bash would open a different name (or
+    // none) with no sentinel to end the step. Also refuse a quote, which the
+    // single-quoted `. '<path>'` cannot carry. Backslashes become forward
+    // slashes: MSYS accepts them and they survive quoting in every shell.
+    for (DWORD i = 0; i < bn; i++) {
+        if ((unsigned char)base[i] >= 0x80 || base[i] == '\'') return;
+        if (base[i] == '\\') base[i] = '/';
     }
-    // All slots busy (32 shells wedged holding wrappers): drop the path. The
-    // file stays until the startup sweep of a later bridge collects it.
-    fprintf(stderr, "wrapper cleanup backlog full, leaving %s for the next sweep\n", path);
+    uint8_t rnd[8];
+    noise_random(rnd, sizeof rnd);
+    char hex[17];
+    hex_encode(hex, rnd, sizeof rnd);
+    char dir[MAX_PATH];
+    if (snprintf(dir, sizeof dir, "%stfa-run-%lu-%s/", base, (unsigned long)GetCurrentProcessId(), hex)
+            >= (int)sizeof dir) return;
+    if (!CreateDirectoryA(dir, NULL)) return;   // random name: never adopts someone else's dir
+    HANDLE lk = wrapper_lock_open(dir, CREATE_NEW);
+    if (lk == INVALID_HANDLE_VALUE) { (void)RemoveDirectoryA(dir); return; }
+    g_wrapper_lock = lk;
+    memcpy(g_wrapper_dir, dir, strlen(dir) + 1);
+}
+
+// Shutdown: drop what we can, then release the directory. Anything a wedged
+// shell still holds stays behind with the lock removed, so the next bridge
+// start reclaims it.
+static void wrapper_dir_release(session_t *sessions, int nsessions) {
+    if (!g_wrapper_dir[0]) return;
+    wrapper_dir_clear(g_wrapper_dir, sessions, nsessions);
+    if (g_wrapper_lock != INVALID_HANDLE_VALUE) { CloseHandle(g_wrapper_lock); g_wrapper_lock = INVALID_HANDLE_VALUE; }
+    char lockp[MAX_PATH + 8];
+    if (snprintf(lockp, sizeof lockp, "%s.lock", g_wrapper_dir) < (int)sizeof lockp) (void)remove(lockp);
+    (void)RemoveDirectoryA(g_wrapper_dir);
+    g_wrapper_dir[0] = '\0';
 }
 #endif
 
+// End of step: the wrapper is garbage. The unlink fails while the shell still
+// has it open (a timed-out step keeps running), which is why it is only
+// attempted here — wrapper_sweep owns the retry.
 static void unstage_wrapper_file(session_t *s) {
 #ifdef _WIN32
-    wrapper_pending_retry();
     if (!s->wrapper_path[0]) return;
-    if (remove(s->wrapper_path) != 0 && errno != ENOENT) wrapper_pending_park(s->wrapper_path);
+    (void)remove(s->wrapper_path);
     s->wrapper_path[0] = '\0';
 #else
     (void)s;
@@ -1174,51 +1267,19 @@ static void unstage_wrapper_file(session_t *s) {
 }
 
 #ifdef _WIN32
-// Crash residue: a killed bridge never unlinks its staged wrappers. Sweep at
-// startup, but only files older than a day — a concurrently running bridge
-// (other profile) must not lose the wrapper of a step in flight.
-static void wrapper_sweep_stale(void) {
-    char dir[MAX_PATH], pat[MAX_PATH + 32];
-    DWORD dn = GetTempPathA((DWORD)sizeof dir, dir);
-    if (dn == 0 || dn >= sizeof dir) return;
-    if (snprintf(pat, sizeof pat, "%stfa-run-*.sh", dir) >= (int)sizeof pat) return;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    FILETIME now;
-    GetSystemTimeAsFileTime(&now);
-    uint64_t now100 = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
-    do {
-        uint64_t mt = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
-        if (now100 <= mt || now100 - mt < 24ULL * 3600 * 10000000) continue;  // 100ns ticks
-        char path[MAX_PATH * 2];
-        if (snprintf(path, sizeof path, "%s%s", dir, fd.cFileName) < (int)sizeof path) (void)remove(path);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-}
-
-// Writes `wrapped` to a fresh temp file and emits the shell line that sources
-// it (`. '<path>'\n`) into `out`; returns its length, or -1 if staging failed
-// — the caller then sends the wrapper inline, which is slow but correct.
+// Writes `wrapped` to a fresh file in the instance directory and emits the
+// shell line that sources it (`. '<path>'\n`) into `out`; returns its length,
+// or -1 if staging failed — the caller then sends the wrapper inline, which
+// is slow but correct.
 static int stage_wrapper_file(session_t *s, const char *wrapped, size_t wn,
                               char *out, size_t out_cap) {
     unstage_wrapper_file(s);
-    char dir[MAX_PATH];
-    DWORD dn = GetTempPathA((DWORD)sizeof dir, dir);
-    if (dn == 0 || dn >= sizeof dir) return -1;
-    // The path is created through the ANSI API but typed into a UTF-8 ConPTY:
-    // outside ASCII the two disagree, and bash would open a different name (or
-    // none) with no sentinel to end the step. Stay inline for such a temp dir.
-    // Forward slashes because bash reads `\` as an escape even in '…'.
-    for (DWORD i = 0; i < dn; i++) {
-        if ((unsigned char)dir[i] >= 0x80 || dir[i] == '\'') return -1;
-        if (dir[i] == '\\') dir[i] = '/';
-    }
+    if (!g_wrapper_dir[0]) return -1;
     uint8_t rnd[8];
     noise_random(rnd, sizeof rnd);
     char hex[17];
     hex_encode(hex, rnd, sizeof rnd);
-    if (snprintf(s->wrapper_path, sizeof s->wrapper_path, "%stfa-run-%s.sh", dir, hex)
+    if (snprintf(s->wrapper_path, sizeof s->wrapper_path, "%s%s.sh", g_wrapper_dir, hex)
             >= (int)sizeof s->wrapper_path) { s->wrapper_path[0] = '\0'; return -1; }
     int n = snprintf(out, out_cap, ". '%s'\n", s->wrapper_path);
     if (n <= 0 || (size_t)n >= out_cap) { s->wrapper_path[0] = '\0'; return -1; }
@@ -2955,11 +3016,14 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 static void service_sessions(edge_t *e) {
     int64_t now = monotonic_ms();
 #ifdef _WIN32
-    // Wrappers whose unlink lost to a shell that still had the file open.
-    // Driven from the service loop, not from the next step: the holder may be
-    // a parked session that never runs another step (see wrapper_pending_*).
-    static int64_t last_wrapper_retry;
-    if (now - last_wrapper_retry >= 1000) { last_wrapper_retry = now; wrapper_pending_retry(); }
+    // Collect wrappers whose unlink lost to a shell that still had the file
+    // open. Driven from here, not from the next step: the holder may be a
+    // parked session that never runs another one (see wrapper_sweep).
+    static int64_t last_wrapper_sweep;
+    if (now - last_wrapper_sweep >= 1000) {
+        last_wrapper_sweep = now;
+        wrapper_sweep(e->sessions, g_max_sessions);
+    }
 #endif
 
     // Reap exited shells; if a step was in flight, surface STEP_DONE first
@@ -3761,7 +3825,8 @@ int bridge_main(int argc, char **argv) {
         pty_pool_init(DEFAULT_SHELL, init_line, in_n);
     }
 #ifdef _WIN32
-    wrapper_sweep_stale();   // wrappers a killed bridge never got to unlink
+    wrapper_dir_init();            // this instance's wrapper staging directory
+    wrapper_reclaim_abandoned();   // directories left by bridges that died
 #endif
 
     g_max_sessions = resolve_max_sessions();
@@ -3948,8 +4013,13 @@ int bridge_main(int argc, char **argv) {
 
     for (int i = 0; i < g_max_sessions; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
-        unstage_wrapper_file(&e->sessions[i]);
+#ifdef _WIN32
+        e->sessions[i].wrapper_path[0] = '\0';   // all of them are garbage now
+#endif
     }
+#ifdef _WIN32
+    wrapper_dir_release(e->sessions, g_max_sessions);
+#endif
     pty_pool_shutdown();
     bridge_identity_server_close(e->identity_fd);
     free(e->sessions);
