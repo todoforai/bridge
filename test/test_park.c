@@ -64,10 +64,17 @@ static void run_step(edge_t *e, session_t *s, const char *cmd, int no_input, int
     s->last_input_ms = 0;          // no pending ldisc drain to wait out
     s->deadline_ms = 0;            // deadline is not what's under test
 
-    char wrapped[4096];
+    // Same shape as the RUN handler: begin marker (split-quoted so the echoed
+    // wrapper never matches), the command, the end sentinel.
+    s->begin_len = gen_begin_sentinel(s->begin_sentinel, sizeof s->begin_sentinel);
+    s->draining_begin = s->begin_len > 0;
+    s->begin_dropped = 0;
+    char wrapped[16384];
     int wn = snprintf(wrapped, sizeof wrapped,
-        "{ %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n", cmd, s->sentinel);
+        "printf '\\n__BRIDGE_''%s\\n'; { %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+        s->begin_sentinel + 9, cmd, s->sentinel);
     assert(wn > 0 && (size_t)wn < sizeof wrapped);
+    (void)bridge_pty_set_canon(&s->pty, 0);   // as the RUN handler does
     assert(bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) == 0);
 
     for (int waited = 0; waited < budget_ms && !g_done && !g_parked; waited += 20) {
@@ -129,6 +136,25 @@ int main(void) {
     expect("password prompt parks", 1, 0);
     if (g_pwd == 0) { printf("FAIL [passwordPrompt flag not set]\n"); failures++; }
     settle(e, s, "x\n");
+
+    // One long line, as every tool install is. Canonical mode caps a line at
+    // MAX_CANON (1024 macOS / 4096 Linux) and drops the rest with a BEL — the
+    // shell then never sees the newline and the step "fails to deliver".
+    {
+        static char big[8192];
+        int n = snprintf(big, sizeof big, "echo ");
+        while (n < 6000) big[n++] = 'x';
+        n += snprintf(big + n, sizeof big - (size_t)n, " | wc -c | tr -d ' '");
+        run_step(e, s, big, 1, 6000);
+        expect("6kB command line delivered", 0, 1);
+    }
+
+    // A parked step gets canonical mode back: ^D must release `cat`'s read.
+    run_step(e, s, "printf 'paste, then ^D: '; cat >/dev/null; echo eof", 0, 6000);
+    expect("cat parks", 1, 0);
+    settle(e, s, "\x04");
+    if (s->state == SESS_RUNNING) { printf("FAIL [^D did not release parked cat]\n"); failures++; }
+    else printf("ok   [%-32s]\n", "^D releases parked cat");
 
     // noInput: not even a real prompt may park — the caller has nobody to ask.
     run_step(e, s, "printf 'Continue? [y/N] '; read a", 1, 3000);

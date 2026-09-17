@@ -310,6 +310,11 @@ fail: {
 }
 }
 
+int bridge_pty_set_canon(bridge_pty_t *p, int on) {
+    (void)p; (void)on;  // ConPTY: no termios line discipline to toggle.
+    return 0;
+}
+
 void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols) {
     if (!p || !p->h_pcon) return;
     COORD size = { (SHORT)cols, (SHORT)rows };

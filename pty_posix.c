@@ -43,14 +43,21 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     t.c_iflag = ICRNL;                      // CR→NL on input; no IXON — a stray ^S must not freeze a run
     t.c_oflag = OPOST | ONLCR;
     t.c_cflag = CREAD | CS8 | B38400;
-    t.c_lflag = ICANON | ISIG | IEXTEN;     // line-at-a-time + control chars raise signals
+    // No ICANON at spawn: canonical mode caps a line at MAX_CANON (1024 on
+    // macOS, 4096 Linux) and silently DROPS the rest with a BEL — the wrapped
+    // RUN (sentinels + env exports + the command) easily exceeds 1 kB, so
+    // every tool install on a Mac never reached the shell and died as
+    // "failed to deliver command to shell". ISIG (^C) works without ICANON;
+    // VEOF/erase only matter for user INPUT, so park_step turns ICANON on
+    // for the duration of a parked step (bridge_pty_set_canon).
+    t.c_lflag = ISIG | IEXTEN;              // control chars raise signals; no line assembly
     if (!no_echo) t.c_lflag |= ECHO | ECHOE | ECHOK;
 
     // Control characters ISIG/ICANON act on. Conventional values (Linux/macOS
     // <sys/ttydefaults.h>), spelled out rather than included for portability.
     t.c_cc[VINTR]  = 0x03;                  // ^C  — SIGINT: the interrupt path
     t.c_cc[VQUIT]  = 0x1c;                  // ^\  — SIGQUIT
-    t.c_cc[VEOF]   = 0x04;                  // ^D  — EOF, releases a blocked stdin reader
+    t.c_cc[VEOF]   = 0x04;                  // ^D  — EOF, releases a blocked stdin reader (parked step: ICANON on)
     t.c_cc[VERASE] = 0x7f;
     t.c_cc[VKILL]  = 0x15;
     t.c_cc[VMIN]   = 1;
@@ -160,6 +167,27 @@ int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
         written += (size_t)n;
     }
     return 0;
+}
+
+// Canonical (line) mode on/off — on the master; Linux and XNU both route
+// TCSETS on a pty master to the shared line discipline.
+//
+// Off while a RUN wrapper is delivered: ICANON caps a line at MAX_CANON
+// (1024 macOS / 4096 Linux) and silently drops the rest, which is how every
+// Mac tool install died. On again once the begin sentinel arrives — proof the
+// shell consumed the wrapper — so a `read`/`cat` in the command enters its
+// read() under ICANON and VEOF (^D) releases it. (Flipping later does not
+// help: a Linux reader that entered in raw mode latched minimum=1 and never
+// returns 0 bytes.) `on` is skipped when ISIG/IEXTEN are gone — a program
+// already put the tty in raw mode and owns it.
+int bridge_pty_set_canon(bridge_pty_t *p, int on) {
+    struct termios t;
+    if (tcgetattr(p->master_fd, &t) != 0) return -1;
+    if (on && (t.c_lflag & (ISIG | IEXTEN)) != (ISIG | IEXTEN)) return 0;
+    tcflag_t want = on ? (t.c_lflag | ICANON) : (t.c_lflag & ~(tcflag_t)ICANON);
+    if (want == t.c_lflag) return 0;
+    t.c_lflag = want;
+    return tcsetattr(p->master_fd, TCSANOW, &t);
 }
 
 long bridge_pty_read(bridge_pty_t *p, void *buf, size_t len) {

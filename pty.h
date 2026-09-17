@@ -47,6 +47,12 @@ void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols);
 // Write all bytes. Returns 0 on success, -1 on error.
 int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len);
 
+// Canonical (line-assembly) mode on/off on the slave. RUN delivers its wrapper
+// raw (ICANON caps a line at MAX_CANON — 1024 on macOS — and drops the rest);
+// a parked step flips it on so user INPUT gets ^D / erase semantics.
+// No-op on Windows (ConPTY has no line discipline). Returns 0 on success.
+int bridge_pty_set_canon(bridge_pty_t *p, int on);
+
 // Read available bytes. Returns >=0 on success, -1 on error.
 long bridge_pty_read(bridge_pty_t *p, void *buf, size_t len);
 

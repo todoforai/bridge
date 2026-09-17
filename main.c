@@ -1220,6 +1220,9 @@ static int begin_drain_scan(session_t *s) {
     memmove(s->tail_buf, s->tail_buf + at, s->tail_len - at);
     s->tail_len -= at;
     s->draining_begin = 0;
+    // The shell has consumed the whole wrapper: back to canonical mode so a
+    // `read`/`cat` inside the command gets ^D and line editing on INPUT.
+    (void)bridge_pty_set_canon(&s->pty, 1);
     return 1;
 }
 
@@ -2162,6 +2165,9 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 
         send_run_started(e, s, created);
 
+        // Raw delivery: the wrapper is one long line and canonical mode would
+        // drop everything past MAX_CANON (1024 on macOS).
+        (void)bridge_pty_set_canon(&s->pty, 0);
         if (bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) != 0) {
             int werr = errno;
             free(wrapped);
