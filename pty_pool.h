@@ -23,7 +23,7 @@
 #include <stdint.h>
 #include "pty.h"
 
-#define PTY_POOL_MAX          5
+#define PTY_POOL_MAX          6
 #define PTY_POOL_THRESHOLD_MS 30
 #define PTY_POOL_MAX_AGE_MS   (10 * 60 * 1000)
 #define PTY_POOL_PROBE_CAP_MS 2000
