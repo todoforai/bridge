@@ -111,12 +111,26 @@ try {
              else                   { "$size B" }
     Ok "downloaded $asset $Tag ($human)"
 
-    $dest = Join-Path $Prefix 'todoforai-bridge.exe'
+    $dest  = Join-Path $Prefix 'todoforai-bridge.exe'
+    $alias = Join-Path $Prefix 'tfa-bridge.exe'
     # stop existing task if present so we can overwrite a running exe
     Get-ScheduledTask -TaskName 'TODOforAI Bridge' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
+    # A running image can't be overwritten on Windows, but it CAN be renamed
+    # (`todoforai-bridge update` runs from $dest itself; a bridge started by
+    # hand is not covered by the task stop above). Park the old files as
+    # *.old and let the next install sweep them.
+    foreach ($f in @($dest, $alias)) {
+        if (-not (Test-Path $f)) { continue }
+        $old = "$f.old"
+        Remove-Item -Force $old -ErrorAction SilentlyContinue
+        if (Test-Path $old) { $old = "$f.$([guid]::NewGuid().ToString('N').Substring(0,8)).old" }  # previous .old still running
+        Move-Item -Force $f $old
+    }
     Move-Item -Force $bin $dest
     # `tfa-bridge` alias alongside `todoforai-bridge` (no symlink privilege needed).
-    Copy-Item -Force $dest (Join-Path $Prefix 'tfa-bridge.exe')
+    Copy-Item -Force $dest $alias
+    Get-ChildItem -Path $Prefix -Filter '*.old' -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue   # succeeds once nothing runs from them
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
