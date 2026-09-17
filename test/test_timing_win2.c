@@ -14,6 +14,6 @@ int main(int argc,char**argv){
   bridge_pty_write_all(&p,script,strlen(script)); printf("%7.1f wrote\n",now_ms()-t0);
   char buf[65536]; double dl=now_ms()+5000; size_t tot=0;
   while(now_ms()<dl){long n=bridge_pty_read(&p,buf,sizeof buf-1);if(n<=0){Sleep(1);continue;}buf[n]=0;
-    printf("%7.1f read %ld: ",now_ms()-t0,n);for(long i=0;i<n&&i<120;i++){unsigned char c=buf[i];if(c==27)printf("\\e");else if(c<32)printf("\\x%02x",c);else putchar(c);}puts("");
-    tot+=n; if(strstr(buf,"__SENT__"))break;}
+    printf("%7.1f read %ld: ",now_ms()-t0,n);for(long i=0;i<n&&i<2000;i++){unsigned char c=buf[i];if(c==27)printf("\\e");else if(c<32)printf("\\x%02x",c);else putchar(c);}puts("");
+    tot+=n; if(strstr(buf,(argc>4?argv[4]:"__SENT__")))break;}
   printf("%7.1f done\n",now_ms()-t0); bridge_pty_signal(&p,9); bridge_pty_close(&p); return 0;}

@@ -1190,10 +1190,9 @@ static void tail_append(session_t *s, const uint8_t *data, size_t len) {
 //
 // The wrapper split-quotes the sentinel ('__BRIDGE_''BEGIN_…'), so the
 // ECHOED command never contains the contiguous marker — the first full match
-// is guaranteed to be the printf's real output. The shell runs sequentially,
-// so bytes between the marker and its '\n' can only be ConPTY VT decoration;
-// they are dropped without inspection (no terminator-adjacency requirement,
-// which ConPTY's escape injection would break).
+// is guaranteed to be the printf's real output. Only the marker and an
+// immediately following line ending are dropped (see below for why the
+// newline may never come on ConPTY).
 //
 // Fail-safe: if the marker still hasn't appeared after BEGIN_DRAIN_MAX drained
 // bytes (shell startup failed, non-bash shell mangled the wrapper, …), give up
@@ -1204,30 +1203,40 @@ static int begin_drain_scan(session_t *s) {
         ? memmem(s->tail_buf, s->tail_len, s->begin_sentinel, s->begin_len)
         : NULL;
     if (!m) {
-        s->begin_dropped += s->tail_len;
-        if (s->begin_dropped > BEGIN_DRAIN_MAX) {
-            fprintf(stderr, "begin drain overflow on %s — passing output through\n", s->session_id);
-            s->draining_begin = 0;
-            return 1;  // keep tail_buf as ordinary output
-        }
         // Drop all but a possible marker prefix.
         size_t keep = s->begin_len - 1;
         if (keep > s->tail_len) keep = s->tail_len;
+        s->begin_dropped += s->tail_len - keep;  // only what actually goes away
+        if (s->begin_dropped > BEGIN_DRAIN_MAX) {
+            fprintf(stderr, "begin drain overflow on %s — passing output through\n", s->session_id);
+            s->draining_begin = 0;
+            // Same canonical-mode restore as the normal exit below: the
+            // wrapper is long gone, so INPUT still needs ^D and line editing.
+            (void)bridge_pty_set_canon(&s->pty, 1);
+            return 1;  // keep tail_buf as ordinary output (redact_token still
+                       // scrubs the device token from anything we emit)
+        }
         memmove(s->tail_buf, s->tail_buf + s->tail_len - keep, keep);
         s->tail_len = keep;
         return 0;
     }
-    // Marker found: drop through the first '\n' after it.
+    // Marker found: drop it plus the "\r\n" / "\n" DIRECTLY after it — never
+    // scan ahead for a newline. ConPTY renders a screen, not a byte stream:
+    // when the command prints nothing, the printf's '\n' comes back as a
+    // cursor move (`\e[7;1H`, stripped by vt_strip) and the STEP sentinel
+    // follows the marker on the same "line". Scanning to the next '\n' then
+    // swallowed the result line → RUN hung until timeout (`true` ~20-40%
+    // on Windows, never with output).
     size_t at = (size_t)((uint8_t *)m - s->tail_buf) + s->begin_len;
-    while (at < s->tail_len && s->tail_buf[at] != '\n') at++;
-    if (at >= s->tail_len) {
-        // Newline not arrived — hold from the marker start.
         size_t start = (size_t)((uint8_t *)m - s->tail_buf);
+    if (at < s->tail_len && s->tail_buf[at] == '\r') at++;
+    if (at >= s->tail_len) {
+        // Line ending may still be in flight — hold from the marker start.
         memmove(s->tail_buf, s->tail_buf + start, s->tail_len - start);
         s->tail_len -= start;
         return 0;
     }
-    at++;  // past the '\n'
+    if (s->tail_buf[at] == '\n') at++;
     memmove(s->tail_buf, s->tail_buf + at, s->tail_len - at);
     s->tail_len -= at;
     s->draining_begin = 0;
@@ -1537,6 +1546,17 @@ static size_t vt_strip(vt_state_t *st, uint8_t *buf, size_t len) {
     return w;
 }
 
+// BRIDGE_DEBUG_PTY=1 ⇒ raw PTY read dumps (see forward_pty_output). Read once:
+// this sits in the hot read path.
+static int debug_pty_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("BRIDGE_DEBUG_PTY");
+        cached = (v && strcmp(v, "1") == 0);
+    }
+    return cached;
+}
+
 // Returns the number of bytes read this call (0 on EAGAIN/no data), so the
 // caller can keep draining while a full buffer suggests more is pending.
 static long forward_pty_output(edge_t *e, session_t *s) {
@@ -1544,6 +1564,23 @@ static long forward_pty_output(edge_t *e, session_t *s) {
     if (n_read <= 0) return 0;
     s->last_active_ms = monotonic_ms();
     long n = n_read;
+    // Diagnostics for drain/sentinel bugs (how the ConPTY newline-as-cursor-
+    // move bug was found): dumps RAW pre-strip, pre-drain bytes — i.e. the
+    // echoed wrapper WITH the device session token, and whatever the command
+    // prints. Never enable on a machine whose stderr you don't own; opt in
+    // deliberately with BRIDGE_DEBUG_PTY=1 (any other value is off).
+    if (debug_pty_enabled()) {
+        char line[2048];
+        int p = snprintf(line, sizeof line, "pty[%.8s] drain=%d state=%d tail=%zu read %ld: ",
+                         s->session_id, s->draining_begin, (int)s->state, s->tail_len, n_read);
+        for (long i = 0; i < n_read && p < (int)sizeof line - 8; i++) {
+            unsigned char c = e->pty_buf[i];
+            if (c == 27)      p += snprintf(line + p, sizeof line - p, "\\e");
+            else if (c < 32)  p += snprintf(line + p, sizeof line - p, "\\x%02x", c);
+            else              line[p++] = (char)c;
+        }
+        fprintf(stderr, "%.*s\n", p, line);  // one write: readable under load
+        }
 #ifdef _WIN32
     // ConPTY injects escapes mid-stream (even inside the sentinel). Strip
     // before anything scans or forwards these bytes. The READ count is what

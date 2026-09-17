@@ -84,9 +84,10 @@ static int scanner_cases(void) {
     int fails = 0;
     char out[4096];
 
-    // Marker + VT escapes between marker and newline (ConPTY decoration),
-    // then real output — split at EVERY chunk size to cover read boundaries.
-    const char *vt = "prompt$ echoed line\r\n__BRIDGE_BEGIN_cafe__\x1b[?25h\x1b[0m\r\nREAL\r\n";
+    // Echoed prompt line, then the marker + CRLF, then real output — split at
+    // EVERY chunk size to cover read boundaries. (On Windows vt_strip runs
+    // before this scanner, so escapes never reach it.)
+    const char *vt = "prompt$ echoed line\r\n__BRIDGE_BEGIN_cafe__\r\nREAL\r\n";
     for (size_t chunk = 1; chunk <= strlen(vt); chunk++) {
         session_t *s = mk_drain_sess();
         int done = feed_drain(s, vt, chunk, out, sizeof out);
@@ -94,8 +95,38 @@ static int scanner_cases(void) {
             fprintf(stderr, "[scanner-vt chunk=%zu] FAIL: done=%d out=%s\n", chunk, done, out);
             fails++; break;
         }
-    }
+        }
     if (!fails) fprintf(stderr, "[scanner-vt] OK (all chunk splits)\n");
+
+    // ConPTY regression: a command with NO output leaves the marker's newline
+    // as a cursor move (stripped by vt_strip), so the STEP result sentinel
+    // lands right behind the marker with no '\n' between them. Scanning for a
+    // newline swallowed the result line → the RUN hung until timeout.
+    {
+        const char *conpty = "prompt$ echoed line\r\n"
+                             "__BRIDGE_BEGIN_cafe____BRIDGE_STEP_beef__:0\r\n";
+        const char *want   = "__BRIDGE_STEP_beef__:0\r\n";
+        int bad = 0;
+        for (size_t chunk = 1; chunk <= strlen(conpty); chunk++) {
+        session_t *s = mk_drain_sess();
+            int done = feed_drain(s, conpty, chunk, out, sizeof out);
+            if (!done || strcmp(out, want) != 0) {
+                fprintf(stderr, "[scanner-conpty chunk=%zu] FAIL: done=%d out=%s\n", chunk, done, out);
+                fails++; bad = 1; break;
+        }
+        }
+        if (!bad) fprintf(stderr, "[scanner-conpty] OK (all chunk splits)\n");
+        }
+
+    // A lone '\r' after the marker (no '\n') must not eat the output byte.
+    {
+        session_t *s = mk_drain_sess();
+        int done = feed_drain(s, "__BRIDGE_BEGIN_cafe__\rout\r\n", 3, out, sizeof out);
+        if (!done || strcmp(out, "out\r\n") != 0) {
+            fprintf(stderr, "[scanner-lone-cr] FAIL: done=%d out=%s\n", done, out);
+            fails++;
+        } else fprintf(stderr, "[scanner-lone-cr] OK\n");
+        }
 
     // Echoed split-quoted copy must NOT terminate the drain early.
     {

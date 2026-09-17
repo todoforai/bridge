@@ -18,6 +18,15 @@
 #define MARKER_CMD "printf '\\nSP''ARE_READY\\n'\n"
 #define MARKER     "SPARE_READY"
 
+// Byte-substring search: glibc has memmem, MSVC/mingw CRT does not. The scan
+// is over ≤128 bytes of banner noise, so the naive loop is free.
+static const char *find_bytes(const char *h, size_t hl, const char *n, size_t nl) {
+    if (nl == 0) return h;
+    for (size_t i = 0; i + nl <= hl; i++)
+        if (h[i] == n[0] && memcmp(h + i, n, nl) == 0) return h + i;
+    return NULL;
+}
+
 typedef struct {
     bridge_pty_t pty;
     int64_t      spawned_ms;
@@ -127,7 +136,7 @@ static void spare_poll_ready(spare_t *sp) {
         long n = bridge_pty_read(&sp->pty, sp->rbuf + sp->rlen, sizeof sp->rbuf - sp->rlen);
         if (n <= 0) return;
         sp->rlen += (size_t)n;
-        if (memmem(sp->rbuf, sp->rlen, MARKER, sizeof MARKER - 1)) {
+        if (find_bytes(sp->rbuf, sp->rlen, MARKER, sizeof MARKER - 1)) {
             sp->ready = 1;
             sp->rlen = 0;
             // Drain the marker's trailing newline so the adopting RUN's
