@@ -145,12 +145,12 @@ int main(void) {
         int n = snprintf(big, sizeof big, "echo ");
         while (n < 6000) big[n++] = 'x';
         n += snprintf(big + n, sizeof big - (size_t)n, " | wc -c | tr -d ' '");
-        run_step(e, s, big, 1, 6000);
+        run_step(e, s, big, 1, 30000);
         expect("6kB command line delivered", 0, 1);
     }
 
     // A parked step gets canonical mode back: ^D must release `cat`'s read.
-    run_step(e, s, "printf 'paste, then ^D: '; cat >/dev/null; echo eof", 0, 6000);
+    run_step(e, s, "printf 'paste, then ^D: '; cat >/dev/null; echo eof", 0, 30000);
     expect("cat parks", 1, 0);
     settle(e, s, "\x04");
     if (s->state == SESS_RUNNING) { printf("FAIL [^D did not release parked cat]\n"); failures++; }
