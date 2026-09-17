@@ -482,8 +482,22 @@ static int output_tail_is_prompt(const session_t *s) {
 // cannot make ^D release it (lost ~1/40 steps under load). Done by the shell
 // itself, the flip sits on the shell's own timeline — no race against the
 // event loop's marker scan, which keeps flipping as the no-stty fallback.
-// Cost: one fork+exec, ~0.6 ms.
-#define CANON_ON "stty icanon 2>/dev/null; "
+// Cost: one fork+exec, ~0.6 ms on Linux.
+//
+// macOS: empty. XNU has no such latch — a reader already blocked in a raw
+// read() picks up ICANON from a later tcsetattr and ^D releases it (probe:
+// 40/40 on macOS, 0/40 on Linux), so the bridge-side flip after the begin
+// marker (begin_drain_scan → bridge_pty_set_canon) is sufficient. The marker
+// is printed only after the shell has parsed the whole wrapper, so the
+// PENDIN/MAX_CANON hazard of flipping early does not apply either. What the
+// stty cost there: fork+exec is ~75 ms on macOS, i.e. most of a pooled step.
+// Windows: stty is an MSYS fork too, but bridge_pty_set_canon is a no-op on
+// ConPTY, so the in-wrapper call stays until measured separately.
+#ifdef __APPLE__
+#  define CANON_ON ""
+#else
+#  define CANON_ON "stty icanon 2>/dev/null; "
+#endif
 
 typedef struct {
     ws_t ws;
@@ -1240,9 +1254,10 @@ static int begin_drain_scan(session_t *s) {
     memmove(s->tail_buf, s->tail_buf + at, s->tail_len - at);
     s->tail_len -= at;
     s->draining_begin = 0;
-    // Fallback for a shell without stty (CANON_ON): the wrapper is consumed,
-    // restore canonical mode so INPUT gets ^D and line editing. Racy on its
-    // own — the command may already sit in a raw-mode read — hence CANON_ON.
+    // Restore canonical mode so INPUT gets ^D and line editing: the primary
+    // path on macOS (CANON_ON is empty there), the no-stty fallback on Linux
+    // where a reader already blocked in raw mode would not pick this up —
+    // hence the in-wrapper stty (see CANON_ON).
     (void)bridge_pty_set_canon(&s->pty, 1);
     return 1;
 }
