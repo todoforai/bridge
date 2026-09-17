@@ -474,6 +474,16 @@ static int output_tail_is_prompt(const session_t *s) {
 #define SUDO_ASKPASS_FN \
     "[ -n \"$SUDO_ASKPASS\" ] && sudo() ( for a; do case $a in --) break;; --stdin|-S|-[!-]*S*) exec sudo \"$@\";; esac; done; exec sudo -A \"$@\" ); "
 
+// First thing a RUN wrapper does. The wrapper is delivered with ICANON off
+// (MAX_CANON, see bridge_pty_spawn) and must be back on BEFORE the command
+// runs: a Linux reader that enters read() in raw mode latches minimum=1 and
+// never sees the 0-byte canonical EOF, so a later tcsetattr from the bridge
+// cannot make ^D release it (lost ~1/40 steps under load). Done by the shell
+// itself, the flip sits on the shell's own timeline — no race against the
+// event loop's marker scan, which keeps flipping as the no-stty fallback.
+// Cost: one fork+exec, ~0.6 ms.
+#define CANON_ON "stty icanon 2>/dev/null; "
+
 typedef struct {
     ws_t ws;
     noise_ws_t noise;
@@ -1220,8 +1230,9 @@ static int begin_drain_scan(session_t *s) {
     memmove(s->tail_buf, s->tail_buf + at, s->tail_len - at);
     s->tail_len -= at;
     s->draining_begin = 0;
-    // The shell has consumed the whole wrapper: back to canonical mode so a
-    // `read`/`cat` inside the command gets ^D and line editing on INPUT.
+    // Fallback for a shell without stty (CANON_ON): the wrapper is consumed,
+    // restore canonical mode so INPUT gets ^D and line editing. Racy on its
+    // own — the command may already sit in a raw-mode read — hence CANON_ON.
     (void)bridge_pty_set_canon(&s->pty, 1);
     return 1;
 }
@@ -2108,7 +2119,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + s->begin_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
                              + sizeof(idenv) + sizeof(e->api_url)
-                             + sizeof(fenv) + sizeof(cenv) + 320;
+                             + sizeof(fenv) + sizeof(cenv) + 384;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
@@ -2125,7 +2136,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 (int)cmd_len, cmd, s->sentinel + 9);
         } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
-                "printf '\\n__BRIDGE_''%s\\n'; "
+                CANON_ON "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
                 "TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; " SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
@@ -2137,7 +2148,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
-                "printf '\\n__BRIDGE_''%s\\n'; "
+                CANON_ON "printf '\\n__BRIDGE_''%s\\n'; "
                 "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=%s%s%s; "
                 SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
@@ -2166,7 +2177,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         send_run_started(e, s, created);
 
         // Raw delivery: the wrapper is one long line and canonical mode would
-        // drop everything past MAX_CANON (1024 on macOS).
+        // drop everything past MAX_CANON (1024 on macOS). ICANON comes back
+        // from inside the wrapper (CANON_ON) — flipping it from here before
+        // the shell has consumed the line is unsafe: XNU re-runs the pending
+        // raw bytes through the canonical path (PENDIN) and hits MAX_CANON
+        // again, and Linux likewise over ~4 kB.
         (void)bridge_pty_set_canon(&s->pty, 0);
         if (bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) != 0) {
             int werr = errno;

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -48,8 +49,8 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     // RUN (sentinels + env exports + the command) easily exceeds 1 kB, so
     // every tool install on a Mac never reached the shell and died as
     // "failed to deliver command to shell". ISIG (^C) works without ICANON;
-    // VEOF/erase only matter for user INPUT, so park_step turns ICANON on
-    // for the duration of a parked step (bridge_pty_set_canon).
+    // VEOF/erase only matter for user INPUT, so the RUN wrapper turns ICANON
+    // back on before the command runs (CANON_ON / bridge_pty_set_canon).
     t.c_lflag = ISIG | IEXTEN;              // control chars raise signals; no line assembly
     if (!no_echo) t.c_lflag |= ECHO | ECHOE | ECHOK;
 
@@ -144,9 +145,16 @@ void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols) {
     (void)ioctl(p->master_fd, TIOCSWINSZ, &ws);
 }
 
+static long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
     const uint8_t *b = buf;
     size_t written = 0;
+    long deadline = 0;   // set on first EAGAIN; 5 s of no input progress
     while (written < len) {
         ssize_t n = write(p->master_fd, b + written, len - written);
         if (n < 0) {
@@ -156,9 +164,28 @@ int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
                 // stopped / not reading stdin). Wait for writability with a
                 // deadline instead of spinning — a wedged child must fail the
                 // write, not freeze the whole single-threaded bridge.
-                struct pollfd pf = { .fd = p->master_fd, .events = POLLOUT };
-                int pr = poll(&pf, 1, 5000);
-                if (pr > 0 && (pf.revents & POLLOUT)) continue;
+                //
+                // Also drain the master while waiting: with ECHO on (a command
+                // ran `stty echo`) the line discipline echoes every input byte
+                // into the pty OUTPUT queue, which is ~1 kB on macOS. Nobody
+                // reads it from inside this loop, so a >1 kB wrapper stalls at
+                // ~1022 bytes, POLLOUT never fires and the step dies as
+                // "failed to deliver" (Linux hides it with a 64 kB queue).
+                // Dropping those bytes is safe for a RUN wrapper: the shell
+                // executes nothing before the newline, so anything arriving
+                // mid-write is echo, and begin-sentinel draining discards
+                // pre-marker output anyway.
+                long now = mono_ms();
+                if (!deadline) deadline = now + 5000;
+                if (now >= deadline) { errno = ETIMEDOUT; return -1; }
+                struct pollfd pf = { .fd = p->master_fd, .events = POLLOUT | POLLIN };
+                int pr = poll(&pf, 1, (int)(deadline - now));
+                if (pr > 0 && (pf.revents & POLLOUT)) { deadline = 0; continue; }
+                if (pr > 0 && (pf.revents & POLLIN)) {
+                    uint8_t sink[1024];
+                    (void)!read(p->master_fd, sink, sizeof sink);
+                    continue;
+                }
                 errno = ETIMEDOUT;
                 return -1;
             }
@@ -174,12 +201,15 @@ int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
 //
 // Off while a RUN wrapper is delivered: ICANON caps a line at MAX_CANON
 // (1024 macOS / 4096 Linux) and silently drops the rest, which is how every
-// Mac tool install died. On again once the begin sentinel arrives — proof the
-// shell consumed the wrapper — so a `read`/`cat` in the command enters its
-// read() under ICANON and VEOF (^D) releases it. (Flipping later does not
-// help: a Linux reader that entered in raw mode latched minimum=1 and never
-// returns 0 bytes.) `on` is skipped when ISIG/IEXTEN are gone — a program
-// already put the tty in raw mode and owns it.
+// Mac tool install died. Back on for the command's INPUT so a `read`/`cat`
+// enters its read() under ICANON and VEOF (^D) releases it. That flip is
+// done by the shell itself (`stty icanon`, CANON_ON in main.c): flipping
+// from here is either too early — XNU re-runs pending raw bytes through the
+// canonical path (PENDIN) and MAX_CANON bites again — or too late — a Linux
+// reader that already entered read() in raw mode latched minimum=1 and
+// never returns 0 bytes, so ^D was lost ~1/40 steps under load. `on` here
+// is only the fallback for a missing stty, and is skipped when ISIG/IEXTEN
+// are gone — a program already put the tty in raw mode and owns it.
 int bridge_pty_set_canon(bridge_pty_t *p, int on) {
     struct termios t;
     if (tcgetattr(p->master_fd, &t) != 0) return -1;

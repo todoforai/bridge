@@ -71,7 +71,7 @@ static void run_step(edge_t *e, session_t *s, const char *cmd, int no_input, int
     s->begin_dropped = 0;
     char wrapped[16384];
     int wn = snprintf(wrapped, sizeof wrapped,
-        "printf '\\n__BRIDGE_''%s\\n'; { %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+        "stty icanon; printf '\\n__BRIDGE_''%s\\n'; { %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
         s->begin_sentinel + 9, cmd, s->sentinel);
     assert(wn > 0 && (size_t)wn < sizeof wrapped);
     (void)bridge_pty_set_canon(&s->pty, 0);   // as the RUN handler does
