@@ -94,7 +94,12 @@ static const char *ABSOLUTE_CANDIDATE_DIRS[] = {
     "/opt/homebrew/sbin",
     "/usr/local/bin",                 // Homebrew, Intel mac (and classic Unix)
     "/usr/local/sbin",
-    "/home/linuxbrew/.linuxbrew/bin", // Linuxbrew
+#ifdef __linux__
+    // Linuxbrew — Linux only: on macOS /home is an autofs automount, and
+    // every stat() under it triggers the automounter (directory-services
+    // lookup): 365 ms measured, seconds under load — on each spawn.
+    "/home/linuxbrew/.linuxbrew/bin",
+#endif
     NULL,
 };
 
