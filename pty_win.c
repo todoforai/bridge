@@ -113,6 +113,13 @@ static int is_wsl_stub(const char *path) {
     return _strnicmp(path, sysdir, n) == 0;
 }
 
+// True for a bash binary (bash.exe / bash), which accepts --norc --noprofile.
+static int bridge_shell_is_bash(const char *sh) {
+    const char *base = sh;
+    for (const char *p = sh; *p; p++) if (*p == '\\' || *p == '/') base = p + 1;
+    return _stricmp(base, "bash.exe") == 0 || _stricmp(base, "bash") == 0;
+}
+
 // Public (identity.c reports it; main.c RUN pre-checks it) so the shell the
 // backend/agent sees is the shell that actually spawns — never a guess.
 const char *bridge_pty_resolve_shell(const char *shell) {
@@ -243,7 +250,11 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     const char *sh = bridge_pty_resolve_shell(shell);
     char cmdline[MAX_PATH + 32];
     // Quoting: shell path may contain spaces. ConPTY child gets argv[0] = sh.
-    snprintf(cmdline, sizeof(cmdline), "\"%s\"", sh);
+    // bash: skip /etc/profile + ~/.bashrc (git-prompt.sh etc.) — measured
+    // ~230 ms of every one-shot RUN on Git for Windows (bash 280 ms vs sh 42 ms
+    // to first sentinel). PATH/MSYSTEM are inherited from our env anyway.
+    snprintf(cmdline, sizeof(cmdline), "\"%s\"%s", sh,
+             bridge_shell_is_bash(sh) ? " --norc --noprofile" : "");
 
     // Job object: groups the shell with every process it spawns. Closing the
     // job handle (or TerminateJobObject) kills the whole tree at once — the

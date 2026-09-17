@@ -146,7 +146,12 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
         // that can't be applied is fatal — running unconfined would silently
         // void the policy.
         if (bridge_policy_jail_child() != 0) _exit(3);
-        char *argv[] = { (char *)shell, NULL };
+        // bash: skip /etc/profile + ~/.bashrc — the rc files (prompt helpers,
+        // nvm/conda init, …) cost tens to hundreds of ms per one-shot RUN and
+        // the wrapper sets everything it needs (PS1/PS2/PATH/pagers) itself.
+        const char *base = strrchr(shell, '/'); base = base ? base + 1 : shell;
+        int is_bash = strcmp(base, "bash") == 0;
+        char *argv[] = { (char *)shell, is_bash ? "--norc" : NULL, is_bash ? "--noprofile" : NULL, NULL };
         execvp(shell, argv);
         _exit(1);
     }
