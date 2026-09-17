@@ -1931,6 +1931,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // so it can't be shipped under this session's id.
             s->obuf_len = 0;
             s->obuf_since_ms = 0;
+            // ConPTY: the previous occupant's last read may have ended
+            // mid-escape (e.g. `\e[?200|4h`), leaving the stripper in
+            // VT_CSI_*/VT_OSC — it would then swallow this shell's bytes up
+            // to the next final byte/BEL, sentinel included.
+            memset(&s->vt, 0, sizeof s->vt);
             s->active = 1;
             s->state = SESS_IDLE;
             s->tail_len = 0;
