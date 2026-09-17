@@ -1121,44 +1121,107 @@ static void ob_reset(out_policy_t *ob);
 // MSYS bash reads console input a character at a time and pays ~0.32 ms per
 // character (measured on Git for Windows: a 700-byte line costs 236 ms, while
 // eight commands in 66 bytes cost 31 ms — the price is per byte, not per
-// command). The wrapper is ~400-800 bytes of exports and sentinels, so typing
+// command). The wrapper is ~400-1300 bytes of exports and sentinels, so typing
 // it in dominates every Windows step. Writing it to a file and sending only
-// `. '<path>'` cuts a captured production wrapper from 127 ms to 31 ms.
+// `. '<path>'` cuts a captured production wrapper from 127 ms to 31 ms, and a
+// full RUN round-trip from 424 ms to 176 ms.
 //
-// The file is not self-deleting: bash re-reads a sourced file as it executes,
-// so an `rm` on its first line hangs the step. The bridge unlinks it in
-// run_finish (and before staging the next one).
+// The file is not self-deleting: bash keeps a sourced file open and re-reads
+// it as it executes, so an `rm` on its first line hangs the step (measured).
+// The bridge owns the lifetime: unlink at run_finish, after shell teardown.
 //
-// It carries the same device token the shell's environment gets, so it lives
-// in the per-user temp dir with a random name and 0600 permissions — no worse
-// exposure than the env block, and gone when the step ends.
+// It carries the same device token the shell's environment gets. GetTempPath
+// is per-user on a default Windows install (…\Users\<u>\AppData\Local\Temp,
+// ACL'd to that user), and CREATE_NEW never adopts a file someone else
+// planted at the name — but TMP is user-settable, so a shared temp dir keeps
+// only the random name, not access control. Exposure window is one step.
+#ifdef _WIN32
+// Deletion can fail while the shell still has the file open — a RUN that
+// timed out keeps executing, and its shell holds the wrapper. Dropping the
+// path there would leak a token-bearing file forever, so a failed unlink
+// parks the path here and every later unstage retries the whole set.
+#define WRAPPER_PENDING_MAX 32
+static char g_wrapper_pending[WRAPPER_PENDING_MAX][sizeof(((session_t *)0)->wrapper_path)];
+
+static void wrapper_pending_retry(void) {
+    for (int i = 0; i < WRAPPER_PENDING_MAX; i++) {
+        if (!g_wrapper_pending[i][0]) continue;
+        if (remove(g_wrapper_pending[i]) == 0 || errno == ENOENT) g_wrapper_pending[i][0] = '\0';
+    }
+}
+
+static void wrapper_pending_park(const char *path) {
+    for (int i = 0; i < WRAPPER_PENDING_MAX; i++) {
+        if (g_wrapper_pending[i][0]) continue;
+        snprintf(g_wrapper_pending[i], sizeof g_wrapper_pending[i], "%s", path);
+        return;
+    }
+    // All slots busy (32 shells wedged holding wrappers): drop the path. The
+    // file stays until the startup sweep of a later bridge collects it.
+    fprintf(stderr, "wrapper cleanup backlog full, leaving %s for the next sweep\n", path);
+}
+#endif
+
 static void unstage_wrapper_file(session_t *s) {
 #ifdef _WIN32
-    if (s->wrapper_path[0]) { (void)remove(s->wrapper_path); s->wrapper_path[0] = '\0'; }
+    wrapper_pending_retry();
+    if (!s->wrapper_path[0]) return;
+    if (remove(s->wrapper_path) != 0 && errno != ENOENT) wrapper_pending_park(s->wrapper_path);
+    s->wrapper_path[0] = '\0';
 #else
     (void)s;
 #endif
 }
 
 #ifdef _WIN32
-// Writes `wrapped` to a fresh temp file and returns the shell line that
-// sources it (`. '<path>'`), or NULL if staging failed — the caller then
-// sends the wrapper inline, which is slow but correct.
+// Crash residue: a killed bridge never unlinks its staged wrappers. Sweep at
+// startup, but only files older than a day — a concurrently running bridge
+// (other profile) must not lose the wrapper of a step in flight.
+static void wrapper_sweep_stale(void) {
+    char dir[MAX_PATH], pat[MAX_PATH + 32];
+    DWORD dn = GetTempPathA((DWORD)sizeof dir, dir);
+    if (dn == 0 || dn >= sizeof dir) return;
+    if (snprintf(pat, sizeof pat, "%stfa-run-*.sh", dir) >= (int)sizeof pat) return;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    uint64_t now100 = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    do {
+        uint64_t mt = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (now100 <= mt || now100 - mt < 24ULL * 3600 * 10000000) continue;  // 100ns ticks
+        char path[MAX_PATH * 2];
+        if (snprintf(path, sizeof path, "%s%s", dir, fd.cFileName) < (int)sizeof path) (void)remove(path);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+// Writes `wrapped` to a fresh temp file and emits the shell line that sources
+// it (`. '<path>'\n`) into `out`; returns its length, or -1 if staging failed
+// — the caller then sends the wrapper inline, which is slow but correct.
 static int stage_wrapper_file(session_t *s, const char *wrapped, size_t wn,
                               char *out, size_t out_cap) {
     unstage_wrapper_file(s);
     char dir[MAX_PATH];
     DWORD dn = GetTempPathA((DWORD)sizeof dir, dir);
     if (dn == 0 || dn >= sizeof dir) return -1;
+    // The path is created through the ANSI API but typed into a UTF-8 ConPTY:
+    // outside ASCII the two disagree, and bash would open a different name (or
+    // none) with no sentinel to end the step. Stay inline for such a temp dir.
+    // Forward slashes because bash reads `\` as an escape even in '…'.
+    for (DWORD i = 0; i < dn; i++) {
+        if ((unsigned char)dir[i] >= 0x80 || dir[i] == '\'') return -1;
+        if (dir[i] == '\\') dir[i] = '/';
+    }
     uint8_t rnd[8];
     noise_random(rnd, sizeof rnd);
     char hex[17];
     hex_encode(hex, rnd, sizeof rnd);
-    // Forward slashes: the path goes through bash, which treats `\` as an
-    // escape even inside a single-quoted Windows path like C:\Users\...
-    for (DWORD i = 0; i < dn; i++) if (dir[i] == '\\') dir[i] = '/';
     if (snprintf(s->wrapper_path, sizeof s->wrapper_path, "%stfa-run-%s.sh", dir, hex)
             >= (int)sizeof s->wrapper_path) { s->wrapper_path[0] = '\0'; return -1; }
+    int n = snprintf(out, out_cap, ". '%s'\n", s->wrapper_path);
+    if (n <= 0 || (size_t)n >= out_cap) { s->wrapper_path[0] = '\0'; return -1; }
     // CREATE_NEW: never adopt a file another process planted at this name.
     HANDLE h = CreateFileA(s->wrapper_path, GENERIC_WRITE, 0, NULL, CREATE_NEW,
                            FILE_ATTRIBUTE_TEMPORARY, NULL);
@@ -1167,11 +1230,6 @@ static int stage_wrapper_file(session_t *s, const char *wrapped, size_t wn,
     BOOL ok = WriteFile(h, wrapped, (DWORD)wn, &written, NULL) && written == (DWORD)wn;
     CloseHandle(h);
     if (!ok) { unstage_wrapper_file(s); return -1; }
-    // The path is bridge-generated (temp dir + hex), so it holds no quote to
-    // escape; refuse it rather than build a broken command if that ever fails.
-    if (strchr(s->wrapper_path, '\'')) { unstage_wrapper_file(s); return -1; }
-    int n = snprintf(out, out_cap, ". '%s'\n", s->wrapper_path);
-    if (n <= 0 || (size_t)n >= out_cap) { unstage_wrapper_file(s); return -1; }
     return n;
 }
 #endif
@@ -1212,7 +1270,6 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
 // (RUN carried a sessionId) survive.
 static void run_finish(session_t *s) {
     s->state = SESS_IDLE;
-    unstage_wrapper_file(s);
     s->tail_len = 0;
     s->deadline_ms = 0;
     s->run_block_id_len = 0;
@@ -1233,6 +1290,10 @@ static void run_finish(session_t *s) {
         s->active = 0;
         s->one_shot = 0;
     }
+    // After teardown: a timed-out step's shell keeps running and keeps the
+    // wrapper open, so the unlink can fail — unstage_wrapper_file retries it
+    // on later steps rather than forgetting the path.
+    unstage_wrapper_file(s);
 }
 
 // Search tail_buf for sentinel start (returns offset, or -1 if absent).
@@ -3692,6 +3753,9 @@ int bridge_main(int argc, char **argv) {
         size_t in_n = build_init_line(init_line, sizeof init_line);
         pty_pool_init(DEFAULT_SHELL, init_line, in_n);
     }
+#ifdef _WIN32
+    wrapper_sweep_stale();   // wrappers a killed bridge never got to unlink
+#endif
 
     g_max_sessions = resolve_max_sessions();
     // Each session needs a master fd + a few transient pipes in the child
