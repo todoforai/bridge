@@ -125,7 +125,14 @@ int bridge_update_apply(void) {
     }
     // The path goes into a shell command line; refuse anything that could end
     // the quoted string. Install dirs are plain paths — a quote in one is a bug.
-    if (strpbrk(dir, "'\"`$\\\n\r")) {
+    // Backslash is the Windows path separator and inert inside a PowerShell
+    // single-quoted string, so it is only rejected on POSIX.
+#ifdef _WIN32
+    static const char BAD[] = "'\"`$\n\r";
+#else
+    static const char BAD[] = "'\"`$\\\n\r";
+#endif
+    if (strpbrk(dir, BAD)) {
         fprintf(stderr, "update: install path contains shell metacharacters (%s)\n", dir);
         return 1;
     }
