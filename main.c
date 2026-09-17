@@ -491,9 +491,12 @@ static int output_tail_is_prompt(const session_t *s) {
 // is printed only after the shell has parsed the whole wrapper, so the
 // PENDIN/MAX_CANON hazard of flipping early does not apply either. What the
 // stty cost there: fork+exec is ~75 ms on macOS, i.e. most of a pooled step.
-// Windows: stty is an MSYS fork too, but bridge_pty_set_canon is a no-op on
-// ConPTY, so the in-wrapper call stays until measured separately.
-#ifdef __APPLE__
+//
+// Windows: empty too. ConPTY has no host-side ICANON, so the bridge never
+// turns it off (bridge_pty_set_canon is a no-op) and the MSYS stty only
+// re-sets a bit that is already set — for the price of an MSYS fork, 16 ms
+// of a 32 ms pooled step (measured on Git for Windows bash).
+#if defined(__APPLE__) || defined(_WIN32)
 #  define CANON_ON ""
 #else
 #  define CANON_ON "stty icanon 2>/dev/null; "
