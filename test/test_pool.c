@@ -110,7 +110,7 @@ int main(void) {
     int fails = 0;
     setenv("BRIDGE_SPARES", "2", 1);
     {
-        char init_line[96];
+        char init_line[256];
         size_t in_n = build_init_line(init_line, sizeof init_line);
         pty_pool_init(DEFAULT_SHELL, init_line, in_n);
     }

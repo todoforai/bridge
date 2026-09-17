@@ -174,7 +174,7 @@ static int run_case(const char *label, const char *cmd, const char *expect_out) 
     snprintf(s->session_id, sizeof s->session_id, "00000000-0000-4000-8000-000000000000");
 
     // Best-effort echo suppression, exactly like the RUN handler.
-    char init_line[96];
+    char init_line[256];
     size_t in_n = build_init_line(init_line, sizeof init_line);
     assert(in_n > 0);
     assert(bridge_pty_write_all(&s->pty, init_line, in_n) == 0);
