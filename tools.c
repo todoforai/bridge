@@ -12,7 +12,9 @@
 //     probe thread held at fork time. Windows: the shell is resolved once up
 //     front (bridge_pty_resolve_shell returns a static buffer).
 //   - "installed" = versionCmd exited 0 with non-empty stdout,
-//                   OR (no versionCmd AND statusCmd exited 0)
+//                   OR (no versionCmd AND statusCmd exited 0),
+//                   OR the binary is on PATH and its versionCmd never
+//                     returned an exit status (deadline / spawn failure)
 //   - "authenticated" = statusCmd exited 0 (absent statusCmd ⇒ true)
 
 #define _POSIX_C_SOURCE 200809L
@@ -49,7 +51,15 @@
 
 #define PARALLEL_WORKERS 16
 
-#define VERSION_TIMEOUT_MS 5000
+// A cold node/bun CLI needs ~2 s just to print its version, and 16 probe
+// threads sharing a CPU push that past 8 s (measured: 16×`canva --version`
+// = 8.2 s wall on an M-series Mac), so 5 s lost their version strings.
+// Not raised further: a probe that times out here AND on its status check
+// holds a worker for VERSION+STATUS ms, and 88 catalog entries over 16
+// workers must still fit the scan's 230 s budget. Overshooting is no longer
+// fatal anyway — the presence fallback in probe_run keeps such a tool
+// "installed", it just loses the version string until the next scan.
+#define VERSION_TIMEOUT_MS 10000
 #define STATUS_TIMEOUT_MS  10000
 #define OUT_CAP            2048  // trim captured output — multi-account tools (e.g. zele whoami) need >200B
 #define VERSION_CAP        100
@@ -467,7 +477,8 @@ typedef struct {
 
 // ── Version cache (~/.todoforai/tools_cache.json) ───────────────────────────
 // `<tool> --version` is the expensive half of a probe (node/python startup,
-// 5 s deadline) and its answer only changes when the binary does. Keyed by
+// VERSION_TIMEOUT_MS deadline) and its answer only changes when the binary
+// does. Keyed by
 // tool; an entry is reused when the fingerprint (resolved path + `ls -ldL`
 // line: perms, size, mtime to the minute) AND the versionCmd match. A
 // same-size, same-minute in-place replacement would keep a stale version
@@ -706,6 +717,16 @@ static void probe_run(probe_t *p) {
         if (p->have_v) p->v_exit = run_shell(p->vcmd, VERSION_TIMEOUT_MS, p->version_out, sizeof(p->version_out));
     }
     p->installed = (p->have_v && p->v_exit == 0 && p->version_out[0] != '\0');
+    // A versionCmd that never returned an exit status (v_exit < 0: deadline,
+    // spawn failure, killed shell) is not evidence of absence — a real "not
+    // installed" shell exit is 1/127, which is >= 0. presence_scan resolved
+    // this binary on PATH. Heavy node CLIs cost ~2 s to print a version alone
+    // and blow past VERSION_TIMEOUT_MS when 16 probe threads run at once, so a
+    // just-installed tool would report as missing and the install would be
+    // called a failure. Interpreters are excluded: `node` being present says
+    // nothing about the package its versionCmd actually versions.
+    if (!p->installed && p->present == 1 && p->v_exit < 0 && !is_interpreter(p->bin))
+        p->installed = 1;
     // statusCmd only matters once installed (or as the sole installed-check
     // when there's no versionCmd); a known-absent tool's auth is never emitted.
     if (p->have_s && (p->installed || !p->have_v))

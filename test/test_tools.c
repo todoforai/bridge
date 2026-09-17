@@ -144,6 +144,44 @@ int main(void) {
               "timed-out status probe omits authenticated");
     }
 
+    // A slow versionCmd for a binary that IS on PATH must not read as absent:
+    // heavy node CLIs blow the version deadline under a parallel scan, and a
+    // freshly installed tool reporting "not installed" fails its own install.
+    // `ls` (not `sh`): interpreters are excluded from the fallback, since
+    // their presence says nothing about the package they version.
+    {
+        char cv[512], slow[2048];
+        enc("ls -d /; sleep 30", cv, sizeof(cv));
+        size_t sn = (size_t)snprintf(slow, sizeof(slow), "ls\t%s\t", cv);
+        len = bridge_scan_tools(slow, sn, out, sizeof(out), &st);
+        // No `version`: the probe never finished, so the half-read output must
+        // not be published (and save_cache must not keep it either).
+        CHECK(len > 0 && strstr(out, "\"ls\":{\"installed\":true}") != NULL,
+              "present binary with a timed-out versionCmd stays installed, without a version");
+    }
+
+    // The fallback is for *no verdict* only: a versionCmd that ran and failed
+    // still means absent, even for a binary sitting on PATH.
+    {
+        char cv[512], bad[2048];
+        enc("ls -d /nonexistent-xyz", cv, sizeof(cv));
+        size_t sn = (size_t)snprintf(bad, sizeof(bad), "ls\t%s\t", cv);
+        len = bridge_scan_tools(bad, sn, out, sizeof(out), &st);
+        CHECK(len > 0 && strstr(out, "\"ls\":{\"installed\":false") != NULL,
+              "versionCmd that ran and failed still reports absent");
+    }
+
+    // Interpreters opt out: `sh` is on every PATH, but its versionCmd may be
+    // versioning some unrelated package.
+    {
+        char cv[512], slow[2048];
+        enc("sh -c 'sleep 30'", cv, sizeof(cv));
+        size_t sn = (size_t)snprintf(slow, sizeof(slow), "sh\t%s\t", cv);
+        len = bridge_scan_tools(slow, sn, out, sizeof(out), &st);
+        CHECK(len > 0 && strstr(out, "\"sh\":{\"installed\":false") != NULL,
+              "interpreter with a timed-out versionCmd is not assumed installed");
+    }
+
     printf("%s\n", fails ? "FAILED" : "PASSED");
     return fails ? 1 : 0;
 }
