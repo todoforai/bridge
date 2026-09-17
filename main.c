@@ -2954,6 +2954,13 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 // Idle sessions live forever; slot pressure handled via LRU on the next RUN.
 static void service_sessions(edge_t *e) {
     int64_t now = monotonic_ms();
+#ifdef _WIN32
+    // Wrappers whose unlink lost to a shell that still had the file open.
+    // Driven from the service loop, not from the next step: the holder may be
+    // a parked session that never runs another step (see wrapper_pending_*).
+    static int64_t last_wrapper_retry;
+    if (now - last_wrapper_retry >= 1000) { last_wrapper_retry = now; wrapper_pending_retry(); }
+#endif
 
     // Reap exited shells; if a step was in flight, surface STEP_DONE first
     // so the backend's pending RUN promise settles cleanly.
