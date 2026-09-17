@@ -139,9 +139,15 @@ int bridge_update_apply(void) {
 
     char cmd[2048];
 #ifdef _WIN32
+    // ONE level of double quotes: system() goes through cmd.exe, which knows
+    // nothing about `\"` escaping — it just toggles on every `"`, so the inner
+    // quotes ended the string early and cmd tried to run `& { … }` itself
+    // ("'{' is not recognized", update was broken on every Windows host).
+    // The install dir travels in TODOFORAI_PREFIX (install.ps1 reads it as the
+    // -Prefix fallback), which keeps the command free of nested quoting.
     snprintf(cmd, sizeof cmd,
              "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-             "\"iex \\\"& { $(irm https://todofor.ai/bridge.ps1) } -Prefix '%s'\\\"\"", dir);
+             "\"$env:TODOFORAI_PREFIX='%s'; iex (irm https://todofor.ai/bridge.ps1)\"", dir);
 #else
     // Download the installer to a temp file first: piping it into `sh` would
     // leave the script no stdin, and a truncated download would execute as a
