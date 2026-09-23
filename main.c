@@ -2749,7 +2749,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             #  define RFB_ISREG(st)        S_ISREG((st).st_mode)
             #endif
             #define RFB_CHUNK_MAX 45000L
-            #define RFB_MAX_FILE  (50LL * 1000 * 1000)
+            // Per-chunk reads: this process never holds more than one chunk.
+            // The whole-file (reassembling) path is capped at 50MB by the
+            // backend; ranged snippet reads go up to this.
+            #define RFB_MAX_FILE  (200LL * 1000 * 1000)
 
             #define RFB_FAIL(msg) do { \
                 send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, (msg)); \
@@ -2776,7 +2779,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (expanded) { free(path); path = expanded; }
 
             // Same LLP64 caveat as write_file_b64: offsets >2GB unsupported on
-            // Windows — irrelevant under the 50MB file cap.
+            // Windows — irrelevant under the 200MB file cap.
             long offset = 0, length = RFB_CHUNK_MAX;
             json_get_long(args, args_len, "offset", &offset);
             json_get_long(args, args_len, "length", &length);
@@ -2802,7 +2805,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             if (rfb_fstat(fd, &st) != 0) RFB_FAIL("read_file_b64: stat failed");
             if (!RFB_ISREG(st)) RFB_FAIL("read_file_b64: not a regular file");
             int64_t total = (int64_t)st.st_size;
-            if (total > RFB_MAX_FILE) RFB_FAIL("read_file_b64: file too large (max 50MB)");
+            if (total > RFB_MAX_FILE) RFB_FAIL("read_file_b64: file too large (max 200MB)");
 
             data = malloc((size_t)length);
             if (!data) RFB_FAIL("out of memory");
