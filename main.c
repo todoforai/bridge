@@ -531,6 +531,11 @@ typedef struct {
     // TODOs. Keyed by the todo itself (scramjet pattern): only that todo's
     // dispatch ever resolves it, and reconnects land in the same session slot.
     int  mayfly;
+    // The spawning CLI's pid. A mayfly is meaningless past its CLI: the todo is
+    // scoped to this session alone, so if the CLI is SIGKILLed (no handler ran
+    // to stop the run or us) we must not linger as an orphan the agent keeps
+    // driving. Checked each loop tick; 0 = not tracked (Windows, hand-run).
+    long mayfly_parent_pid;
     char mayfly_todo_id[40];     // the todo this session is scoped to (CLI-minted)
     char mayfly_workspace[1024]; // absolute cwd at startup — the task's workspace root
     int done;
@@ -3171,6 +3176,14 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             fail(e, "poll failed (errno %d)", errno);
             break;
         }
+        // Orphaned mayfly (CLI SIGKILLed): exit for good — the reconnect loop
+        // honours rc==0 as "done", and the backend stops the todo once our
+        // slot stays empty (BridgeHandler.scheduleMayflyOrphanStop).
+        if (e->mayfly_parent_pid && (long)getppid() != e->mayfly_parent_pid) {
+            fprintf(stderr, "Spawning CLI is gone — mayfly session ending.\n");
+            e->rc = 0; e->done = 1;
+            break;
+        }
 #endif
         if (pr > 0) {
             if (pfd->revents & (POLLERR | POLLNVAL)) {
@@ -3734,6 +3747,11 @@ int bridge_main(int argc, char **argv) {
             return 1;
         }
         e->mayfly = 1;
+#ifndef _WIN32
+        // Only when actually spawned by something (a hand-run bridge from a
+        // shell would otherwise die with the shell — that's the same contract).
+        e->mayfly_parent_pid = getppid() > 1 ? (long)getppid() : 0;
+#endif
         snprintf(e->mayfly_todo_id, sizeof e->mayfly_todo_id, "%s", mayfly_todo_id);
         // Workspace root: --workspace flag, else the invoking cwd — the
         // spawning CLI runs from the task's repo, so "." is the contract.
@@ -3887,11 +3905,18 @@ int bridge_main(int argc, char **argv) {
 #else
         // No SIGINT handler installed — default disposition terminates the
         // process during sleep(), which is the desired behavior for Ctrl+C.
-        sleep((unsigned)delay);
+        // A mayfly keeps watching its CLI across the wait (up to 300s) so an
+        // orphan doesn't sit out a backend outage before noticing.
+        for (int slept = 0; slept < delay; slept++) {
+            if (e->mayfly_parent_pid && (long)getppid() != e->mayfly_parent_pid) { rc = 0; goto done; }
+            sleep(1);
+        }
 #endif
         reset_connection_state(e);
     }
-
+#ifndef _WIN32
+done:
+#endif
     for (int i = 0; i < g_max_sessions; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
         unstage_wrapper_file(&e->sessions[i]);
