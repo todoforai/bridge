@@ -182,6 +182,33 @@ int main(void) {
               "interpreter with a timed-out versionCmd is not assumed installed");
     }
 
+    // Windows argv quoting for run_shell's `-c` argument (MS CRT rules).
+    {
+        static const char *const cases[][2] = {
+            { "abc",                  "\"abc\"" },
+            { "",                     "\"\"" },
+            { "say \"hi\"",           "\"say \\\"hi\\\"\"" },
+            { "a\\b",                 "\"a\\b\"" },            // lone \ stays literal
+            { "end\\",                "\"end\\\\\"" },         // trailing \ doubled
+            { "x\\\"y",               "\"x\\\\\\\"y\"" },      // \" → \\\"
+            { "print(version(\"m\"))", "\"print(version(\\\"m\\\"))\"" },
+            { "a\\\\\"b",             "\"a\\\\\\\\\\\"b\"" },  // \\" → five backslashes + "
+            { "z\\\\",                "\"z\\\\\\\\\"" },       // trailing \\ → four backslashes
+            { "\"\"",                 "\"\\\"\\\"\"" },
+        };
+        char q[128];
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            int n = bridge_win_quote_arg(cases[i][0], q, sizeof q);
+            char msg[160];
+            snprintf(msg, sizeof msg, "win_quote_arg [%s]", cases[i][0]);
+            CHECK(n == (int)strlen(cases[i][1]) && strcmp(q, cases[i][1]) == 0, msg);
+        }
+        CHECK(bridge_win_quote_arg("abcdef", q, 8) == -1, "win_quote_arg overflow → -1");
+        CHECK(bridge_win_quote_arg("abcde", q, 8) == 7, "win_quote_arg exact fit");
+        CHECK(bridge_win_quote_arg("", q, 2) == -1 && bridge_win_quote_arg("", q, 3) == 2,
+              "win_quote_arg tiny caps");
+    }
+
     printf("%s\n", fails ? "FAILED" : "PASSED");
     return fails ? 1 : 0;
 }

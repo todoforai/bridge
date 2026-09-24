@@ -65,6 +65,27 @@
 #define VERSION_CAP        100
 #define PRESENCE_FP_CAP    512
 
+int bridge_win_quote_arg(const char *arg, char *out, size_t cap) {
+    size_t o = 0;
+#define PUT(c) do { if (o + 1 >= cap) return -1; out[o++] = (c); } while (0)
+    PUT('"');
+    for (const char *p = arg;; p++) {
+        size_t bs = 0;
+        while (*p == '\\') { bs++; p++; }
+        // Backslashes are literal unless they precede a `"` (escaped) or the
+        // closing quote we add: then each must be doubled.
+        size_t reps = (*p == '"' || *p == '\0') ? bs * 2 : bs;
+        for (size_t i = 0; i < reps; i++) PUT('\\');
+        if (*p == '\0') break;
+        if (*p == '"') PUT('\\');
+        PUT(*p);
+    }
+    PUT('"');
+#undef PUT
+    out[o] = '\0';
+    return (int)o;
+}
+
 // Run a shell command with a deadline. Captures up to `cap` bytes of combined
 // stdout+stderr into `out` (NUL-terminated, trimmed of trailing whitespace).
 // Returns the child exit code (0 = success), or -1 on spawn/timeout failure.
@@ -100,9 +121,11 @@ static int run_shell(const char *cmd, int timeout_ms, char *out, size_t cap) {
     if (!*sh) return -1;
 
     char cmdline[16384];  // presence_scan passes every catalog binary in one line
-    // Quote shell path; pass `cmd` as a single argument to `-c`.
-    int n = snprintf(cmdline, sizeof(cmdline), "\"%s\" -c \"%s\"", sh, cmd);
+    // Quote shell path; pass `cmd` as a single argument to `-c`, escaped so
+    // embedded `"` / `\` reach the shell intact.
+    int n = snprintf(cmdline, sizeof(cmdline), "\"%s\" -c ", sh);
     if (n <= 0 || (size_t)n >= sizeof(cmdline)) return -1;
+    if (bridge_win_quote_arg(cmd, cmdline + n, sizeof(cmdline) - (size_t)n) < 0) return -1;
 
     SECURITY_ATTRIBUTES sa = { .nLength = sizeof(sa), .bInheritHandle = TRUE };
     HANDLE r = NULL, w = NULL;
