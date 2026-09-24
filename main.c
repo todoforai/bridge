@@ -2927,6 +2927,19 @@ static void service_sessions(edge_t *e) {
         int code;
         if (bridge_pty_reap(&s->pty, &code)) {
             if (s->state == SESS_RUNNING) {
+                if (s->draining_begin) {
+                    // Died before the wrapper's begin marker was seen: the
+                    // drain ate whatever it printed (e.g. a broken shell
+                    // binary's "not found", or a failed `cd`). Never report
+                    // that as a silent "(no output)" — say what happened.
+                    char em[192];
+                    int en = snprintf(em, sizeof em,
+                        "bridge: shell exited (code %d) before the command-start marker was seen — "
+                        "shell startup or cwd failed; its output was suppressed\n", code);
+                    if (en > 0) send_output_bytes(e, s, (const uint8_t *)em,
+                                                  (size_t)en < sizeof em ? (size_t)en : sizeof em - 1);
+                    s->tail_len = 0;
+                }
                 if (s->tail_len > 0) {
                     ob_append(e, s, s->tail_buf, s->tail_len);
                     s->tail_len = 0;

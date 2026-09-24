@@ -120,6 +120,27 @@ static int bridge_shell_is_bash(const char *sh) {
     return _stricmp(base, "bash.exe") == 0 || _stricmp(base, "bash") == 0;
 }
 
+// Git\bin\{bash,sh}.exe are launcher shims that exec ..\usr\bin\bash.exe. If
+// that target is gone (renamed `bash.exe.disabled` by hardening tools) the shim
+// prints "…usr\bin\bash.exe not found" and exits 1 — every RUN then died
+// silently until timeout. Treat such a shim as absent; usr\bin\sh.exe (a real
+// msys2 bash copy) is probed later in the list.
+static int is_orphan_git_shim(const char *path) {
+    char target[MAX_PATH];
+    snprintf(target, sizeof target, "%s", path);
+    char *leaf = strrchr(target, '\\');
+    if (!leaf) return 0;
+    *leaf = '\0';                                   // ...\Git\bin or ...\Git\usr\bin
+    size_t n = strlen(target);
+    if (n < 4 || _stricmp(target + n - 4, "\\bin") != 0) return 0;
+    if (n >= 8 && _stricmp(target + n - 8, "\\usr\\bin") == 0) return 0;  // real binary
+    // Only a Git for Windows root (has git-bash.exe) — never reject e.g. cygwin's real bin\bash.exe.
+    snprintf(target + n - 4, sizeof target - (n - 4), "\\git-bash.exe");
+    if (GetFileAttributesA(target) == INVALID_FILE_ATTRIBUTES) return 0;
+    snprintf(target + n - 4, sizeof target - (n - 4), "\\usr\\bin\\bash.exe");
+    return GetFileAttributesA(target) == INVALID_FILE_ATTRIBUTES;
+}
+
 // Public (identity.c reports it; main.c RUN pre-checks it) so the shell the
 // backend/agent sees is the shell that actually spawns — never a guess.
 const char *bridge_pty_resolve_shell(const char *shell) {
@@ -150,7 +171,8 @@ const char *bridge_pty_resolve_shell(const char *shell) {
         NULL,
     };
     for (int i = 0; fallbacks[i]; i++) {
-        if (GetFileAttributesA(fallbacks[i]) != INVALID_FILE_ATTRIBUTES) {
+        if (GetFileAttributesA(fallbacks[i]) != INVALID_FILE_ATTRIBUTES &&
+            !is_orphan_git_shim(fallbacks[i])) {
             snprintf(buf, sizeof(buf), "%s", fallbacks[i]);
             return buf;
         }
@@ -159,9 +181,9 @@ const char *bridge_pty_resolve_shell(const char *shell) {
     // sh.exe is checked second: a PATH bash is the better-known shape, and
     // the provisioned busybox (also sh.exe) is reached by the branch below
     // even if it somehow landed on PATH.
-    if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf))
+    if (SearchPathA(NULL, "bash.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf) && !is_orphan_git_shim(buf))
         return buf;
-    if (SearchPathA(NULL, "sh.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf))
+    if (SearchPathA(NULL, "sh.exe", NULL, sizeof(buf), buf, NULL) > 0 && !is_wsl_stub(buf) && !is_orphan_git_shim(buf))
         return buf;
 
     // Provisioned busybox sh (the guaranteed floor — see provision_shell_async).
