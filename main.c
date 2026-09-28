@@ -2957,29 +2957,26 @@ static void service_sessions(edge_t *e) {
         }
     }
 
-    // Per-step deadline. Settle the RUN; for persistent sessions the shell
-    // is left alive (agent can retry on the same sessionId). One-shot
-    // sessions are torn down by run_finish() since the agent never owned
-    // the id and has no way to address them.
-    //
-    // Windows: ConPTY exposes no "blocked on stdin" signal (see pty_win.c
-    // bridge_pty_probe_blocked), so an interactive prompt can only surface
-    // here, at the deadline. Killing it would make every interactive command
-    // unrecoverable (PID_NOT_FOUND on resume) — instead park it exactly like
-    // the probe does: the backend keeps the run, the agent gets a pid and can
-    // feed stdin via bridge_exec(pid, ...).
+    // Per-step deadline: park the step exactly like the probe does — the
+    // backend keeps the run, the agent gets a pid and can feed stdin or ^C
+    // via bridge_exec(pid, ...). The deadline is where a prompt the probe
+    // missed surfaces: Windows ConPTY has no "blocked on stdin" signal at all
+    // (pty_win.c), and on Linux the probe goes blind in containers on 6.x
+    // kernels (/proc/<pid>/syscall EPERM, wchan `wait_woken`) or when the
+    // prompt's output was redirected away. Settling instead left the command
+    // running unaddressed — a hung `apt-get` (tzdata prompt) kept the dpkg
+    // lock while the agent only saw "exit code -1".
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active || s->state != SESS_RUNNING || s->deadline_ms == 0) continue;
         if (now < s->deadline_ms) continue;
-#ifdef _WIN32
         // ...unless the RUN declared itself non-interactive: nothing can be
         // typed, so a park would strand the step instead of reporting it.
+        // Settle it; one-shot sessions are torn down by run_finish().
         if (!s->no_input) {
             park_step(e, s, /*password_prompt=*/0, "timeout");
             continue;
         }
-#endif
         if (s->tail_len > 0) {
             ob_append(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
