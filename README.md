@@ -61,14 +61,14 @@ Server side: `backend/src/api/ws/handlers/BridgeHandler.ts`.
 Only libc + `libutil` (for `forkpty`, in libc on macOS).
 
 ```sh
-# Dynamic build (default system cc) — ~77 KB stripped, libc only
+# Dynamic build (default system cc) — ~190 KB stripped, libc only
 make
 ./build/todoforai-bridge --help
 
-# Static musl build via `zig cc` — ~90 KB, single-file, zero deps
+# Static musl build via `zig cc` — ~260 KB, single-file, zero deps
 make static
 
-# Windows x64 build via `zig cc` (mingw-w64) — ~150 KB
+# Windows x64 build via `zig cc` (mingw-w64) — ~240 KB
 make release-windows-x64
 ```
 
