@@ -16,7 +16,7 @@
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
 //     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool,"reason":"probe"|"timeout"|"detach"}
 //     → {"type":"step_done","sessionId":"uuid","blockId":"...","shellPid":N,"exitCode":N|null,"timedOut":bool}
-//     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"..."}   // resumes a step waiting on stdin
+//     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"...","timeoutMs":N?}  // empty data = peek; timeoutMs re-arms the step deadline   // resumes a step waiting on stdin
 //     ← {"type":"detach","sessionId":"uuid","requestId":"..."}                  // user detach: park the running step (→ step_awaiting_input)
 //     → {"type":"ack","requestId":"..."}                            // success reply for input
 //     → {"type":"exit","sessionId":"uuid","blockId":"...","code":N}
@@ -2492,7 +2492,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "INVALID_BASE64", "data is not valid base64")
                            : send_error(e, sid, sid_len, NULL, 0, "INVALID_BASE64", "data is not valid base64");
 
-        if (bridge_pty_write_all(&s->pty, decoded, dec_len) != 0) {
+        // Empty data = peek: nothing is written, the step is only re-armed.
+        if (dec_len > 0 && bridge_pty_write_all(&s->pty, decoded, dec_len) != 0) {
             fprintf(stderr, "PTY write error\n");
             return has_rid ? send_req_error(e, sid, sid_len, rid, rid_len, "PTY_WRITE_FAILED", "PTY write failed; session may have died")
                            : send_error(e, sid, sid_len, NULL, 0, "PTY_WRITE_FAILED", "PTY write failed; session may have died");
@@ -2506,6 +2507,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // the probe may park it anew if it blocks on stdin later.
         s->pause_consec_ticks = 0;
         s->parked = 0;
+        // Resume re-arms the deadline (park_step dropped it): without one a
+        // step the probe can't see (container kernels, see the deadline loop)
+        // would go silent forever instead of parking again with its output.
+        long resume_raw = 0;
+        if (s->state == SESS_RUNNING && json_get_long(msg, msg_len, "timeoutMs", &resume_raw) && resume_raw > 0)
+            s->deadline_ms = monotonic_ms() + (int64_t)resume_raw;
 
         if (has_rid) send_ack(e, rid, rid_len);
 

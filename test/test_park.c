@@ -156,6 +156,32 @@ int main(void) {
     if (s->state == SESS_RUNNING) { printf("FAIL [^D did not release parked cat]\n"); failures++; }
     else printf("ok   [%-32s]\n", "^D releases parked cat");
 
+    // Deadline park, then a resume re-arms it. A prompt the probe can't see
+    // (`read` from a pipe-less redirect keeps it off the tty: `cat` waits on
+    // a fifo) must park at the deadline, and park again after an empty
+    // INPUT (peek) with timeoutMs — which must write nothing to the PTY.
+    {
+        run_step(e, s, "mkfifo /tmp/tp_fifo.$$ 2>/dev/null; cat /tmp/tp_fifo.$$; rm -f /tmp/tp_fifo.$$", 0, 1);
+        s->deadline_ms = monotonic_ms() + 300;
+        for (int w = 0; w < 3000 && !g_parked; w += 20) {
+            struct pollfd pfd = { .fd = bridge_pty_pollfd(&s->pty), .events = POLLIN };
+            poll(&pfd, 1, 20); service_sessions(e);
+        }
+        expect("deadline parks", 1, 0);
+        g_parked = 0;
+        char peek[160];
+        int pn = snprintf(peek, sizeof peek, "{\"type\":\"input\",\"sessionId\":\"%s\",\"data\":\"\",\"timeoutMs\":300}", s->session_id);
+        handle_command(e, peek, (size_t)pn);
+        if (s->deadline_ms == 0) { printf("FAIL [peek did not re-arm deadline]\n"); failures++; }
+        for (int w = 0; w < 3000 && !g_parked; w += 20) {
+            struct pollfd pfd = { .fd = bridge_pty_pollfd(&s->pty), .events = POLLIN };
+            poll(&pfd, 1, 20); service_sessions(e);
+        }
+        expect("peek re-parks at deadline", 1, 0);
+        bridge_pty_write_all(&s->pty, "\x03", 1);   // ^C the cat
+        settle(e, s, "");
+    }
+
     // noInput: not even a real prompt may park — the caller has nobody to ask.
     run_step(e, s, "printf 'Continue? [y/N] '; read a", 1, 3000);
     expect("noInput never parks", 0, 0);
