@@ -438,6 +438,51 @@ static pid_t proc_pgrp(pid_t pid) {
     if (sscanf(rp + 2, "%c %d %d", &state, &ppid, &pgrp) != 3) return 0;
     return (pid_t)pgrp;
 }
+
+// state + ppid from /proc/<pid>/stat in one read. Returns 0 on failure.
+static int proc_stat_state_ppid(pid_t pid, char *state, pid_t *ppid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char sb[512];
+    ssize_t n = read(fd, sb, sizeof(sb) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    sb[n] = '\0';
+    char *rp = strrchr(sb, ')');
+    if (!rp || rp[1] != ' ') return 0;
+    int pp;
+    if (sscanf(rp + 2, "%c %d", state, &pp) != 2) return 0;
+    *ppid = (pid_t)pp;
+    return 1;
+}
+
+// Raw kernel wait channel (/proc/<pid>/wchan), "" if unreadable/running.
+static void proc_wchan(pid_t pid, char *out, size_t cap) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/wchan", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd >= 0 ? read(fd, out, cap - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0 || (n == 1 && out[0] == '0')) n = 0;
+    out[n] = '\0';
+}
+
+// /proc/<pid>/cmdline with NULs turned into spaces. Returns length, 0 if none.
+static size_t proc_cmdline(pid_t pid, char *out, size_t cap) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    while (n > 0 && out[n - 1] == '\0') n--;   // trailing NUL(s)
+    for (ssize_t i = 0; i < n; i++) if (out[i] == '\0') out[i] = ' ';
+    out[n] = '\0';
+    return (size_t)n;
+}
 #endif
 
 #if defined(__APPLE__)
@@ -584,6 +629,61 @@ int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
         }
     }
     return how;
+#else
+    (void)p;
+    return 0;
+#endif
+}
+
+#if defined(__linux__)
+typedef struct { pid_t *pid, *ppid; char *st; int n; char *out; size_t cap, u; } ptree_t;
+
+static void ptree_emit(ptree_t *t, pid_t parent, int depth) {
+    for (int i = 0; i < t->n && t->u + 1 < t->cap; i++) {
+        if (t->ppid[i] != parent) continue;
+        char wchan[48]; proc_wchan(t->pid[i], wchan, sizeof wchan);
+        if (!wchan[0]) { wchan[0] = t->st[i]; wchan[1] = '\0'; }   // running: R/D/...
+        char args[240];
+        if (!proc_cmdline(t->pid[i], args, sizeof args)) snprintf(args, sizeof args, "?");
+        // "<indent>└ <cmdline>  <wchan>" — raw values, minimal chars.
+        int w = snprintf(t->out + t->u, t->cap - t->u, "%*s%s%s  %s\n",
+                         depth * 2, "", depth ? "\u2514 " : "", args, wchan);
+        if (w < 0) return;
+        t->u += (size_t)w < t->cap - t->u ? (size_t)w : t->cap - t->u - 1;
+        if (depth < 16) ptree_emit(t, t->pid[i], depth + 1);
+    }
+}
+#endif
+
+size_t bridge_pty_stdin_waiter(const bridge_pty_t *p, char *out, size_t cap) {
+    if (!out || cap < 2) return 0;
+    out[0] = '\0';
+#if defined(__linux__)
+    if (!p || p->child_pid <= 0) return 0;
+    // Park-time only (never the hot path): one /proc pass reading each stat
+    // once, then a forest of everything under the RUN shell: raw cmdline +
+    // raw wchan (state char when running). No interpretation — the reader of a prompt is not
+    // always the leaf (tzdata: debconf's frontend reads the tty, its
+    // tzdata.config child reads a pipe), and the model reads ps output fluently.
+    enum { MAXP = 8192 };   // static: ~72 KB, covers a busy desktop
+    static pid_t pid[MAXP], ppid[MAXP];
+    static char st[MAXP];
+    int n = 0;
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < MAXP) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        pid_t x = (pid_t)atoi(e->d_name);
+        if (x > 1 && proc_stat_state_ppid(x, &st[n], &ppid[n])) pid[n++] = x;
+    }
+    closedir(d);
+    ptree_t t = { pid, ppid, st, n, out, cap, 0 };
+    ptree_emit(&t, p->child_pid, 0);
+    if (t.u == 0) return 0;                               // shell has no children
+    while (t.u > 0 && out[t.u - 1] == '\n') t.u--;       // trailing newline
+    out[t.u] = '\0';
+    return t.u;
 #else
     (void)p;
     return 0;

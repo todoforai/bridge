@@ -14,7 +14,8 @@
 //     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N,"noInput":bool?}
 //     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool,"cwd":"..."}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
-//     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool,"reason":"probe"|"timeout"|"detach"}
+//     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool,"reason":"probe"|"timeout"|"detach","stdinWaiter":"cmdline"?}
+//         stdinWaiter: raw process tree under the shell, "<indent>└ <cmdline>  <wchan>" per line (Linux) — names the prompt even when its output went to /dev/null
 //     → {"type":"step_done","sessionId":"uuid","blockId":"...","shellPid":N,"exitCode":N|null,"timedOut":bool}
 //     ← {"type":"input","sessionId":"uuid","data":"base64","requestId":"...","timeoutMs":N?}  // empty data = peek; timeoutMs re-arms the step deadline   // resumes a step waiting on stdin
 //     ← {"type":"detach","sessionId":"uuid","requestId":"..."}                  // user detach: park the running step (→ step_awaiting_input)
@@ -1112,8 +1113,11 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
 // latter may just be a long-running command; backend surfaces it as timedOut.
 static void send_step_awaiting_input(edge_t *e, session_t *s, int password_prompt, const char *reason) {
     flush_output(e, s);  // the prompt itself is usually the last queued chunk
-    char buf[512]; size_t u = 0;
+    char buf[4096]; size_t u = 0;
     char shell_pid_buf[24]; snprintf(shell_pid_buf, sizeof shell_pid_buf, "%ld", SHELL_PID(s));
+    // Raw process tree under the shell (ps --forest style). Park-time only;
+    // the only clue left when the command redirected its prompt away.
+    char waiter[2048]; size_t wl = bridge_pty_stdin_waiter(&s->pty, waiter, sizeof waiter);
     if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
         jfield_str(buf, sizeof buf, &u, "type", "step_awaiting_input", -1, 0) < 0 ||
         jfield_str(buf, sizeof buf, &u, "sessionId", s->session_id, -1, 1) < 0 ||
@@ -1122,6 +1126,7 @@ static void send_step_awaiting_input(edge_t *e, session_t *s, int password_promp
         jfield_raw(buf, sizeof buf, &u, "shellPid", shell_pid_buf, 1) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "passwordPrompt", password_prompt ? "true" : "false", 1) < 0 ||
         jfield_str(buf, sizeof buf, &u, "reason", reason, -1, 1) < 0 ||
+        (wl > 0 && jfield_str(buf, sizeof buf, &u, "stdinWaiter", waiter, (long)wl, 1) < 0) ||
         jfield_raw(buf, sizeof buf, &u, "truncated", s->ob.truncated ? "true" : "false", 1) < 0 ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
