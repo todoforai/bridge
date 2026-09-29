@@ -26,6 +26,7 @@
 #undef main
 
 static int g_parked, g_done, g_pwd;
+static char g_waiter[2048];
 
 int bridge_test_noise_send(noise_ws_t *n, ws_t *w, const uint8_t *pt, size_t pt_len) {
     (void)n; (void)w;
@@ -36,6 +37,11 @@ int bridge_test_noise_send(noise_ws_t *n, ws_t *w, const uint8_t *pt, size_t pt_
         g_parked++;
         int pwd = 0;
         if (json_get_bool(json, pt_len, "passwordPrompt", &pwd) && pwd) g_pwd++;
+        const char *w = NULL; size_t wl = 0;
+        g_waiter[0] = '\0';
+        if (json_get_str(json, pt_len, "stdinWaiter", &w, &wl) && wl < sizeof g_waiter) {
+            memcpy(g_waiter, w, wl); g_waiter[wl] = '\0';
+        }
     } else if (type_len == 9 && memcmp(type, "step_done", 9) == 0) {
         g_done++;
     }
@@ -179,6 +185,29 @@ int main(void) {
         }
         expect("peek re-parks at deadline", 1, 0);
         bridge_pty_write_all(&s->pty, "\x03", 1);   // ^C the cat
+        settle(e, s, "");
+    }
+
+    // stdinWaiter names the process holding the prompt even when its output
+    // went to /dev/null: the leaf of the shell's process tree. Mirrors
+    // apt-get → dpkg → debconf → tzdata.config with a sh → sh → cat chain.
+    {
+        run_step(e, s, "sh -c 'sh -c \"exec cat -A\"' >/dev/null", 0, 3000);
+        if (!g_parked) {
+            // Probe may be blind here (6.x container); force the park via deadline.
+            s->deadline_ms = monotonic_ms() + 300;
+            for (int w = 0; w < 3000 && !g_parked; w += 20) {
+                struct pollfd pfd = { .fd = bridge_pty_pollfd(&s->pty), .events = POLLIN };
+                poll(&pfd, 1, 20); service_sessions(e);
+            }
+        }
+        expect("redirected prompt parks", 1, 0);
+#ifdef __linux__
+        if (!strstr(g_waiter, "\u2514 cat -A  ")) {
+            failures++; fprintf(stderr, "FAIL stdinWaiter: got:\n%s\n", g_waiter);
+        } else printf("ok   stdinWaiter:\n%s\n", g_waiter);
+#endif
+        bridge_pty_write_all(&s->pty, "\x03", 1);
         settle(e, s, "");
     }
 

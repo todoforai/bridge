@@ -93,4 +93,12 @@ int bridge_pty_pollfd(const bridge_pty_t *p);
 int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
                              long *fg_pid, int *password_prompt);
 
+// Raw process tree under the shell for the park frame, one line per process:
+// "<indent>└ <cmdline>  <wchan>" (state char instead of wchan when running). When a prompt was
+// redirected away (`apt-get ... >/dev/null` → tzdata debconf) the agent sees
+// no output at all; this is the only clue left. Park-time only.
+// Writes NUL-terminated text into `out`; returns its length, 0 if the shell
+// has no children. Linux only (/proc); other platforms return 0.
+size_t bridge_pty_stdin_waiter(const bridge_pty_t *p, char *out, size_t cap);
+
 #endif

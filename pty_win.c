@@ -596,6 +596,12 @@ static DWORD *bridge_job_pid_list(HANDLE job, ULONG *out_count) {
     return NULL;
 }
 
+size_t bridge_pty_stdin_waiter(const bridge_pty_t *p, char *out, size_t cap) {
+    (void)p;  // No cheap per-process "blocked on console read" view on Windows.
+    if (out && cap) out[0] = '\0';
+    return 0;
+}
+
 int bridge_pty_probe_blocked(const bridge_pty_t *p, int echo_baseline,
                              long *fg_pid, int *password_prompt) {
     (void)echo_baseline;  // No ECHO introspection on Windows; see file header.
