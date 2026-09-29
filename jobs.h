@@ -32,6 +32,8 @@
 // results by them. They travel to the worker as the `__job` argument.
 #define BRIDGE_JOB_SCAN     1
 #define BRIDGE_JOB_PREVIEW  2
+#define BRIDGE_JOB_CLOUD_SSH_KEY    3
+#define BRIDGE_JOB_CLOUD_SSH_CONFIG 4
 
 // Emit one ready-to-send JSON message from inside the worker. Returns 0, or
 // -1 once the parent is gone / cancelled (workers should then unwind).

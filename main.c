@@ -94,6 +94,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "tools.h"
 #include "update.h"
 #include "policy.h"
+#include "cloud_ssh.h"
 #include "login.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
@@ -570,6 +571,11 @@ typedef struct {
 
     // Off-loop workers (tool scan, preview fetch) — see jobs.h.
     bridge_jobs_t jobs;
+
+    // Native cloud SSH (cloud_ssh.h): capability decided once in main();
+    // `pinned` = this connection authenticates the server by a stored key.
+    int cloud_ssh;
+    int pinned;
 
     session_t *sessions;     // heap, length = g_max_sessions
     uint8_t  pty_buf[BUF_SIZE];
@@ -1866,6 +1872,8 @@ static int cmd_job_worker(const char *kind_s) {
     switch (atoi(kind_s)) {
         case BRIDGE_JOB_SCAN:    return bridge_job_worker_main(scan_job_body);
         case BRIDGE_JOB_PREVIEW: return bridge_job_worker_main(preview_job_body);
+        case BRIDGE_JOB_CLOUD_SSH_KEY:    return bridge_job_worker_main(cloud_ssh_key_job);
+        case BRIDGE_JOB_CLOUD_SSH_CONFIG: return bridge_job_worker_main(cloud_ssh_config_job);
         default:                 return 2;
     }
 }
@@ -1904,6 +1912,16 @@ static int jobs_frame_cb(void *ctx, const bridge_job_t *j,
 
 static void jobs_done_cb(void *ctx, const bridge_job_t *j, int ok, const char *err) {
     edge_t *e = ctx;
+    if (j->kind == BRIDGE_JOB_CLOUD_SSH_CONFIG && j->frames == 0) {
+        // The worker died before its verdict: the backend is still waiting.
+        char buf[160];
+        int n = cloud_ssh_ready_json(j->rid, 0, buf, sizeof buf);
+        if (n > 0) send_json(e, buf, (size_t)n);
+    }
+    if (j->kind == BRIDGE_JOB_CLOUD_SSH_KEY || j->kind == BRIDGE_JOB_CLOUD_SSH_CONFIG) {
+        if (!ok) fprintf(stderr, "cloud-ssh: worker failed (%s)\n", err ? err : "unknown");
+        return;
+    }
     if (ok) return;
     if (j->kind == BRIDGE_JOB_SCAN) {
         char msg[192];
@@ -1921,6 +1939,58 @@ static void jobs_done_cb(void *ctx, const bridge_job_t *j, int ok, const char *e
         snprintf(msg, sizeof msg, "preview: fetch failed (%s)", err ? err : "unknown");
         send_preview_error(e, j->rid, j->rid_len, msg);
     }
+}
+
+// ── Native cloud SSH (cloud_ssh.h) ───────────────────────────────────────────
+// Only the persistent, pinned, policy-free PC daemon takes part (e->cloud_ssh
+// is decided once in main() and advertised as identity.cloudSsh). The disk
+// and ssh work runs in job workers; one of each kind at a time, so the
+// backend's 5-minute re-offer can never pile up workers.
+#define CLOUD_SSH_KEY_TIMEOUT_MS     30000
+#define CLOUD_SSH_CONFIG_TIMEOUT_MS  60000
+
+static int handle_cloud_ssh(edge_t *e, int offer, const char *msg, size_t msg_len) {
+    if (!e->cloud_ssh || !e->pinned) {
+        fprintf(stderr, "cloud-ssh: ignoring %s (not enabled on this bridge)\n",
+                offer ? "offer" : "config");
+        return 0;
+    }
+    char buf[640];
+    if (offer) {
+        if (bridge_jobs_count(&e->jobs, BRIDGE_JOB_CLOUD_SSH_KEY) > 0) return 0;
+        int n = snprintf(buf, sizeof buf, "{\"profile\":\"%s\"}", login_get_profile());
+        if (n > 0 && (size_t)n < sizeof buf &&
+            bridge_job_start(&e->jobs, BRIDGE_JOB_CLOUD_SSH_KEY, buf, (size_t)n, monotonic_ms(),
+                             CLOUD_SSH_KEY_TIMEOUT_MS, NULL, 0, NULL, 0, NULL, 0) != 0)
+            fprintf(stderr, "cloud-ssh: failed to start key worker\n");
+        return 0;
+    }
+    cloud_ssh_cfg_t c; const char *err;
+    if (cloud_ssh_parse_config(msg, msg_len, &c, &err) != 0) {
+        fprintf(stderr, "cloud-ssh: rejected config (%s)\n", err);
+        // A readable cloudDeviceId still gets a verdict so the backend settles.
+        size_t idl = 0;
+        if (json_get_str_decoded(msg, msg_len, "cloudDeviceId", buf, 64, &idl) &&
+            cloud_ssh_valid_uuid(buf, idl)) {
+            char r[160]; int n = cloud_ssh_ready_json(buf, 0, r, sizeof r);
+            if (n > 0) send_json(e, r, (size_t)n);
+        }
+        return 0;
+    }
+    if (bridge_jobs_count(&e->jobs, BRIDGE_JOB_CLOUD_SSH_CONFIG) > 0) {
+        fprintf(stderr, "cloud-ssh: config already being applied; ignoring duplicate\n");
+        return 0;
+    }
+    snprintf(c.profile, sizeof c.profile, "%s", login_get_profile());
+    int n = cloud_ssh_build_payload(&c, buf, sizeof buf);
+    // rid carries the cloudDeviceId so a dead worker still yields ready:false.
+    if (n < 0 || bridge_job_start(&e->jobs, BRIDGE_JOB_CLOUD_SSH_CONFIG, buf, (size_t)n, monotonic_ms(),
+                                  CLOUD_SSH_CONFIG_TIMEOUT_MS, c.device_id, strlen(c.device_id),
+                                  NULL, 0, NULL, 0) != 0) {
+        char r[160]; int m = cloud_ssh_ready_json(c.device_id, 0, r, sizeof r);
+        if (m > 0) send_json(e, r, (size_t)m);
+    }
+    return 0;
 }
 
 static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
@@ -2886,6 +2956,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
+    } else if (IS("cloud_ssh_offer") || IS("cloud_ssh_config")) {
+        return handle_cloud_ssh(e, IS("cloud_ssh_offer"), msg, msg_len);
     } else if (IS("preview:http_request")) {
         // live_preview relay fetch. Payload-wrapped like FUNCTION_CALL_*:
         // {"payload":{requestId, port, method, path, headers{}, bodyB64?}}.
@@ -3138,6 +3210,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         else
             snprintf(e->api_url, sizeof e->api_url, "%s://%s", scheme, host);
     }
+    e->pinned = pubkey != NULL;
     if (noise_ws_init(&e->noise, pubkey) != 0) {
         fail(e, "failed to initialize noise (bad server pubkey?)");
         return -1;
@@ -3796,6 +3869,17 @@ int bridge_main(int argc, char **argv) {
             }
         }
         fprintf(stderr, "mayfly session for todo %s (workspace: %s)\n", e->mayfly_todo_id, e->mayfly_workspace);
+    }
+
+    // Native cloud SSH: only the persistent daemon with a pinned backend key,
+    // no device policy (the policy confines the backend to workspaces; ~/.ssh
+    // is outside them), POSIX with OpenSSH installed. Opt out with
+    // TODOFORAI_CLOUD_SSH=0.
+    {
+        const char *cs = getenv("TODOFORAI_CLOUD_SSH");
+        e->cloud_ssh = !mayfly_todo_id && have_pubkey && !g_policy.active &&
+                       !(cs && strcmp(cs, "0") == 0) && cloud_ssh_supported();
+        g_identity_cloud_ssh = e->cloud_ssh;
     }
 
     // Reconnect loop. PTY sessions survive across reconnects; in-flight RPCs

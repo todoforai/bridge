@@ -14,6 +14,10 @@
 // in other payloads like enroll redeem). When zero, wrap as a control message.
 int bridge_identity_json(char *out, size_t out_cap, int top_level);
 
+// Set by the daemon when native cloud SSH may be offered (cloud_ssh.h);
+// advertised as `cloudSsh: true` only on a PC-type device.
+extern int g_identity_cloud_ssh;
+
 // Populate provided buffers with identity strings. Returns 0.
 // Caller-owned buffers: caller must ensure each is large enough.
 typedef struct {

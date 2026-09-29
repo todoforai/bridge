@@ -218,3 +218,36 @@ todoforai-bridge policy list            # restart bridge to apply
 - macOS / Windows: path checks only; the shell is not confined.
 - Fail closed: bad policy file ⇒ all paths denied, no shells, reason on
   stderr.
+
+## Native cloud SSH (`ssh tfa-cloud`)
+
+On a durable PC bridge the backend can set up plain OpenSSH access to the
+user's cloud sandbox (no VPN, no proxy). Advertised as `identity.cloudSsh:
+true`; the backend only offers it then (`CLOUD_SSH_ENABLED=1` server-side).
+
+Flow: `cloud_ssh_offer` → bridge ensures `~/.ssh/tfa_cloud` (ed25519, created
+once by `ssh-keygen`, never overwritten) → `cloud_ssh_key` → `cloud_ssh_config`
+(strictly validated: DNS/IP host, port 1–65535, user `workspace`, canonical
+`ssh-ed25519` key of 68 base64 chars, uuid) → writes `~/.ssh/tfa_cloud_config`
++ `~/.ssh/tfa_cloud_known_hosts` (pinned under `HostKeyAlias
+tfa-cloud-<uuid>`), prepends one `Include` to `~/.ssh/config`, checks `ssh -G
+tfa-cloud`, probes `ssh -o BatchMode=yes -o ConnectTimeout=5 tfa-cloud true`
+→ `cloud_ssh_ready {ready:true|false}`. All disk/ssh work runs in `__job`
+workers (never on the event loop); one of each kind at a time.
+
+Enabled only for: persistent daemon (not `--mayfly`), stored/pinned backend
+key, no device policy file, POSIX with `ssh` + `ssh-keygen` on PATH.
+`TODOFORAI_CLOUD_SSH=0` opts out.
+
+Limitations (v1):
+- POSIX only. Windows never advertises the capability (fails closed).
+- Refuses (ready:false, nothing written) when: `~/.ssh/config` already
+  mentions `tfa-cloud` in a `Host`/`Match` line, is a symlink or not owned by
+  you; `tfa_cloud_config` wasn't written by the bridge or belongs to another
+  credential profile (first profile wins); the key pair is half-present or
+  the private key is not 0600; `~/.ssh` is group/world-writable.
+- `ssh -G` must resolve to exactly the managed settings. User globals that
+  would also apply to `tfa-cloud` (a global/`Host *` `IdentityFile`, a proxy
+  for all hosts) make it not ready instead of being overridden.
+- `~/.ssh` is taken from the passwd entry (as ssh does), not `$HOME`.
+- Removal is manual: delete the `Include` line and `~/.ssh/tfa_cloud*`.

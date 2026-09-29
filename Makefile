@@ -33,11 +33,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c \
+COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h \
+HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -167,6 +167,13 @@ test-jobs: | build
 	$(CC) -O1 -g -Wall -Wextra -I. -o build/test-jobs test/test_jobs.c jobs.c
 	./build/test-jobs
 
+# Native cloud SSH: validation, config render, conflicts, idempotence, and
+# the real ssh-keygen / ssh -G path — all under a temp dir, never ~/.ssh.
+.PHONY: test-cloud-ssh
+test-cloud-ssh: | build
+	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-cloud-ssh test/test_cloud_ssh.c cloud_ssh.c json.c
+	./build/test-cloud-ssh
+
 # Preview relay: local HTTP fetch + chunked response emission, no network.
 .PHONY: test-preview
 test-preview: | build
@@ -186,7 +193,7 @@ test-timing: | build
 test-coalesce: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
-	    test/test_coalesce.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    test/test_coalesce.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-coalesce
 
@@ -198,7 +205,7 @@ test-coalesce: | build
 test-runenv: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
-	    test/test_runenv.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    test/test_runenv.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
@@ -209,7 +216,7 @@ test-runenv: | build
 test-initdrain: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-initdrain \
-	    test/test_initdrain.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    test/test_initdrain.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-initdrain
 
@@ -221,7 +228,7 @@ test-initdrain: | build
 test-oneshot-leak: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-oneshot-leak \
-	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-oneshot-leak
 
@@ -263,7 +270,7 @@ test-probe: | build
 test-prompt-tail: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-prompt-tail \
-	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-prompt-tail
 
@@ -273,13 +280,13 @@ test-prompt-tail: | build
 test-park: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-park \
-	    test/test_park.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    test/test_park.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-park
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c
+BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c cloud_ssh.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 
@@ -368,6 +375,6 @@ clean:
 test-pool: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-pool \
-	    test/test_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c \
+	    test/test_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-pool

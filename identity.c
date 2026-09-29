@@ -398,6 +398,8 @@ void bridge_identity_gather(bridge_identity_t *id) {
     }
 }
 
+int g_identity_cloud_ssh;
+
 int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     bridge_identity_t id;
     bridge_identity_gather(&id);
@@ -438,6 +440,8 @@ int bridge_identity_json(char *out, size_t out_cap, int top_level) {
     if (id.cores[0])      KV("cores",      id.cores);
     if (id.screen[0])     KV("screen",     id.screen);
     if (id.gpu[0])        KV("gpu",        id.gpu);
+    if (g_identity_cloud_ssh && strcmp(id.device_type, "PC") == 0 &&
+        json_emit_raw(out, out_cap, &u, ",\"cloudSsh\":true", 16) < 0) return -1;
     if (json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
 
     if (!top_level && json_emit_raw(out, out_cap, &u, "}", 1) < 0) return -1;
