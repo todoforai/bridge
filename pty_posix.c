@@ -319,6 +319,23 @@ int bridge_pty_pollfd(const bridge_pty_t *p) {
 #  define BRIDGE_SYS_READ -1   // unknown arch → syscall path disabled
 #endif
 
+// Readiness waits (poll/select/epoll family). A line-editing REPL (Python's
+// readline: pselect6 on fd 0; node, ipython: epoll) sleeps HERE, never in a
+// tty read(), so the authoritative check can't see it. Weak signal only: a
+// build or download sleeps in the same calls, so the caller corroborates
+// (prompt-shaped last line + OPAQUE_QUIET_MS silence).
+static int sys_is_poll_wait(long nr) {
+#if defined(__x86_64__)
+    // poll, select, epoll_wait, pselect6, ppoll, epoll_pwait, epoll_pwait2
+    return nr == 7 || nr == 23 || nr == 232 || nr == 270 || nr == 271 || nr == 281 || nr == 441;
+#elif defined(__aarch64__) || defined(__riscv)
+    // pselect6, ppoll, epoll_pwait, epoll_pwait2
+    return nr == 72 || nr == 73 || nr == 22 || nr == 441;
+#else
+    (void)nr; return 0;
+#endif
+}
+
 // Authoritative: read /proc/<pid>/syscall. Returns 1 iff the task is blocked
 // inside read()/pread64()/readv() on an fd pointing at the controlling
 // terminal — /dev/pts/* (normal stdin) or /dev/tty (sudo/ssh/getpass open
@@ -410,6 +427,28 @@ static int proc_is_opaque_sleeping(pid_t pid) {
     return proc_state(pid) == 'S';
 }
 
+static void proc_wchan(pid_t pid, char *out, size_t cap);
+// Sleeping in a readiness wait (see sys_is_poll_wait): syscall number when
+// /proc/<pid>/syscall is readable (we are an ancestor under ptrace_scope=1),
+// else the wchan symbol. Returns 1 = weak candidate, never authoritative.
+static int proc_is_poll_waiting(pid_t pid) {
+    if (proc_state(pid) != 'S') return 0;
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/syscall", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char buf[64];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        long nr = -1;
+        if (n > 0) { buf[n] = '\0'; if (sscanf(buf, "%ld", &nr) == 1) return sys_is_poll_wait(nr); }
+    }
+    char w[48];
+    proc_wchan(pid, w, sizeof w);
+    return strstr(w, "poll_schedule_timeout") || strstr(w, "do_select")
+        || strstr(w, "do_sys_poll") || strstr(w, "ep_poll");
+}
+
 // Combined check: prefer syscall (authoritative), fall back to wchan symbol,
 // then to the ptrace-opaque-sleeping heuristic for setuid children.
 // Returns 1 for an authoritative tty-read, 2 for the opaque guess (the task
@@ -417,6 +456,7 @@ static int proc_is_opaque_sleeping(pid_t pid) {
 // caller must corroborate, e.g. with PTY silence), 0 otherwise.
 static int proc_is_blocked_on_tty(pid_t pid) {
     if (proc_syscall_is_tty_read(pid) || proc_wchan_is_tty_read(pid)) return 1;
+    if (proc_is_poll_waiting(pid)) return 2;
     return proc_is_opaque_sleeping(pid) ? 2 : 0;
 }
 

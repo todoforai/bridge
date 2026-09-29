@@ -211,6 +211,21 @@ int main(void) {
         settle(e, s, "");
     }
 
+    // A line-editing REPL waits in pselect6/epoll, not a tty read(): weak
+    // probe signal, parks only with a prompt-shaped tail + OPAQUE_QUIET_MS.
+    if (system("python3 -c 1 >/dev/null 2>&1") == 0) {
+        int64_t t0 = monotonic_ms();
+        run_step(e, s, "python3 -q -i -c 'print(1)'", 0, 8000);
+        expect("python REPL parks", 1, 0);
+        if (g_parked) printf("     parked after %lld ms\n", (long long)(monotonic_ms() - t0));
+        settle(e, s, "\x04");
+    } else printf("skip [python REPL parks: no python3]\n");
+
+    // The same poll()-sleep WITHOUT a prompt (a download, a build waiting on
+    // a socket) must run to completion, not park.
+    run_step(e, s, "printf 'downloading...\\n'; python3 -c 'import select; select.select([],[],[],4)' 2>/dev/null || sleep 4; echo done", 0, 9000);
+    expect("silent poll-wait completes", 0, 1);
+
     // noInput: not even a real prompt may park — the caller has nobody to ask.
     run_step(e, s, "printf 'Continue? [y/N] '; read a", 1, 3000);
     expect("noInput never parks", 0, 0);
