@@ -240,11 +240,75 @@ static int test_cmd_dialect(void) {
     return 0;
 }
 
+// INPUT keystrokes (bridge_pty_write_input): a native console REPL only takes
+// '\r' as Enter under ConPTY. Sends LF-terminated lines, as the backend does,
+// and checks python executes them (single line + multi-line def + blank line),
+// then that bash `read` still accepts the translated Enter.
+static int test_input_enter(void) {
+    bridge_pty_t pty;
+    if (bridge_pty_spawn(&pty, NULL, NULL, 1) != 0) {
+        fprintf(stderr, "FAIL: could not spawn shell for input test\n");
+        return 1;
+    }
+    bridge_pty_resize(&pty, 40, 120);
+    char output[65536] = {0};
+
+    const char *start = "command -v python >/dev/null 2>&1 && echo TFA_PY_YES || echo TFA_PY_NO\n";
+    bridge_pty_write_all(&pty, start, strlen(start));
+    if (wait_for_text(&pty, "TFA_PY_", output, sizeof output, 15000) == 0 && strstr(output, "TFA_PY_YES")) {
+        const char *py = "python -q -i -c \"print('TFA'+'READY')\"\n";
+        bridge_pty_write_all(&pty, py, strlen(py));
+        if (wait_for_text(&pty, "TFAREADY", output, sizeof output, 20000)) {
+            fprintf(stderr, "FAIL: python REPL did not start\n");
+            bridge_pty_close(&pty); return 1;
+        }
+        Sleep(500);
+        const char *in1 = "print(40+2)\n";
+        const char *in2 = "def f(x):\n    return x*1000+7\n\nprint(f(5))\n";
+        const char *in3 = "exit()\n";
+        if (bridge_pty_write_input(&pty, in1, strlen(in1)) ||
+            wait_for_text(&pty, "42", output, sizeof output, 10000)) {
+            strip_ansi(output);
+            fprintf(stderr, "FAIL: python REPL did not run an LF-terminated line. Output:\n%s\n", output);
+            bridge_pty_close(&pty); return 1;
+        }
+        if (bridge_pty_write_input(&pty, in2, strlen(in2)) ||
+            wait_for_text(&pty, "5007", output, sizeof output, 10000)) {
+            strip_ansi(output);
+            fprintf(stderr, "FAIL: python REPL multi-line def failed. Output:\n%s\n", output);
+            bridge_pty_close(&pty); return 1;
+        }
+        bridge_pty_write_input(&pty, in3, strlen(in3));
+        puts("PASS: python REPL runs LF-terminated input (single, multi-line def)");
+    } else {
+        puts("SKIP: python REPL input (python not on PATH)");
+    }
+
+    const char *rd = "read -p 'TFA''Q? ' v; echo \"TFAGOT=$v\"\n";
+    bridge_pty_write_all(&pty, rd, strlen(rd));
+    if (wait_for_text(&pty, "TFAQ?", output, sizeof output, 10000)) {
+        fprintf(stderr, "FAIL: read prompt missing\n");
+        bridge_pty_close(&pty); return 1;
+    }
+    const char *ans = "yes\n";
+    bridge_pty_write_input(&pty, ans, strlen(ans));
+    int rc = wait_for_text(&pty, "TFAGOT=yes", output, sizeof output, 10000);
+    bridge_pty_close(&pty);
+    if (rc) {
+        strip_ansi(output);
+        fprintf(stderr, "FAIL: bash read did not accept translated Enter. Output:\n%s\n", output);
+        return 1;
+    }
+    puts("PASS: bash read accepts translated Enter");
+    return 0;
+}
+
 int main(void) {
     if (test_shell_io() != 0) return 1;
     if (test_process_tree_termination() != 0) return 1;
     if (test_busybox_run_wrapper() != 0) return 1;
     if (test_cmd_dialect() != 0) return 1;
+    if (test_input_enter() != 0) return 1;
     puts("Windows PTY smoke tests passed");
     return 0;
 }

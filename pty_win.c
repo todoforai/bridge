@@ -372,6 +372,26 @@ int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
     return 0;
 }
 
+int bridge_pty_write_input(bridge_pty_t *p, const void *buf, size_t len) {
+    // Enter under ConPTY is '\r': a native console app (python -i) reads a '\n'
+    // as just another character and waits for the real Enter forever. MSYS
+    // bash `read` takes '\r' as Enter too, so translating is safe for both.
+    const uint8_t *b = buf;
+    uint8_t out[4096];
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = b[i];
+        if (c == '\r' && i + 1 < len && b[i + 1] == '\n') { c = '\r'; i++; }
+        else if (c == '\n') c = '\r';
+        out[o++] = c;
+        if (o == sizeof out) {
+            if (bridge_pty_write_all(p, out, o) != 0) return -1;
+            o = 0;
+        }
+    }
+    return o ? bridge_pty_write_all(p, out, o) : 0;
+}
+
 long bridge_pty_read(bridge_pty_t *p, void *buf, size_t len) {
     DWORD avail = 0;
     if (!PeekNamedPipe((HANDLE)p->h_out_read, NULL, 0, NULL, &avail, NULL)) {

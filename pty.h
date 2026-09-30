@@ -47,6 +47,12 @@ void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols);
 // Write all bytes. Returns 0 on success, -1 on error.
 int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len);
 
+// Write user keystrokes (INPUT frames) — what a human would type. POSIX: same
+// as write_all (the line discipline's ICRNL/ICANON handle Enter). Windows:
+// ConPTY has no line discipline and native console programs (python REPL)
+// only take '\r' as Enter, so '\r\n' and a lone '\n' become '\r'.
+int bridge_pty_write_input(bridge_pty_t *p, const void *buf, size_t len);
+
 // Canonical (line-assembly) mode on/off on the slave. RUN delivers its wrapper
 // raw (ICANON caps a line at MAX_CANON — 1024 on macOS — and drops the rest);
 // a parked step flips it on so user INPUT gets ^D / erase semantics.

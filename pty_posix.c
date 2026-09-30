@@ -173,6 +173,10 @@ static long mono_ms(void) {
     return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+int bridge_pty_write_input(bridge_pty_t *p, const void *buf, size_t len) {
+    return bridge_pty_write_all(p, buf, len);
+}
+
 int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
     const uint8_t *b = buf;
     size_t written = 0;
