@@ -11,6 +11,10 @@
 
 #include "json.h"
 
+#ifdef _MSC_VER            // MSVC CRT spells it with an underscore
+#  define strncasecmp _strnicmp
+#endif
+
 #define ED25519_PREFIX     "ssh-ed25519 "
 #define ED25519_B64_LEN    68   // 51-byte blob, no padding
 #define MANAGED_HEADER     "# Managed by TODOforAI bridge (ssh " CLOUD_SSH_ALIAS "). Regenerated automatically; do not edit.\n"
