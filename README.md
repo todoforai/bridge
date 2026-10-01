@@ -223,7 +223,7 @@ todoforai-bridge policy list            # restart bridge to apply
 
 On a durable PC bridge the backend can set up plain OpenSSH access to the
 user's cloud sandbox (no VPN, no proxy). Advertised as `identity.cloudSsh:
-true`; the backend only offers it then (`CLOUD_SSH_ENABLED=1` server-side).
+true`; the backend offers it unless switched off (globally `CLOUD_SSH_ENABLED=0`, or per PC by the owner in the device menu).
 
 Flow: `cloud_ssh_offer` → bridge ensures `~/.ssh/tfa_cloud` (ed25519, created
 once by `ssh-keygen`, never overwritten) → `cloud_ssh_key` → `cloud_ssh_config`
