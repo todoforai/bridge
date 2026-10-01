@@ -132,6 +132,18 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
         setenv("MANPAGER", "cat", 1);
         setenv("SYSTEMD_PAGER", "cat", 1);
         setenv("AWS_PAGER", "", 1);
+        // A Finder/launchd-started bridge has no locale at all. Bash's
+        // readline then reads UTF-8 bytes as meta keys (convert-meta), so
+        // `echo '→ x'` loses its closing quote and the RUN sits at PS2 until
+        // the timeout with no output. Only fill in a UTF-8 ctype when the
+        // user has set no locale.
+        if (!getenv("LC_ALL") && !getenv("LC_CTYPE") && !getenv("LANG")) {
+#ifdef __APPLE__
+            setenv("LC_CTYPE", "UTF-8", 1);
+#else
+            setenv("LC_CTYPE", "C.UTF-8", 1);
+#endif
+        }
         // Make HostDesktop-installed tools discoverable (cached, see spawn_env_init).
         if (g_tools_path) setenv("PATH", g_tools_path, 1);
         // Route sudo -A / ssh password prompts through a visible tty read

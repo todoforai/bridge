@@ -112,6 +112,10 @@ int main(void) {
     // documented limitation, mitigated by random generation).
     fails += run_case("non-colliding-payload", "printf '__BRIDGE_STEP_OTHER__:0\\n'",
                                                "__BRIDGE_STEP_OTHER__:0\r\n", 0);
+    // Finder/launchd-started bridge: no locale. Bash readline then ate the
+    // UTF-8 bytes as meta keys and the closing quote with them → PS2 forever.
+    unsetenv("LANG"); unsetenv("LC_ALL"); unsetenv("LC_CTYPE");
+    fails += run_case("utf8-no-locale", "echo '\xe2\x86\x92 x'", "\xe2\x86\x92 x\r\n", 0);
     if (fails) fprintf(stderr, "\n%d test(s) failed\n", fails);
     else       fprintf(stderr, "\nall tests passed\n");
     return fails ? 1 : 0;
