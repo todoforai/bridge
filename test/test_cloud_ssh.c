@@ -123,34 +123,34 @@ static void test_validators(void) {
 
 static void test_parse(void) {
     char j[1024]; cloud_ssh_cfg_t c;
-    cfg_json(j, sizeof j, "ssh.todofor.ai", "2222", "workspace", HOSTKEY, UUID);
+    cfg_json(j, sizeof j, "ssh.todofor.ai", "2222", "root", HOSTKEY, UUID);
     CHECK(parse(j, &c) == 0 && c.port == 2222 && strcmp(c.host, "ssh.todofor.ai") == 0 &&
           strcmp(c.device_id, UUID) == 0 && strcmp(c.host_key, HOSTKEY) == 0 && !c.profile[0]);
 
     const char *bad_ports[] = { "0", "65536", "\"22\"", "22.5", "-1", "022", "1e3", "true", "99999999999" };
     for (size_t i = 0; i < sizeof bad_ports / sizeof *bad_ports; i++) {
-        cfg_json(j, sizeof j, "h.example", bad_ports[i], "workspace", HOSTKEY, UUID);
+        cfg_json(j, sizeof j, "h.example", bad_ports[i], "root", HOSTKEY, UUID);
         CHECK(parse(j, &c) != 0);
     }
-    cfg_json(j, sizeof j, "h.example", "22", "root", HOSTKEY, UUID);                CHECK(parse(j, &c) != 0);
-    cfg_json(j, sizeof j, "h.example", "22", "workspace", HOSTKEY, "not-a-uuid");   CHECK(parse(j, &c) != 0);
-    cfg_json(j, sizeof j, "h.ex\\nProxyCommand x", "22", "workspace", HOSTKEY, UUID); CHECK(parse(j, &c) != 0);
-    cfg_json(j, sizeof j, "h.example", "22", "work\\u0073pace", HOSTKEY, UUID);     CHECK(parse(j, &c) != 0);
+    cfg_json(j, sizeof j, "h.example", "22", "workspace", HOSTKEY, UUID);          CHECK(parse(j, &c) != 0);
+    cfg_json(j, sizeof j, "h.example", "22", "root", HOSTKEY, "not-a-uuid");   CHECK(parse(j, &c) != 0);
+    cfg_json(j, sizeof j, "h.ex\\nProxyCommand x", "22", "root", HOSTKEY, UUID); CHECK(parse(j, &c) != 0);
+    cfg_json(j, sizeof j, "h.example", "22", "r\\u006fot", HOSTKEY, UUID);     CHECK(parse(j, &c) != 0);
     char k2[128]; snprintf(k2, sizeof k2, "%.40s\\u002b%s", HOSTKEY, HOSTKEY + 41);
-    cfg_json(j, sizeof j, "h.example", "22", "workspace", k2, UUID);                CHECK(parse(j, &c) != 0);
+    cfg_json(j, sizeof j, "h.example", "22", "root", k2, UUID);                CHECK(parse(j, &c) != 0);
     CHECK(parse("{\"host\":\"h\"", &c) != 0);
     // Missing field.
-    snprintf(j, sizeof j, "{\"host\":\"h.example\",\"port\":22,\"user\":\"workspace\",\"cloudDeviceId\":\"%s\"}", UUID);
+    snprintf(j, sizeof j, "{\"host\":\"h.example\",\"port\":22,\"user\":\"root\",\"cloudDeviceId\":\"%s\"}", UUID);
     CHECK(parse(j, &c) != 0);
     // Job payload round-trip incl. profile; hostile profile rejected.
-    cfg_json(j, sizeof j, "h.example", "22", "workspace", HOSTKEY, UUID);
+    cfg_json(j, sizeof j, "h.example", "22", "root", HOSTKEY, UUID);
     CHECK(parse(j, &c) == 0);
     strcpy(c.profile, "dev");
     char pl[1024];
     CHECK(cloud_ssh_build_payload(&c, pl, sizeof pl) > 0);
     cloud_ssh_cfg_t c2;
     CHECK(parse(pl, &c2) == 0 && strcmp(c2.profile, "dev") == 0 && c2.port == 22);
-    snprintf(j, sizeof j, "{\"host\":\"h.example\",\"port\":22,\"user\":\"workspace\",\"hostKey\":\"%s\","
+    snprintf(j, sizeof j, "{\"host\":\"h.example\",\"port\":22,\"user\":\"root\",\"hostKey\":\"%s\","
                           "\"cloudDeviceId\":\"%s\",\"profile\":\"../x\"}", HOSTKEY, UUID);
     CHECK(parse(j, &c2) != 0);
 
@@ -184,7 +184,7 @@ static void test_render(void) {
     char out[4096];
     CHECK(cloud_ssh_render_config("/home/u/.ssh", &c, out, sizeof out) > 0);
     const char *must[] = {
-        "Host tfa-cloud\n", "  HostName h.example\n", "  Port 2222\n", "  User workspace\n",
+        "Host tfa-cloud\n", "  HostName h.example\n", "  Port 2222\n", "  User root\n",
         "  IdentityFile \"/home/u/.ssh/tfa_cloud\"\n", "  IdentitiesOnly yes\n", "  IdentityAgent none\n",
         "  UserKnownHostsFile \"/home/u/.ssh/tfa_cloud_known_hosts\"\n",
         "  HostKeyAlias tfa-cloud-0f8fad5b-d9cb-469f-a165-70867728950e\n",

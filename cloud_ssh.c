@@ -87,7 +87,7 @@ static int str_field(const char *msg, size_t len, const char *key, char *dst, si
     return 1;
 }
 
-static int is_workspace(const char *s, size_t n) { return n == 9 && memcmp(s, "workspace", 9) == 0; }
+static int is_root(const char *s, size_t n) { return n == 4 && memcmp(s, "root", 4) == 0; }
 
 int cloud_ssh_parse_config(const char *msg, size_t len, cloud_ssh_cfg_t *c, const char **err) {
     memset(c, 0, sizeof *c);
@@ -97,7 +97,7 @@ int cloud_ssh_parse_config(const char *msg, size_t len, cloud_ssh_cfg_t *c, cons
     if (!json_validate_doc(msg, len))                                                 *err = "malformed JSON";
     else if (!str_field(msg, len, "cloudDeviceId", c->device_id, sizeof c->device_id, cloud_ssh_valid_uuid)) *err = "invalid cloudDeviceId";
     else if (!str_field(msg, len, "host", c->host, sizeof c->host, cloud_ssh_valid_host))       *err = "invalid host";
-    else if (!str_field(msg, len, "user", user, sizeof user, is_workspace))                     *err = "user must be \"workspace\"";
+    else if (!str_field(msg, len, "user", user, sizeof user, is_root))                          *err = "user must be \"root\"";
     else if (!str_field(msg, len, "hostKey", c->host_key, sizeof c->host_key, cloud_ssh_valid_ed25519)) *err = "invalid hostKey";
     else if (!field(msg, len, "port", &v, &vl, &t) || t != JT_NUM || vl == 0 || vl > 5)         *err = "invalid port";
     else {
@@ -117,7 +117,7 @@ int cloud_ssh_parse_config(const char *msg, size_t len, cloud_ssh_cfg_t *c, cons
 
 int cloud_ssh_build_payload(const cloud_ssh_cfg_t *c, char *out, size_t cap) {
     int n = snprintf(out, cap,
-        "{\"cloudDeviceId\":\"%s\",\"host\":\"%s\",\"port\":%ld,\"user\":\"workspace\","
+        "{\"cloudDeviceId\":\"%s\",\"host\":\"%s\",\"port\":%ld,\"user\":\"root\","
         "\"hostKey\":\"%s\",\"profile\":\"%s\"}",
         c->device_id, c->host, c->port, c->host_key, c->profile);
     return (n < 0 || (size_t)n >= cap) ? -1 : n;
@@ -183,7 +183,7 @@ int cloud_ssh_render_config(const char *dir, const cloud_ssh_cfg_t *c, char *out
         "Host " CLOUD_SSH_ALIAS "\n"
         "  HostName %s\n"
         "  Port %ld\n"
-        "  User workspace\n"
+        "  User root\n"
         "  IdentityFile \"%s/tfa_cloud\"\n"
         "  IdentitiesOnly yes\n"
         "  IdentityAgent none\n"
@@ -517,7 +517,7 @@ static int verify_effective(const cloud_ssh_env_t *env, const cloud_ssh_cfg_t *c
     char want[12][1100]; int n = 0;
     snprintf(want[n++], sizeof want[0], "hostname %s", c->host);
     snprintf(want[n++], sizeof want[0], "port %ld", c->port);
-    snprintf(want[n++], sizeof want[0], "user workspace");
+    snprintf(want[n++], sizeof want[0], "user root");
     snprintf(want[n++], sizeof want[0], "identityfile %s/tfa_cloud", env->dir);
     snprintf(want[n++], sizeof want[0], "identitiesonly yes");
     snprintf(want[n++], sizeof want[0], "identityagent none");

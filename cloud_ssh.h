@@ -4,7 +4,7 @@
 //   → identity.data.cloudSsh = true                   (capable bridges only)
 //   ← {"type":"cloud_ssh_offer"}                       (on auth + every 5 min)
 //   → {"type":"cloud_ssh_key","publicKey":"ssh-ed25519 AAAA…"}
-//   ← {"type":"cloud_ssh_config","host":"…","port":N,"user":"workspace",
+//   ← {"type":"cloud_ssh_config","host":"…","port":N,"user":"root",
 //      "hostKey":"ssh-ed25519 AAAA…","cloudDeviceId":"<uuid>"}
 //   → {"type":"cloud_ssh_ready","cloudDeviceId":"<uuid>","ready":true|false}
 //

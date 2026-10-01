@@ -227,7 +227,7 @@ true`; the backend offers it unless switched off (globally `CLOUD_SSH_ENABLED=0`
 
 Flow: `cloud_ssh_offer` → bridge ensures `~/.ssh/tfa_cloud` (ed25519, created
 once by `ssh-keygen`, never overwritten) → `cloud_ssh_key` → `cloud_ssh_config`
-(strictly validated: DNS/IP host, port 1–65535, user `workspace`, canonical
+(strictly validated: DNS/IP host, port 1–65535, user `root`, canonical
 `ssh-ed25519` key of 68 base64 chars, uuid) → writes `~/.ssh/tfa_cloud_config`
 + `~/.ssh/tfa_cloud_known_hosts` (pinned under `HostKeyAlias
 tfa-cloud-<uuid>`), prepends one `Include` to `~/.ssh/config`, checks `ssh -G
