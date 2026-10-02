@@ -2223,6 +2223,30 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         RUN_ID(cblk,  "chatBlockId",     "INVALID_CHAT_BLOCK_ID", "chatBlockId");
         #undef RUN_ID
 
+        // Timezone is per-RUN metadata, not session state. Validate before
+        // any ids are committed; this restricted alphabet is shell-safe.
+        const char *tz = NULL; size_t tz_len = 0;
+        int tz_present = json_get_str(msg, msg_len, "timeZone", &tz, &tz_len);
+        if (tz_present) {
+            int valid = tz_len <= 128;
+            for (size_t i = 0; valid && i < tz_len; i++) {
+                unsigned char c = (unsigned char)tz[i];
+                valid = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '/' || c == '_' ||
+                        c == '-' || c == '+' || c == '.' || c == ':';
+            }
+            if (!valid) {
+                free(cmd); RUN_FAIL_CLEANUP();
+                return send_error(e, NULL, 0, bid, bid_len, "INVALID_TIMEZONE",
+                                  "timeZone must be at most 128 shell-safe IANA timezone characters");
+            }
+        }
+        char tz_env[192] = "";
+        if (tz_present && tz_len)
+            snprintf(tz_env, sizeof tz_env, "; export TODOFORAI_TIMEZONE=%.*s", (int)tz_len, tz);
+        else if (tz_present)
+            snprintf(tz_env, sizeof tz_env, "; unset TODOFORAI_TIMEZONE");
+
         // Validation done — commit the session-scoped ids. Exported so a
         // tfa-* / todoforai-cli child inherits the calling TODO's identity.
         #define RUN_ID_COMMIT(src, field) do { \
@@ -2353,7 +2377,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + s->begin_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
                              + sizeof(idenv) + sizeof(e->api_url)
-                             + sizeof(fenv) + sizeof(cenv) + strlen(cdpre) + 384;
+                             + sizeof(fenv) + sizeof(cenv) + sizeof(tz_env) + strlen(cdpre) + 384;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
@@ -2371,26 +2395,26 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'; "
-                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s; " SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; " SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
                 idenv,
-                fenv, cenv,
+                fenv, cenv, tz_env,
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
                 // idenv is ` KEY=val` fragments and may be empty, so `export`
                 // is emitted only when there is something to export; fenv/cenv
                 // are full `; export …` / `; unset …` statements.
-                CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'%s%s%s%s; "
+                CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'%s%s%s%s%s; "
                 SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv[0] ? "; export" : "", idenv,
-                fenv, cenv,
+                fenv, cenv, tz_env,
                 (int)cmd_len, cmd, s->sentinel);
         }
         free(cmd);

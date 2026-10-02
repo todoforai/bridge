@@ -66,7 +66,7 @@ static int test_capture(const char *json, size_t len) {
 static void run_step(edge_t *e, const char *session_id, const char *extra) {
     static const char *CMD =
         "echo \"T=[$TODOFORAI_TODO_ID] G=[$TODOFORAI_GROUP_ID] P=[$TODOFORAI_PROJECT_ID] A=[$AGENT_BROWSER_SESSION]"
-        " M=[$TODOFORAI_MESSAGE_ID] B=[$TODOFORAI_BLOCK_ID] F=[$TODOFORAI_FRONTEND_ID] MODEL=[$TODOFORAI_MODEL_ID]\"";
+        " M=[$TODOFORAI_MESSAGE_ID] B=[$TODOFORAI_BLOCK_ID] F=[$TODOFORAI_FRONTEND_ID] MODEL=[$TODOFORAI_MODEL_ID] TZ=[$TODOFORAI_TIMEZONE]\"";
     char cmd_b64[512];
     size_t bn = b64_encode((const uint8_t *)CMD, strlen(CMD), cmd_b64, sizeof cmd_b64);
     assert(bn > 0);
@@ -122,6 +122,17 @@ int main(void) {
     s->state = SESS_IDLE;
     s->one_shot = 0;
     snprintf(s->session_id, sizeof s->session_id, "%s", SID);
+
+    // Timezone exports are independent of global TZ and reject injection.
+    run_step(e, SID, "\"timeZone\":\"Europe/Budapest\"");
+    expect("timezone exported", "TZ=[Europe/Budapest]");
+    run_step(e, SID, "\"timeZone\":\"Etc/GMT+5\"");
+    expect("timezone changed", "TZ=[Etc/GMT+5]");
+    run_step(e, SID, "\"timeZone\":\"x;echo INJECTED\"");
+    if (strcmp(g_error, "INVALID_TIMEZONE") != 0) g_fails++;
+    run_step(e, SID, "\"timeZone\":\"\"");
+    expect("timezone explicitly cleared", "TZ=[]");
+    ok("per-run timezone is exported safely");
 
     // ── The pair is exported when sent ──
     run_step(e, SID, "\"todoId\":\"todo-1\",\"groupTag\":\"grp-1\",\"projectId\":\"proj-1\","
