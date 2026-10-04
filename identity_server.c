@@ -4,6 +4,7 @@
 
 #include "identity_server.h"
 #include "json.h"
+#include "file_server.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -14,6 +15,7 @@
 #  define strncasecmp _strnicmp
 static int is_close_fd(SOCKET s) { return closesocket(s); }
 static int is_set_nb(SOCKET s)   { u_long m = 1; return ioctlsocket(s, FIONBIO, &m); }
+static void is_cloexec(SOCKET s) { SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0); }
 #else
 #  include <arpa/inet.h>
 #  include <strings.h>  // strncasecmp
@@ -24,6 +26,7 @@ static int is_set_nb(SOCKET s)   { u_long m = 1; return ioctlsocket(s, FIONBIO, 
 #  include <unistd.h>
 static int is_close_fd(int s) { return close(s); }
 static int is_set_nb(int s)   { int f = fcntl(s, F_GETFL, 0); return f < 0 ? -1 : fcntl(s, F_SETFL, f | O_NONBLOCK); }
+static void is_cloexec(int s) { fcntl(s, F_SETFD, FD_CLOEXEC); }
 #endif
 
 // One absolute budget for accept→read→write: this runs on the daemon's main
@@ -37,6 +40,7 @@ ws_fd_t bridge_identity_server_open(void) {
 #endif
     ws_fd_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == WS_INVALID_FD) return WS_INVALID_FD;
+    is_cloexec(fd);
     // SO_REUSEADDR only skips TIME_WAIT leftovers of our own previous
     // instance; a live listener (e.g. the bun edge) still wins the port — and
     // it names this machine just as well. (On Windows it would allow real
@@ -109,10 +113,11 @@ static int header_value(const char *req, const char *name, char *out, size_t cap
 void bridge_identity_server_serve(ws_fd_t listen_fd, const char *device_id) {
     ws_fd_t fd = accept(listen_fd, NULL, NULL);
     if (fd == WS_INVALID_FD) return;
+    is_cloexec(fd);  // a PTY spawned while a stream runs must not inherit it
     int64_t deadline = ws_monotonic_ms() + IO_BUDGET_MS;
     if (is_set_nb(fd) != 0) { is_close_fd(fd); return; }
 
-    char req[2048] = {0};
+    char req[4096] = {0};
     size_t off = 0;
     int complete = 0;
     while (off + 1 < sizeof req) {
@@ -131,17 +136,25 @@ void bridge_identity_server_serve(ws_fd_t listen_fd, const char *device_id) {
     if (!complete) { is_close_fd(fd); return; }
 
     char origin[256];
-    char cors[512] = "";
+    char cors[768] = "";
     if (header_value(req, "Origin", origin, sizeof origin) && origin_allowed(origin, strlen(origin)))
         snprintf(cors, sizeof cors,
                  "Access-Control-Allow-Origin: %s\r\n"
                  "Access-Control-Allow-Private-Network: true\r\n"
-                 "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                 "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"
+                 "Access-Control-Allow-Headers: Range\r\n"
+                 "Access-Control-Expose-Headers: Content-Range, Content-Length, Accept-Ranges\r\n"
                  "Access-Control-Max-Age: 86400\r\n"
                  "Vary: Origin\r\n", origin);
 
-    char out[1024];
-    if (strncmp(req, "OPTIONS /identity ", 18) == 0) {
+    // /file streams on its own thread (file_server.c), which owns fd from here.
+    if (strncmp(req, "GET /file?", 10) == 0 || strncmp(req, "HEAD /file?", 11) == 0) {
+        bridge_file_serve(fd, req, cors);
+        return;
+    }
+
+    char out[2048];
+    if (strncmp(req, "OPTIONS /identity ", 18) == 0 || strncmp(req, "OPTIONS /file?", 14) == 0) {
         snprintf(out, sizeof out, "HTTP/1.0 204 No Content\r\n%sConnection: close\r\n\r\n", cors);
     } else if (strncmp(req, "GET /identity ", 14) == 0 && device_id && device_id[0]) {
         // Only the id: the frontend already has name/os from the device list.

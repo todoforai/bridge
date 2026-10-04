@@ -33,11 +33,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c \
+COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h \
+HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -160,6 +160,13 @@ test-policy: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-policy test/test_policy.c $(TEST_DEPS) -lutil
 	./build/test-policy
 
+# Loopback file streaming (file_server.c): grant, token gate, Range, CORS.
+.PHONY: test-file-server
+test-file-server: | build
+	$(CC) -O0 -g -Wall -Wextra -DIDENTITY_SERVER_PORT=43199 -I. -I$(CORE)/noise -o build/test-file-server test/test_file_server.c \
+	    identity_server.c file_server.c json.c ws.c policy.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
+	./build/test-file-server
+
 # Off-loop jobs: the loop keeps ticking while a slow worker runs; frame
 # reassembly, deadlines, slot cap and teardown reaping.
 .PHONY: test-jobs
@@ -193,7 +200,7 @@ test-timing: | build
 test-coalesce: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
-	    test/test_coalesce.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    test/test_coalesce.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-coalesce
 
@@ -205,7 +212,7 @@ test-coalesce: | build
 test-runenv: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
-	    test/test_runenv.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    test/test_runenv.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
@@ -216,7 +223,7 @@ test-runenv: | build
 test-initdrain: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-initdrain \
-	    test/test_initdrain.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    test/test_initdrain.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-initdrain
 
@@ -228,7 +235,7 @@ test-initdrain: | build
 test-oneshot-leak: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-oneshot-leak \
-	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-oneshot-leak
 
@@ -270,7 +277,7 @@ test-probe: | build
 test-prompt-tail: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-prompt-tail \
-	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-prompt-tail
 
@@ -280,7 +287,7 @@ test-prompt-tail: | build
 test-park: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-park \
-	    test/test_park.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    test/test_park.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-park
 
@@ -375,6 +382,6 @@ clean:
 test-pool: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-pool \
-	    test/test_pool.c noise_ws.c identity.c identity_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    test/test_pool.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-pool

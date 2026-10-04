@@ -16,7 +16,9 @@
 
 #include "ws.h"  // ws_fd_t, WS_INVALID_FD
 
+#ifndef IDENTITY_SERVER_PORT  // tests override it so they run beside a live bridge
 #define IDENTITY_SERVER_PORT 43127
+#endif
 
 // Bind + listen on 127.0.0.1:IDENTITY_SERVER_PORT (non-blocking). Returns the
 // listening fd, or the platform invalid fd when the port is taken — the bridge

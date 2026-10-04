@@ -83,6 +83,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "args.h"      // ketopt + cli_usage helpers
 #include "identity.h"  // BRIDGE_VERSION
 #include "identity_server.h"
+#include "file_server.h"
 #include "json.h"
 #include "noise.h"     // noise_random
 #include "noise_ws.h"
@@ -2956,6 +2957,43 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             #undef RFB_ISREG
             #undef rfb_close
             #undef rfb_fstat
+        } else if (fn_len == 10 && memcmp(fn, "file_grant", 10) == 0) {
+            // args: {path}. Mints a capability token for streaming this one
+            // file from the loopback port (file_server.h) — the caller's
+            // browser, if on this machine, fetches
+            // http://127.0.0.1:43127/file?t=<token> with Range support.
+            // Result: {token, port, totalSize}
+            const char *praw = NULL; size_t praw_len = 0;
+            if (e->identity_fd == WS_INVALID_FD) {
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                         "file_grant: loopback port not held by this bridge");
+                return 0;
+            }
+            if (!args || !json_get_str(args, args_len, "path", &praw, &praw_len) || praw_len == 0) {
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, "file_grant requires args.path");
+                return 0;
+            }
+            char *path = malloc(praw_len + 1);
+            size_t plen = 0;
+            if (!path || !json_get_str_decoded(args, args_len, "path", path, praw_len + 1, &plen)) {
+                free(path);
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, "file_grant: malformed args.path");
+                return 0;
+            }
+            char *expanded = bridge_expand_tilde(path);
+            if (expanded) { free(path); path = expanded; }
+            char token[FILE_GRANT_TOKEN_LEN + 1], gerr[2300];
+            long long size = 0;
+            if (bridge_file_grant(path, token, sizeof token, &size, gerr, sizeof gerr) != 0) {
+                free(path);
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, gerr);
+                return 0;
+            }
+            free(path);
+            char result[160];
+            int rn = snprintf(result, sizeof result, "{\"token\":\"%s\",\"port\":%d,\"totalSize\":%lld}",
+                              token, IDENTITY_SERVER_PORT, size);
+            send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)rn);
         } else if (fn_len == 21 && memcmp(fn, "preview_register_port", 21) == 0) {
             // live_preview: allow the relay to serve this local port (see
             // preview.c). Probes first so the agent gets an immediate
@@ -2981,7 +3019,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         } else {
             char errmsg[160];
             snprintf(errmsg, sizeof errmsg,
-                     "Unknown function: %.*s. Available: scan_tools, write_file_b64, read_file_b64, preview_register_port",
+                     "Unknown function: %.*s. Available: scan_tools, write_file_b64, read_file_b64, file_grant, preview_register_port",
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
