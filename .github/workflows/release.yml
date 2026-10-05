@@ -98,16 +98,16 @@ jobs:
         if: startsWith(matrix.target, 'darwin-') && github.repository == 'todoforai/bridge'
         env:
           CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           missing=""
-          [ -n "$CERT" ]               || missing="$missing APPLE_CERT_P12_BASE64"
-          [ -n "$CERT_PASSWORD" ]      || missing="$missing APPLE_CERT_PASSWORD"
-          [ -n "$APPLE_ID" ]           || missing="$missing APPLE_ID"
-          [ -n "$APPLE_TEAM_ID" ]      || missing="$missing APPLE_TEAM_ID"
-          [ -n "$APPLE_APP_PASSWORD" ] || missing="$missing APPLE_APP_PASSWORD"
+          [ -n "$CERT" ]             || missing="$missing APPLE_CERT_P12_BASE64"
+          [ -n "$CERT_PASSWORD" ]    || missing="$missing APPLE_CERT_PASSWORD"
+          [ -n "$APPLE_API_KEY" ]    || missing="$missing APPLE_API_KEY"
+          [ -n "$APPLE_API_KEY_ID" ] || missing="$missing APPLE_API_KEY_ID"
+          [ -n "$APPLE_API_ISSUER" ] || missing="$missing APPLE_API_ISSUER"
           if [ -n "$missing" ]; then
             echo "::error::missing signing secret(s):$missing — macOS builds would be blocked by Gatekeeper" >&2
             exit 1
@@ -144,9 +144,9 @@ jobs:
         if: startsWith(matrix.target, 'darwin-') && env.CERT != ''
         working-directory: bridge/build
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           ASSET: todoforai-bridge-${{ matrix.target }}
         run: |
           set -eu
@@ -159,13 +159,17 @@ jobs:
 
           # A bare Mach-O executable can't be stapled, so notarize a zip of it.
           # Gatekeeper then validates online via the signed+notarized identity.
+          # App Store Connect API key (same as the Electron app): no Apple ID
+          # password / 2FA, and not tied to one person's agreement state.
           ditto -c -k --keepParent "$ASSET" "$ASSET.zip"
+          KEY_FILE="$RUNNER_TEMP/asc.p8"
+          printf '%s\n' "$APPLE_API_KEY" > "$KEY_FILE"
           xcrun notarytool submit "$ASSET.zip" \
-              --apple-id "$APPLE_ID" \
-              --team-id "$APPLE_TEAM_ID" \
-              --password "$APPLE_APP_PASSWORD" \
+              --key "$KEY_FILE" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
               --wait --timeout 30m
-          rm -f "$ASSET.zip"
+          rm -f "$ASSET.zip" "$KEY_FILE"
 
           # notarytool's Accepted status above is the notarization gate. A bare
           # Mach-O CLI is not an app bundle, so `spctl --type execute` reports
