@@ -42,7 +42,7 @@ static size_t http(const char *req, char *out, size_t cap) {
 static const char *body_of(const char *resp) { const char *b = strstr(resp, "\r\n\r\n"); return b ? b + 4 : NULL; }
 
 int main(void) {
-    g_lfd = bridge_identity_server_open();
+    g_lfd = bridge_identity_server_open(IDENTITY_SERVER_PORT);
     if (g_lfd == WS_INVALID_FD) { printf("SKIP: port %d taken (a bridge is running)\n", IDENTITY_SERVER_PORT); return 0; }
 
     char path[] = "/tmp/fs-test-XXXXXX.mp4";

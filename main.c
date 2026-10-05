@@ -522,11 +522,12 @@ typedef struct {
     // process entirely. Only meaningful together with `mayfly`.
     const char *session_token;
     const char *user_email;  // for the auth banner; points into main()'s saved_creds
-    // Loopback 127.0.0.1:43127 listener answering GET /identity so a web
-    // frontend on this machine learns our device id (identity_server.h).
+    // Loopback 127.0.0.1:identity_port listener answering GET /identity so a
+    // web frontend on this machine learns our device id (identity_server.h).
     // Invalid fd while the port is taken (a predecessor still shutting down,
     // the bun edge); retried on each (re)connect, never fatal.
     ws_fd_t identity_fd;
+    uint16_t identity_port;  // 43127 for prod, 43128 for a local/dev backend
     // Mayfly mode (--mayfly <todoId>): ephemeral, task-scoped session. Auths
     // with the normal saved credentials but registers backend-side under the
     // in-memory id `mayfly-<todoId>` — never as the persistent device row —
@@ -2961,7 +2962,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // args: {path}. Mints a capability token for streaming this one
             // file from the loopback port (file_server.h) — the caller's
             // browser, if on this machine, fetches
-            // http://127.0.0.1:43127/file?t=<token> with Range support.
+            // http://127.0.0.1:<identity_port>/file?t=<token> with Range support.
             // Result: {token, port, totalSize}
             const char *praw = NULL; size_t praw_len = 0;
             if (e->identity_fd == WS_INVALID_FD) {
@@ -2992,7 +2993,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             free(path);
             char result[160];
             int rn = snprintf(result, sizeof result, "{\"token\":\"%s\",\"port\":%d,\"totalSize\":%lld}",
-                              token, IDENTITY_SERVER_PORT, size);
+                              token, e->identity_port, size);
             send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)rn);
         } else if (fn_len == 21 && memcmp(fn, "preview_register_port", 21) == 0) {
             // live_preview: allow the relay to serve this local port (see
@@ -3262,7 +3263,8 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                const uint8_t pubkey[32]) {
     e->device_id = device_id;
     e->device_secret = device_secret;
-    if (e->identity_fd == WS_INVALID_FD && !e->mayfly) e->identity_fd = bridge_identity_server_open();
+    e->identity_port = login_is_local_host(host) ? IDENTITY_SERVER_PORT_LOCAL : IDENTITY_SERVER_PORT;
+    if (e->identity_fd == WS_INVALID_FD && !e->mayfly) e->identity_fd = bridge_identity_server_open(e->identity_port);
     // Derive the public HTTP API URL from the Noise host. In prod a TLS
     // terminator (nginx/Cloudflare) fronts the backend on 443 while the Noise
     // channel rides plain WS on port 80 — so the transport `port` must NOT leak

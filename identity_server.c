@@ -33,7 +33,7 @@ static void is_cloexec(int s) { fcntl(s, F_SETFD, FD_CLOEXEC); }
 // loop, so a slow local client must never hold agent traffic for long.
 #define IO_BUDGET_MS 300
 
-ws_fd_t bridge_identity_server_open(void) {
+ws_fd_t bridge_identity_server_open(uint16_t port) {
 #ifdef _WIN32
     WSADATA wd;
     if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) return WS_INVALID_FD;
@@ -48,7 +48,7 @@ ws_fd_t bridge_identity_server_open(void) {
 #ifndef _WIN32
     int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 #endif
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(IDENTITY_SERVER_PORT) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 8) != 0 || is_set_nb(fd) != 0) {
         is_close_fd(fd);

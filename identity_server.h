@@ -19,11 +19,17 @@
 #ifndef IDENTITY_SERVER_PORT  // tests override it so they run beside a live bridge
 #define IDENTITY_SERVER_PORT 43127
 #endif
+// A bridge paired with a local/dev backend answers on its own port, so a dev
+// bridge never shadows the prod one (and vice versa) on the same machine. The
+// extension picks the port by the same rule (local-identity.ts).
+#ifndef IDENTITY_SERVER_PORT_LOCAL
+#define IDENTITY_SERVER_PORT_LOCAL 43128
+#endif
 
-// Bind + listen on 127.0.0.1:IDENTITY_SERVER_PORT (non-blocking). Returns the
-// listening fd, or the platform invalid fd when the port is taken — the bridge
-// runs fine without it, so callers just skip polling.
-ws_fd_t bridge_identity_server_open(void);
+// Bind + listen on 127.0.0.1:port (non-blocking). Returns the listening fd,
+// or the platform invalid fd when the port is taken — the bridge runs fine
+// without it, so callers just skip polling.
+ws_fd_t bridge_identity_server_open(uint16_t port);
 
 // Accept and answer one pending connection (call on POLLIN of the listen fd).
 // The whole exchange shares one ~300ms budget, so a slow local client can
