@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --token)      need_val "$1" "${2:-}"; TOKEN=$2;       shift 2 ;;
         --name)       need_val "$1" "${2:-}"; DEVICE_NAME=$2; shift 2 ;;
-        --prefix)     need_val "$1" "${2:-}"; PREFIX=$2;      shift 2 ;;
+        --prefix)     need_val "$1" "${2:-}"; PREFIX=$2; PREFIX_SET=1; shift 2 ;;
         --tag)        need_val "$1" "${2:-}"; TAG=$2;         shift 2 ;;
         --service)    DO_SERVICE=1; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -53,7 +53,24 @@ uname_m=$(uname -m)
 case "$uname_s" in
     Linux)  os=linux ;;
     Darwin) os=darwin ;;
-    *)      die "unsupported OS: $uname_s (Windows coming soon)" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        # Git Bash / MSYS / Cygwin: hand off to the native PowerShell installer.
+        command -v powershell.exe >/dev/null 2>&1 || die "powershell.exe not found; run in PowerShell: irm https://todofor.ai/bridge.ps1 | iex"
+        ps1="${TMPDIR:-/tmp}/todoforai-bridge-install.$$.ps1"
+        # UTF-8 BOM: Windows PowerShell 5.1 reads BOM-less files as ANSI and chokes on non-ASCII.
+        printf '\357\273\277' >"$ps1"
+        curl -fsSL https://todofor.ai/bridge.ps1 >>"$ps1" || die "download failed: bridge.ps1"
+        winpath() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+        set -- -NoProfile -ExecutionPolicy Bypass -File "$(winpath "$ps1")"
+        [ -n "$TOKEN" ]        && set -- "$@" -Token "$TOKEN"
+        [ -n "$DEVICE_NAME" ]  && set -- "$@" -Name "$DEVICE_NAME"
+        [ -n "$TAG" ]          && set -- "$@" -Tag "$TAG"
+        [ "${PREFIX_SET:-0}" = 1 ] && set -- "$@" -Prefix "$(winpath "$PREFIX")"
+        [ "$DO_SERVICE" = 1 ]  && set -- "$@" -Service
+        info "Windows detected — running PowerShell installer"
+        rc=0; powershell.exe "$@" || rc=$?
+        rm -f "$ps1"; exit $rc ;;
+    *)      die "unsupported OS: $uname_s" ;;
 esac
 case "$uname_m" in
     x86_64|amd64) arch=x64 ;;
