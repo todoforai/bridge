@@ -273,6 +273,17 @@ test-probe: | build
 
 # Prompt-shaped output tail: the corroboration that stops a merely-slow command
 # (macOS has no wait channel, so the probe alone cannot tell) from being parked.
+# Trailing `| tail -N` strip on the RUN path: parser cases + live steps on a
+# real PTY (last-N cut, prefix exit code, park shows progress). No `-I.`: it
+# would shadow <pty.h> with the bridge's own pty.h on Linux.
+.PHONY: test-tail-strip
+test-tail-strip: | build
+	$(CC) -O0 -g -Wall -Wextra -Wno-unused-function -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-tail-strip \
+	    test/test_tail_strip.c noise_ws.c identity.c identity_server.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c \
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-tail-strip
+
 .PHONY: test-prompt-tail
 test-prompt-tail: | build
 	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \

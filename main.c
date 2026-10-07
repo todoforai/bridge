@@ -244,6 +244,11 @@ typedef struct {
     uint8_t tcur[OB_TCUR_CAP];
     size_t  tcur_len, tcur_col, tcur_charged;
     cr_tok_t tail_tok;
+    // >0: the RUN ended in `| tail -N` that the bridge stripped (see
+    // strip_trailing_tail). Nothing streams; ob_finish emits the last N lines
+    // of the rolling tail instead of the truncation notice.
+    long   tail_lines;
+    int    tail_wrapped; // rolling tail dropped bytes (oldest lines are gone)
 } out_policy_t;
 
 
@@ -1428,7 +1433,105 @@ static void ob_resolve(out_policy_t *ob, const char *mode, size_t mode_len) {
     if (cap == OB_NOLIMIT) lastlim = last;
     else { size_t room = (head >= cap) ? 0 : cap - head; lastlim = last < room ? last : room; }
     ob->head_limit = head; ob->last_limit = lastlim; ob->line_limit = line;
+    ob->tail_lines = 0;
     ob_reset(ob);
+}
+
+// ── Trailing `| tail -N` strip ──────────────────────────────────────────────
+// `cmd | tail -N` is how a model keeps a noisy command's result small — but
+// tail prints nothing until its stdin closes, so a step that hits its
+// deadline parks with "(no output)" and the agent never learns how far the
+// command got (qemu boot + `apk add` sat 7 minutes behind `| tail -60`).
+// When the step is ONE pipeline ending in `| tail -N`, the bridge drops the
+// tail stage, runs the prefix, and applies the last-N-lines cut itself from
+// the rolling output tail: at a park the agent sees the last N lines so far,
+// at step end exactly what tail would have printed, and the exit code is the
+// real command's (tail's was always 0). Fails open: anything the scanner
+// can't prove a single pipeline (`;`, `&&`, `||`, `&`, `|&`, newline,
+// backtick, comment at top level, unbalanced parens/quotes) runs untouched,
+// as do `tail -f`, `tail +N`, `tail -c`, files, and the raw/full output
+// modes (their contract is "bytes as-is"). Known, accepted differences:
+// stderr shares the N-line budget (a real `| tail` lets it scroll past), and
+// the command writes to a tty instead of a pipe (isatty-aware formatting).
+static int cmd_is_single_pipeline(const char *c, size_t n) {
+    int sq = 0, dq = 0, depth = 0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = c[i];
+        if (sq) { if (ch == '\'') sq = 0; continue; }
+        if (ch == '\\') { i++; continue; }
+        if (dq) { if (ch == '"') dq = 0; continue; }
+        switch (ch) {
+        case '\'': sq = 1; break;
+        case '"':  dq = 1; break;
+        case '`':  return 0;
+        case '(': depth++; break;                 // `{`/`}` can be literal args; `;` inside a brace group fails open
+        case ')': if (--depth < 0) return 0; break;
+        case '#':  if (i == 0 || c[i - 1] == ' ' || c[i - 1] == '\t') return 0; break;
+        case '\n': case ';': if (depth == 0) return 0; break;
+        case '|':  if (depth == 0 && i + 1 < n && c[i + 1] == '|') return 0; break;
+        case '&':
+            if (depth) break;
+            // Redirections (`2>&1`, `<&0`, `&>f`) and `|&` are not separators.
+            if (i > 0 && (c[i - 1] == '>' || c[i - 1] == '<' || c[i - 1] == '|')) break;
+            if (i + 1 < n && c[i + 1] == '>') break;
+            return 0;
+        default: break;
+        }
+    }
+    return !sq && !dq && depth == 0;
+}
+
+static int ob_blank(char ch) { return ch == ' ' || ch == '\t'; }
+static int ends_with_lit(const char *c, size_t n, const char *lit, size_t lit_len) {
+    return n >= lit_len && memcmp(c + n - lit_len, lit, lit_len) == 0;
+}
+
+// cmd ends in `| tail -N` / `-n N` / `-nN` / `--lines[= ]N` and the
+// rest is one pipeline ⇒ returns N and sets *prefix_len to the pipeline
+// without the tail stage. Returns 0 (nothing to strip) otherwise.
+static long strip_trailing_tail(const char *c, size_t n, size_t *prefix_len) {
+    size_t e = n;
+    while (e > 0 && isspace((unsigned char)c[e - 1])) e--;
+    size_t d = e;
+    while (d > 0 && c[d - 1] >= '0' && c[d - 1] <= '9') d--;
+    if (d == e || e - d > 6) return 0;
+    long lines = 0;
+    for (size_t i = d; i < e; i++) lines = lines * 10 + (c[i] - '0');
+    if (lines <= 0) return 0;
+    size_t q = d; int spaced = 0;
+    while (q > 0 && ob_blank(c[q - 1])) { q--; spaced = 1; }
+    size_t p;
+    if (!spaced && ends_with_lit(c, q, "--lines=", 8)) p = q - 8;
+    else if (spaced && ends_with_lit(c, q, "--lines", 7)) p = q - 7;
+    else if (ends_with_lit(c, q, "-n", 2)) p = q - 2;
+    else if (!spaced && q > 0 && c[q - 1] == '-') p = q - 1;
+    else return 0;
+    if (p == 0 || !ob_blank(c[p - 1])) return 0;
+    while (p > 0 && ob_blank(c[p - 1])) p--;
+    if (!ends_with_lit(c, p, "tail", 4)) return 0;
+    p -= 4;
+    if (p > 0 && !ob_blank(c[p - 1]) && c[p - 1] != '|') return 0;
+    while (p > 0 && ob_blank(c[p - 1])) p--;
+    if (p == 0 || c[p - 1] != '|') return 0;
+    p--;
+    if (p > 0 && (c[p - 1] == '|' || c[p - 1] == '\\')) return 0;  // `||`, `\|`
+    while (p > 0 && ob_blank(c[p - 1])) p--;
+    if (p == 0 || !cmd_is_single_pipeline(c, p)) return 0;
+    *prefix_len = p;
+    return lines;
+}
+
+// Switch the step's policy to tail-mode: no live head (the backend would
+// concatenate it into the result), everything rolls through the tail.
+static void ob_set_tail_lines(out_policy_t *ob, long lines) {
+    ob->tail_lines = lines;
+    ob->head_limit = 0;
+    ob->last_limit = OB_STREAM_LAST;
+}
+// Only the capped modes (safe/wide) get the strip: raw/full promise the
+// command's bytes untouched, and their head would not fit the tail buffer.
+static int ob_tail_strip_ok(const out_policy_t *ob) {
+    return ob->head_limit != OB_NOLIMIT && ob->head_limit <= OB_STREAM_FIRST;
 }
 
 // Clear counters/tail but keep the resolved limits (used at STEP_AWAITING_INPUT,
@@ -1438,6 +1541,7 @@ static void ob_reset(out_policy_t *ob) {
     ob->col = 0; ob->line_len = 0; ob->line_charged = 0; ob->line_dropped = 0;
     memset(&ob->head_tok, 0, sizeof ob->head_tok);
     ob->tail_len = 0; ob->tcur_len = 0; ob->tcur_col = 0; ob->tcur_charged = 0;
+    ob->tail_wrapped = 0;
     memset(&ob->tail_tok, 0, sizeof ob->tail_tok);
 }
 
@@ -1446,8 +1550,9 @@ static void ob_tail_push_raw(out_policy_t *ob, const uint8_t *d, size_t n) {
     size_t cap = ob->last_limit;
     if (cap == 0) return;
     if (cap > OB_TAIL_CAP) cap = OB_TAIL_CAP;  // defensive; last_limit ≤ OB_STREAM_LAST today
-    if (n >= cap) { memcpy(ob->tail, d + (n - cap), cap); ob->tail_len = cap; return; }
+    if (n >= cap) { memcpy(ob->tail, d + (n - cap), cap); ob->tail_len = cap; ob->tail_wrapped = 1; return; }
     if (ob->tail_len + n > cap) {
+        ob->tail_wrapped = 1;
         size_t drop = ob->tail_len + n - cap;
         memmove(ob->tail, ob->tail + drop, ob->tail_len - drop);
         ob->tail_len -= drop;
@@ -1591,6 +1696,40 @@ static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
 // frame flag, so call this just before it.
 static void ob_finish(edge_t *e, session_t *s) {
     out_policy_t *ob = &s->ob;
+    if (ob->tail_lines > 0) {
+        // Stripped `| tail -N`: emit the last N lines of what rolled through
+        // (≤ last_limit bytes — a huge-line tail yields fewer lines). The
+        // agent gets exactly what it asked for, so this is not a truncation.
+        ob_tail_flush(ob);
+        size_t p = ob->tail_len;
+        if (p > 0 && ob->tail[p - 1] == '\n') p--;
+        long seen = 0;
+        while (p > 0 && !(ob->tail[p - 1] == '\n' && ++seen == ob->tail_lines)) p--;
+        if (p == 0 && ob->tail_wrapped) {
+            // Asked for more lines than the rolling buffer held: say so, and
+            // keep the frame's truncated flag honest (first line may be partial).
+            ob->truncated = 1;
+            char notice[96];
+            int m = snprintf(notice, sizeof notice,
+                             "[tail -%ld: only the last %d chars were kept]\n", ob->tail_lines, OB_STREAM_LAST);
+            if (m > 0) send_output_bytes(e, s, (const uint8_t *)notice, (size_t)m);
+        } else {
+            ob->truncated = 0;
+        }
+        if (ob->tail_len > p) {
+            ob->col = 0; ob->line_len = 0; ob->line_charged = 0; ob->line_dropped = 0;
+            memset(&ob->head_tok, 0, sizeof ob->head_tok);
+            ob_emit_capped(e, s, ob->tail + p, ob->tail_len - p);
+            if (ob->line_limit != OB_NOLIMIT && ob->line_dropped > 0) {
+                char suf[32];
+                int k = snprintf(suf, sizeof suf, " ...[+%zu chars]", ob->line_dropped);
+                if (k > 0) send_output_bytes(e, s, (const uint8_t *)suf, (size_t)k);
+                ob->line_dropped = 0;
+            }
+        }
+        ob->tail_len = 0;
+        return;
+    }
     if (!ob->truncated || ob->notice_sent) return;
     ob->notice_sent = 1;
     ob_tail_flush(ob);
@@ -2309,6 +2448,13 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         const char *omode = NULL; size_t omode_len = 0;
         json_get_str(msg, msg_len, "output", &omode, &omode_len);
         ob_resolve(&s->ob, omode, omode_len);
+        // Trailing `| tail -N` → bridge-side cut (see strip_trailing_tail).
+        // cmd.exe has no tail; leave that dialect alone.
+        if (!s->cmd_mode && ob_tail_strip_ok(&s->ob)) {
+            size_t plen = 0;
+            long tl = strip_trailing_tail(cmd, cmd_len, &plen);
+            if (tl > 0) { cmd_len = plen; ob_set_tail_lines(&s->ob, tl); }
+        }
 
         // The tfa-surface target is per-RUN state, and a persistent PTY keeps
         // whatever a previous run exported — so this is a statement of its own
