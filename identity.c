@@ -359,14 +359,15 @@ void bridge_identity_gather(bridge_identity_t *id) {
     detect_distro(id->os, id->distro, sizeof(id->distro), id->distro_version, sizeof(id->distro_version));
     detect_device_type(id->os, id->device_type, sizeof(id->device_type));
 
+    // The shell RUN actually spawns (main.c DEFAULT_SHELL), not the login
+    // shell: a "zsh" label over /bin/sh makes bash/zsh-isms fail silently.
+    snprintf(id->shell, sizeof(id->shell), "/bin/sh");
     struct passwd *pw = getpwuid(getuid());
     if (pw) {
         snprintf(id->user,  sizeof(id->user),  "%s", pw->pw_name ? pw->pw_name : "unknown");
-        snprintf(id->shell, sizeof(id->shell), "%s", pw->pw_shell ? pw->pw_shell : "/bin/sh");
         snprintf(id->home,  sizeof(id->home),  "%s", pw->pw_dir ? pw->pw_dir : "/");
     } else {
         snprintf(id->user,  sizeof(id->user),  "unknown");
-        snprintf(id->shell, sizeof(id->shell), "/bin/sh");
         snprintf(id->home,  sizeof(id->home),  "/");
     }
 
