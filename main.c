@@ -11,7 +11,7 @@
 //   STEP_AWAITING_INPUT only parks the *step* (resumable by pid while the
 //   backend still holds the pending run); it never makes the shell persistent.
 //     → {"type":"identity","data":{...}}
-//     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N,"noInput":bool?}
+//     ← {"type":"run","sessionId":"uuid"?,"blockId":"...","cmdB64":"...","cwd":"...","timeoutMs":N,"noInput":bool?,"detached":bool?}
 //     → {"type":"run_started","sessionId":"uuid","blockId":"...","shellPid":N,"created":bool,"cwd":"..."}
 //     → {"type":"output","sessionId":"uuid","blockId":"...","data":"base64"}
 //     → {"type":"step_awaiting_input","sessionId":"uuid","blockId":"...","shellPid":N,"passwordPrompt":bool,"reason":"probe"|"timeout"|"detach","stdinWaiter":"cmdline"?}
@@ -1118,6 +1118,22 @@ static void send_step_done(edge_t *e, session_t *s, int has_code, int exit_code,
     send_json(e, buf, u);
 }
 
+// STEP_DONE for a `detached` RUN: no session ever existed, so a synthetic
+// sessionId ("detached") and shellPid 0. The backend keys on blockId only.
+static void send_detached_done(edge_t *e, const char *bid, size_t bid_len) {
+    char buf[256]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "step_done", -1, 0) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "sessionId", "detached", -1, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "blockId", bid, (long)bid_len, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "shellPid", "0", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "exitCode", "0", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "timedOut", "false", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "truncated", "false", 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    send_json(e, buf, u);
+}
+
 // Bridge → server: step's fg process is blocked in a tty read. RUN stays in
 // flight; backend resolves the promise with awaitingInput:true so the agent
 // can resume via INPUT on the same sessionId. `passwordPrompt` ⇔ ECHO off.
@@ -2174,17 +2190,32 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             free(cmd);
             return send_error(e, NULL, 0, bid, bid_len, "INVALID_BASE64", "cmdB64 is not valid base64");
         }
+        cmd[cmd_len] = '\0';   // b64_decode does not terminate; detached spawn needs a C string
+
+        // `detached`: fire-and-forget, no PTY, no session slot. The command is
+        // launched outside every lifetime the bridge manages (one-shot
+        // teardown, job object / pgrp kill, ConPTY close) and the step
+        // completes at once. For helpers that must outlive their RUN — an
+        // OAuth login's loopback callback server — where `nohup … &` is not
+        // enough on Windows (TerminateJobObject + CTRL_CLOSE_EVENT reach it).
+        // Output is not captured; callers redirect to a file themselves.
+        int detached_val = 0;
+        int detached = json_get_bool(msg, msg_len, "detached", &detached_val) && detached_val;
+        if (detached && has_sid) {
+            free(cmd);
+            return send_error(e, NULL, 0, bid, bid_len, "INVALID_DETACHED", "detached run cannot target a sessionId");
+        }
 
         // Resolve / allocate session. Missing sessionId ⇒ spawn one-shot.
         session_t *s = NULL;
         int created = 0;
         int adopted = 0;   // one-shot took a pre-warmed shell → wrapper needs `cd`
         if (!has_sid) {
-            s = free_slot(e);
+            s = detached ? NULL : free_slot(e);
             // Array full: evict the LRU idle session to make room. Only RUN
             // sessions (which have an in-flight step) are protected.
-            if (!s) s = evict_lru_idle(e);
-            if (!s) {
+            if (!s && !detached) s = evict_lru_idle(e);
+            if (!s && !detached) {
                 free(cmd);
                 char errmsg[64];
                 snprintf(errmsg, sizeof errmsg, "all %d sessions busy", g_max_sessions);
@@ -2227,6 +2258,18 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             const char *spawn_cwd = has_cwd ? cwd_buf
                                   : bridge_policy_default_cwd() ? bridge_policy_default_cwd()
                                   : resolve_default_cwd();
+            if (detached) {
+                int rc = bridge_pty_spawn_detached(DEFAULT_SHELL, cmd, spawn_cwd);
+                int err = errno;
+                free(cmd);
+                if (rc != 0) {
+                    char why[160];
+                    snprintf(why, sizeof why, "failed to spawn detached command: %s", strerror(err));
+                    return send_error(e, NULL, 0, bid, bid_len, "SPAWN_FAILED", why);
+                }
+                send_detached_done(e, bid, bid_len);
+                return 0;
+            }
             // Windows last-resort detection: resolution landing on cmd.exe
             // means no POSIX shell yet (busybox provisioning pending/failed).
             // RUN proceeds in cmd-dialect (see session_t.cmd_mode) so the

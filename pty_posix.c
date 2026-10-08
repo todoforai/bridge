@@ -174,6 +174,59 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     return 0;
 }
 
+int bridge_pty_spawn_detached(const char *shell, const char *cmd, const char *cwd) {
+    spawn_env_init();
+    // fork → setsid → fork: the grandchild is reparented to init (never ours
+    // to reap, survives a daemon restart) and, being no session leader, can
+    // never reacquire a controlling tty. A close-on-exec pipe carries the
+    // grandchild's setup/exec errno back, so a bad cwd or missing shell is
+    // reported instead of "launched".
+    int ep[2];
+    if (pipe(ep) < 0) return -1;
+    fcntl(ep[1], F_SETFD, FD_CLOEXEC);
+    pid_t pid = fork();
+    if (pid < 0) { int e = errno; close(ep[0]); close(ep[1]); errno = e; return -1; }
+    if (pid == 0) {
+        close(ep[0]);
+        if (setsid() < 0) { int e = errno; (void)!write(ep[1], &e, sizeof e); _exit(1); }
+        pid_t gc = fork();
+        if (gc < 0) { int e = errno; (void)!write(ep[1], &e, sizeof e); _exit(1); }
+        if (gc > 0) _exit(0);   // intermediate: its only job was the fork
+        signal(SIGINT,  SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGHUP,  SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull < 0 || dup2(devnull, 0) < 0 || dup2(devnull, 1) < 0 || dup2(devnull, 2) < 0) {
+            int e = errno; (void)!write(ep[1], &e, sizeof e); _exit(1);
+        }
+        // Drop every other inherited descriptor (the daemon's websocket, PTY
+        // masters, …): a long-lived login must not keep them alive.
+        {
+            long maxfd = sysconf(_SC_OPEN_MAX);
+            if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+            for (int fd = 3; fd < maxfd; fd++) if (fd != ep[1]) close(fd);
+        }
+        if (cwd && *cwd && chdir(cwd) != 0) { int e = errno; (void)!write(ep[1], &e, sizeof e); _exit(1); }
+        if (g_tools_path) setenv("PATH", g_tools_path, 1);
+        if (bridge_policy_jail_child() != 0) { int e = EPERM; (void)!write(ep[1], &e, sizeof e); _exit(1); }
+        execl(shell, shell, "-c", cmd, (char *)NULL);
+        int e = errno; (void)!write(ep[1], &e, sizeof e);
+        _exit(1);
+    }
+    close(ep[1]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    // EOF on the pipe = exec happened (CLOEXEC closed our end); bytes = errno.
+    int child_err = 0; ssize_t n;
+    while ((n = read(ep[0], &child_err, sizeof child_err)) < 0 && errno == EINTR) {}
+    close(ep[0]);
+    if (n > 0) { errno = child_err ? child_err : EIO; return -1; }
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { errno = EAGAIN; return -1; }
+    return 0;
+}
+
 void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols) {
     struct winsize ws = { .ws_row = rows, .ws_col = cols, 0, 0 };
     (void)ioctl(p->master_fd, TIOCSWINSZ, &ws);

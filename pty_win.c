@@ -17,6 +17,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "pty.h"
 #include "env_path.h"
+#include "tools.h"   // bridge_win_quote_arg
 
 #include <windows.h>
 #include <winternl.h>   // UNICODE_STRING, used by the SYSTEM_PROCESS_INFORMATION layout
@@ -345,6 +346,74 @@ fail: {
 
 int bridge_pty_set_canon(bridge_pty_t *p, int on) {
     (void)p; (void)on;  // ConPTY: no termios line discipline to toggle.
+    return 0;
+}
+
+int bridge_pty_spawn_detached(const char *shell, const char *cmd, const char *cwd) {
+    bridge_prepend_tools_path_win();
+    const char *sh = bridge_pty_resolve_shell(shell);
+    {   // `sh -c` is POSIX-shell dialect: no bash/busybox yet ⇒ refuse, do not
+        // feed it to cmd.exe (the one-shot path has a cmd dialect; this hasn't).
+        const char *b = sh + strlen(sh);
+        while (b > sh && b[-1] != '\\' && b[-1] != '/') b--;
+        if (_stricmp(b, "cmd.exe") == 0 || _stricmp(b, "cmd") == 0) { errno = ENOENT; return -1; }
+    }
+    char *cmdline = malloc(65536);
+    if (!cmdline) { errno = ENOMEM; return -1; }
+    int n = snprintf(cmdline, 65536, "\"%s\" -c ", sh);
+    if (n <= 0 || n >= 65536 || bridge_win_quote_arg(cmd, cmdline + n, 65536 - (size_t)n) < 0) {
+        free(cmdline); errno = E2BIG; return -1;
+    }
+    // No ConPTY, no job object, no inherited handles: the child must survive
+    // every teardown the bridge performs on a RUN session.
+    //   CREATE_BREAKAWAY_FROM_JOB — in case the bridge itself was started
+    //     inside a job (installer, service wrapper); fails only if that job
+    //     forbids breakaway, so retry without.
+    //   DETACHED_PROCESS         — no console at all: nothing to receive a
+    //     CTRL_CLOSE_EVENT, nothing a ClosePseudoConsole can reach.
+    //   CREATE_NEW_PROCESS_GROUP — a Ctrl-C to our group never fans out to it.
+    // stdio -> NUL (the POSIX /dev/null equivalent). Invalid/NULL std handles
+    // make node and MSYS bash misbehave, so hand over real ones; the handle
+    // list attribute keeps every other inheritable handle out of the child.
+    SECURITY_ATTRIBUTES sa = { .nLength = sizeof sa, .bInheritHandle = TRUE };
+    HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             &sa, OPEN_EXISTING, 0, NULL);
+    if (nul == INVALID_HANDLE_VALUE) { free(cmdline); errno = EIO; return -1; }
+    SIZE_T attr_sz = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_sz);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = malloc(attr_sz);
+    if (!attrs || !InitializeProcThreadAttributeList(attrs, 1, 0, &attr_sz)) {
+        free(attrs); free(cmdline); CloseHandle(nul); errno = ENOMEM; return -1;
+    }
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &nul, sizeof nul, NULL, NULL)) {
+        DeleteProcThreadAttributeList(attrs);
+        free(attrs); free(cmdline); CloseHandle(nul); errno = EIO; return -1;
+    }
+    STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES,
+                                           .hStdInput = nul, .hStdOutput = nul, .hStdError = nul },
+                          .lpAttributeList = attrs };
+    PROCESS_INFORMATION pi = {0};
+    DWORD base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
+    const char *dir = (cwd && *cwd) ? cwd : NULL;
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, base | CREATE_BREAKAWAY_FROM_JOB,
+                             NULL, dir, &si.StartupInfo, &pi);
+    // Breakaway refused (bridge runs in a job without BREAKAWAY_OK, e.g. under
+    // a scheduled task): the child then shares the bridge's enclosing job —
+    // still outside every per-RUN job, which is the guarantee that matters.
+    if (!ok && GetLastError() == ERROR_ACCESS_DENIED)
+        ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, base, NULL, dir, &si.StartupInfo, &pi);
+    DWORD gle = ok ? 0 : GetLastError();
+    DeleteProcThreadAttributeList(attrs);
+    free(attrs);
+    free(cmdline);
+    CloseHandle(nul);
+    if (!ok) {
+        errno = gle == ERROR_FILE_NOT_FOUND || gle == ERROR_PATH_NOT_FOUND ? ENOENT
+              : gle == ERROR_ACCESS_DENIED ? EACCES : EIO;
+        return -1;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return 0;
 }
 

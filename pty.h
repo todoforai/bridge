@@ -42,6 +42,16 @@ const char *bridge_pty_resolve_shell(const char *shell);
 // Returns 0 on success, -1 on failure.
 int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no_echo);
 
+// Run `cmd` (shell text) fully DETACHED: no PTY, no job object / process
+// group tie to the bridge, stdio → /dev/null, cwd as given (may be NULL).
+// For long-lived helpers that must outlive the RUN that started them (an
+// OAuth loopback-callback server). Nothing the bridge does later (one-shot
+// teardown, TerminateJobObject, ClosePseudoConsole's CTRL_CLOSE_EVENT,
+// SIGHUP on the pgrp) reaches it. The child is not tracked (callers find it
+// by its own command line, e.g. pgrep). Returns 0 once it is launched, -1 on
+// failure (errno set).
+int bridge_pty_spawn_detached(const char *shell, const char *cmd, const char *cwd);
+
 void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols);
 
 // Write all bytes. Returns 0 on success, -1 on error.
