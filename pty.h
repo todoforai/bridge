@@ -52,6 +52,13 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
 // failure (errno set).
 int bridge_pty_spawn_detached(const char *shell, const char *cmd, const char *cwd);
 
+#ifdef _WIN32
+// `<bridge> __detach PROG [ARGS…]` entry (argv past "__detach"): launch PROG
+// outside our job/console, inheriting cwd, env and file/pipe std handles,
+// exit at once. Backs the nohup/setsid shim the RUN wrapper defines.
+int bridge_pty_detach_main(int argc, char **argv);
+#endif
+
 void bridge_pty_resize(bridge_pty_t *p, uint16_t rows, uint16_t cols);
 
 // Write all bytes. Returns 0 on success, -1 on error.

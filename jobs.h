@@ -89,6 +89,8 @@ typedef void (*bridge_job_done_cb)(void *ctx, const bridge_job_t *j,
 
 // Record how to re-execute ourselves. Call once at startup, before any job.
 void bridge_jobs_init_self(const char *argv0);
+// Path recorded by bridge_jobs_init_self ("" when unknown).
+const char *bridge_jobs_self_path(void);
 
 // Worker entry point: read the payload from stdin, run `body`, frame whatever
 // it emits onto stdout. Returns a process exit code.

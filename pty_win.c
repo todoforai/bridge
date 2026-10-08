@@ -263,6 +263,8 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     SetEnvironmentVariableA("MANPAGER", "cat");
     SetEnvironmentVariableA("SYSTEMD_PAGER", "cat");
     SetEnvironmentVariableA("AWS_PAGER", "");
+    // For `__detach` (nohup shim): the job-free process to parent on.
+    { char pid_s[16]; snprintf(pid_s, sizeof pid_s, "%lu", (unsigned long)GetCurrentProcessId()); SetEnvironmentVariableA("TODOFORAI_BRIDGE_PID", pid_s); }
     // Mirror pty_posix.c: keep prompts out of OUTPUT. Git Bash rc files
     // (git-prompt.sh) may re-set PS1 — main.c's spawn-time init line
     // (`stty -echo; PS1=; …` + ready-sentinel drain) handles that and the
@@ -286,7 +288,9 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     HANDLE job = CreateJobObjectA(NULL, NULL);
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // BREAKAWAY_OK: lets `__detach` (the nohup/setsid shim) launch a child
+        // outside this job; everything else stays in and dies with it.
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
     }
 
@@ -349,63 +353,74 @@ int bridge_pty_set_canon(bridge_pty_t *p, int on) {
     return 0;
 }
 
-int bridge_pty_spawn_detached(const char *shell, const char *cmd, const char *cwd) {
-    bridge_prepend_tools_path_win();
-    const char *sh = bridge_pty_resolve_shell(shell);
-    {   // `sh -c` is POSIX-shell dialect: no bash/busybox yet ⇒ refuse, do not
-        // feed it to cmd.exe (the one-shot path has a cmd dialect; this hasn't).
-        const char *b = sh + strlen(sh);
-        while (b > sh && b[-1] != '\\' && b[-1] != '/') b--;
-        if (_stricmp(b, "cmd.exe") == 0 || _stricmp(b, "cmd") == 0) { errno = ENOENT; return -1; }
-    }
-    char *cmdline = malloc(65536);
-    if (!cmdline) { errno = ENOMEM; return -1; }
-    int n = snprintf(cmdline, 65536, "\"%s\" -c ", sh);
-    if (n <= 0 || n >= 65536 || bridge_win_quote_arg(cmd, cmdline + n, 65536 - (size_t)n) < 0) {
-        free(cmdline); errno = E2BIG; return -1;
-    }
-    // No ConPTY, no job object, no inherited handles: the child must survive
-    // every teardown the bridge performs on a RUN session.
-    //   CREATE_BREAKAWAY_FROM_JOB — in case the bridge itself was started
-    //     inside a job (installer, service wrapper); fails only if that job
-    //     forbids breakaway, so retry without.
-    //   DETACHED_PROCESS         — no console at all: nothing to receive a
-    //     CTRL_CLOSE_EVENT, nothing a ClosePseudoConsole can reach.
-    //   CREATE_NEW_PROCESS_GROUP — a Ctrl-C to our group never fans out to it.
-    // stdio -> NUL (the POSIX /dev/null equivalent). Invalid/NULL std handles
-    // make node and MSYS bash misbehave, so hand over real ones; the handle
-    // list attribute keeps every other inheritable handle out of the child.
+// Shared core of the two detached launchers. `cmdline` is a mutable Win32
+// command line. `h[3]` are the std handles to hand over (any may be NULL ⇒
+// NUL): only these get inherited, via the handle-list attribute.
+//   CREATE_BREAKAWAY_FROM_JOB — out of every job the bridge put us (or the
+//     calling shell) in. The per-RUN job allows it (BREAKAWAY_OK); if the
+//     bridge's own enclosing job forbids it, retry without — the child still
+//     escapes the per-RUN job, which is the guarantee that matters.
+//   DETACHED_PROCESS         — no console at all: nothing to receive a
+//     CTRL_CLOSE_EVENT, nothing a ClosePseudoConsole can reach.
+//   CREATE_NEW_PROCESS_GROUP — a Ctrl-C to our group never fans out to it.
+//   parent (optional)        — PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the
+//     child is created AS IF by that process, inheriting its job membership
+//     (none, for the bridge daemon). The `__detach` helper needs this: MSYS/
+//     Cygwin bash assigns every child to its own per-user job, which forbids
+//     breakaway, so from inside the shell neither flag can get a child out.
+//     Handles in `h` are then duplicated into the parent, as inheritance is
+//     evaluated against it.
+static int win_spawn_detached(char *cmdline, const char *cwd, HANDLE h[3], HANDLE parent) {
     SECURITY_ATTRIBUTES sa = { .nLength = sizeof sa, .bInheritHandle = TRUE };
     HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                              &sa, OPEN_EXISTING, 0, NULL);
-    if (nul == INVALID_HANDLE_VALUE) { free(cmdline); errno = EIO; return -1; }
-    SIZE_T attr_sz = 0;
-    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_sz);
-    LPPROC_THREAD_ATTRIBUTE_LIST attrs = malloc(attr_sz);
-    if (!attrs || !InitializeProcThreadAttributeList(attrs, 1, 0, &attr_sz)) {
-        free(attrs); free(cmdline); CloseHandle(nul); errno = ENOMEM; return -1;
+    if (nul == INVALID_HANDLE_VALUE) { errno = EIO; return -1; }
+    HANDLE list[4]; DWORD nlist = 0;
+    HANDLE owned[4]; DWORD nowned = 0;   // handles we created in `parent`
+    for (int i = 0; i < 3; i++) {
+        if (!h[i] || h[i] == INVALID_HANDLE_VALUE) h[i] = nul;
+        if (parent) {
+            HANDLE d = NULL;
+            if (!DuplicateHandle(GetCurrentProcess(), h[i], parent, &d, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+                for (DWORD j = 0; j < nowned; j++) DuplicateHandle(parent, owned[j], NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+                CloseHandle(nul); errno = EACCES; return -1;
+            }
+            h[i] = d; owned[nowned++] = d;
+        }
+        int dup = 0;
+        for (DWORD j = 0; j < nlist; j++) if (list[j] == h[i]) dup = 1;
+        if (!dup) list[nlist++] = h[i];
     }
-    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &nul, sizeof nul, NULL, NULL)) {
+    SIZE_T attr_sz = 0;
+    DWORD nattr = parent ? 2 : 1;
+    InitializeProcThreadAttributeList(NULL, nattr, 0, &attr_sz);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = malloc(attr_sz);
+    if (!attrs || !InitializeProcThreadAttributeList(attrs, nattr, 0, &attr_sz)) {
+        free(attrs);
+        for (DWORD j = 0; j < nowned; j++) DuplicateHandle(parent, owned[j], NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+        CloseHandle(nul); errno = ENOMEM; return -1;
+    }
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list, nlist * sizeof list[0], NULL, NULL) ||
+        (parent && !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &parent, sizeof parent, NULL, NULL))) {
         DeleteProcThreadAttributeList(attrs);
-        free(attrs); free(cmdline); CloseHandle(nul); errno = EIO; return -1;
+        free(attrs);
+        for (DWORD j = 0; j < nowned; j++) DuplicateHandle(parent, owned[j], NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+        CloseHandle(nul); errno = EIO; return -1;
     }
     STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES,
-                                           .hStdInput = nul, .hStdOutput = nul, .hStdError = nul },
+                                           .hStdInput = h[0], .hStdOutput = h[1], .hStdError = h[2] },
                           .lpAttributeList = attrs };
     PROCESS_INFORMATION pi = {0};
     DWORD base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
     const char *dir = (cwd && *cwd) ? cwd : NULL;
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, base | CREATE_BREAKAWAY_FROM_JOB,
                              NULL, dir, &si.StartupInfo, &pi);
-    // Breakaway refused (bridge runs in a job without BREAKAWAY_OK, e.g. under
-    // a scheduled task): the child then shares the bridge's enclosing job —
-    // still outside every per-RUN job, which is the guarantee that matters.
     if (!ok && GetLastError() == ERROR_ACCESS_DENIED)
         ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, base, NULL, dir, &si.StartupInfo, &pi);
     DWORD gle = ok ? 0 : GetLastError();
     DeleteProcThreadAttributeList(attrs);
     free(attrs);
-    free(cmdline);
+    for (DWORD j = 0; j < nowned; j++) DuplicateHandle(parent, owned[j], NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
     CloseHandle(nul);
     if (!ok) {
         errno = gle == ERROR_FILE_NOT_FOUND || gle == ERROR_PATH_NOT_FOUND ? ENOENT
@@ -414,6 +429,92 @@ int bridge_pty_spawn_detached(const char *shell, const char *cmd, const char *cw
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    return 0;
+}
+
+// Is `sh` cmd.exe (no POSIX shell provisioned yet)?
+static int win_shell_is_cmd(const char *sh) {
+    const char *b = sh + strlen(sh);
+    while (b > sh && b[-1] != '\\' && b[-1] != '/') b--;
+    return _stricmp(b, "cmd.exe") == 0 || _stricmp(b, "cmd") == 0;
+}
+
+int bridge_pty_spawn_detached(const char *shell, const char *cmd, const char *cwd) {
+    bridge_prepend_tools_path_win();
+    const char *sh = bridge_pty_resolve_shell(shell);
+    // `sh -c` is POSIX-shell dialect: no bash/busybox yet ⇒ refuse, do not
+    // feed it to cmd.exe (the one-shot path has a cmd dialect; this hasn't).
+    if (win_shell_is_cmd(sh)) { errno = ENOENT; return -1; }
+    char *cmdline = malloc(65536);
+    if (!cmdline) { errno = ENOMEM; return -1; }
+    int n = snprintf(cmdline, 65536, "\"%s\" -c ", sh);
+    if (n <= 0 || n >= 65536 || bridge_win_quote_arg(cmd, cmdline + n, 65536 - (size_t)n) < 0) {
+        free(cmdline); errno = E2BIG; return -1;
+    }
+    // No ConPTY, no job object, stdio -> NUL (the POSIX /dev/null equivalent;
+    // invalid/NULL std handles make node and MSYS bash misbehave).
+    HANDLE h[3] = {0};
+    int rc = win_spawn_detached(cmdline, cwd, h, NULL);
+    free(cmdline);
+    return rc;
+}
+
+// `<bridge> __detach PROG [ARGS…]`: the body of the `nohup`/`setsid` shim the
+// RUN wrapper defines on Windows. The shell does its job up to here — PATH
+// lookup is NOT done (PROG may be a script, a shell function's target, a
+// .cmd shim), so the shell resolves it: `sh -c 'exec "$0" "$@"' PROG ARGS…`.
+// Inherits our cwd, environment and std handles — i.e. the shell's `> log
+// 2>&1` redirects — then exits 0 at once so the `&` the agent wrote is a
+// no-op. A std handle that is still the ConPTY would die with it, so those
+// become NUL (nohup would write nohup.out; close enough).
+// The child is created with the bridge daemon ($TODOFORAI_BRIDGE_PID) as its
+// parent: we ourselves sit in MSYS bash's per-user job (no breakaway allowed)
+// and in the RUN's job, and only a job-free parent yields a job-free child.
+int bridge_pty_detach_main(int argc, char **argv) {
+    // `nohup -- PROG` / `setsid -- PROG`: skip the option terminator. Any
+    // other option (setsid -w, nohup --version) is not supported here.
+    if (argc >= 1 && strcmp(argv[0], "--") == 0) { argc--; argv++; }
+    if (argc < 1 || argv[0][0] == '-') { fprintf(stderr, "usage: __detach [--] PROG [ARGS...]\n"); return 2; }
+    // Parent = the bridge daemon, by pid from the env the daemon set on the
+    // shell. Strict parse: a stale/garbled value must not pick a random
+    // process. Without it the child would stay in MSYS bash's per-user job
+    // and die with the RUN, so refuse rather than pretend.
+    HANDLE parent = NULL;
+    {
+        char pid_s[16]; char *endp = NULL;
+        DWORD len = GetEnvironmentVariableA("TODOFORAI_BRIDGE_PID", pid_s, sizeof pid_s);
+        unsigned long pid = (len > 0 && len < sizeof pid_s) ? strtoul(pid_s, &endp, 10) : 0;
+        if (pid && pid <= 0xFFFFFFFFul && endp && *endp == '\0')
+            parent = OpenProcess(PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE, FALSE, (DWORD)pid);
+        if (!parent) { fprintf(stderr, "__detach: bridge daemon not reachable (TODOFORAI_BRIDGE_PID)\n"); return 126; }
+    }
+    bridge_prepend_tools_path_win();
+    const char *sh = bridge_pty_resolve_shell(NULL);
+    if (win_shell_is_cmd(sh)) { CloseHandle(parent); fprintf(stderr, "__detach: no POSIX shell\n"); return 127; }
+    size_t cap = 65536;
+    char *cmdline = malloc(cap);
+    if (!cmdline) { CloseHandle(parent); return 1; }
+    int n = snprintf(cmdline, cap, "\"%s\" -c \"exec \\\"$0\\\" \\\"$@\\\"\"", sh);
+    for (int i = 0; i < argc && n > 0 && (size_t)n < cap; i++) {
+        cmdline[n++] = ' ';
+        int q = bridge_win_quote_arg(argv[i], cmdline + n, cap - (size_t)n);
+        if (q < 0) { free(cmdline); CloseHandle(parent); fprintf(stderr, "__detach: command line too long\n"); return 1; }
+        n += q;
+    }
+    // Std handles: a file/pipe redirect is handed over (win_spawn_detached
+    // duplicates it into the parent, so inheritability here is irrelevant);
+    // a console handle — incl. the ConPTY end — answers GetConsoleMode and
+    // would die with the RUN, so it becomes NUL.
+    HANDLE h[3] = { GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE) };
+    for (int i = 0; i < 3; i++) {
+        DWORD mode;
+        if (h[i] == INVALID_HANDLE_VALUE || (h[i] && GetConsoleMode(h[i], &mode))) h[i] = NULL;
+    }
+    int rc = win_spawn_detached(cmdline, NULL, h, parent);
+    int err = errno;
+    free(cmdline);
+    CloseHandle(parent);
+    if (rc != 0) { fprintf(stderr, "__detach: %s: %s\n", argv[0], strerror(err)); return err == ENOENT ? 127 : 126; }
     return 0;
 }
 

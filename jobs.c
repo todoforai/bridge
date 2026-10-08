@@ -39,6 +39,8 @@ static char g_self[1024];
 // marker already set means exactly that, so the worker dies instead.
 #define JOB_DEPTH_ENV "TODOFORAI_JOB_WORKER"
 
+const char *bridge_jobs_self_path(void) { return g_self; }
+
 void bridge_jobs_init_self(const char *argv0) {
 #ifdef _WIN32
     char depth[8];

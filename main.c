@@ -515,6 +515,20 @@ static int output_tail_is_prompt(const session_t *s) {
 #  define CANON_ON "stty icanon 2>/dev/null; "
 #endif
 
+// Windows only: `nohup PROG…` / `setsid PROG…` in a RUN would not survive the
+// step — the one-shot job object is terminated and the ConPTY closed at
+// STEP_DONE, and both reach a backgrounded child whatever the shell did.
+// Shadow them with functions that hand the launch to `<bridge> __detach`
+// (pty_win.c), which spawns PROG outside the job and console with the
+// shell's env, cwd and redirects, so the POSIX idiom just works. `%s` is the
+// bridge's own path, single-quoted. Written `nohup X &`, the helper runs in
+// the background while the wrapper may already print its sentinel; the
+// launch is one CreateProcess (~ms) against a STEP_DONE round trip, and the
+// job is only terminated once the step is reported, so in practice it wins.
+#ifdef _WIN32
+#  define DETACH_SHIM_FMT "nohup() { '%s' __detach \"$@\"; }; setsid() { nohup \"$@\"; }; "
+#endif
+
 typedef struct {
     ws_t ws;
     noise_ws_t noise;
@@ -2562,6 +2576,23 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
+        char dshim[1024 * 4 + 128];   // g_self ≤ 1023, each ' may become '\''
+        dshim[0] = '\0';
+#ifdef _WIN32
+        {
+            const char *self = bridge_jobs_self_path();
+            if (self && *self) {
+                char q[1024 * 4]; size_t qn = 0;
+                for (const char *c = self; *c && qn + 5 < sizeof q; c++) {
+                    if (*c == '\'') { memcpy(q + qn, "'\\''", 4); qn += 4; }
+                    else q[qn++] = *c;
+                }
+                q[qn] = '\0';
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q);
+                if (dn < 0 || (size_t)dn >= sizeof dshim) dshim[0] = '\0';
+            }
+        }
+#endif
         if (adopted && !pty_pool_cd_prefix(s->cwd, cdpre, sizeof cdpre)) {
             free(cmd); RUN_FAIL_CLEANUP();
             return send_error(e, NULL, 0, bid, bid_len, "INTERNAL", "cwd too long");
@@ -2569,7 +2600,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + s->begin_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
                              + sizeof(idenv) + sizeof(e->api_url)
-                             + sizeof(fenv) + sizeof(cenv) + sizeof(tz_env) + strlen(cdpre) + 384;
+                             + sizeof(fenv) + sizeof(cenv) + sizeof(tz_env) + strlen(cdpre) + strlen(dshim) + 384;
         char *wrapped = malloc(wrapped_cap);
         if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
@@ -2587,14 +2618,14 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'; "
-                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; " SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; " SUDO_ASKPASS_FN "%strap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
                 s->agent_settings_id[0] ? " TODOFORAI_AGENT_SETTINGS_ID=" : "",
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
                 idenv,
-                fenv, cenv, tz_env,
+                fenv, cenv, tz_env, dshim,
                 (int)cmd_len, cmd, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
@@ -2602,11 +2633,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 // is emitted only when there is something to export; fenv/cenv
                 // are full `; export …` / `; unset …` statements.
                 CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'%s%s%s%s%s; "
-                SUDO_ASKPASS_FN "trap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                SUDO_ASKPASS_FN "%strap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv[0] ? "; export" : "", idenv,
-                fenv, cenv, tz_env,
+                fenv, cenv, tz_env, dshim,
                 (int)cmd_len, cmd, s->sentinel);
         }
         free(cmd);
@@ -3834,6 +3865,9 @@ int bridge_main(int argc, char **argv) {
     // Off-loop worker: dispatch first and hard-return, so a worker can never
     // fall through into daemon startup. Hidden from --help; not a user command.
     if (argc >= 3 && strcmp(argv[1], "__job") == 0) return cmd_job_worker(argv[2]);
+#ifdef _WIN32
+    if (argc >= 2 && strcmp(argv[1], "__detach") == 0) return bridge_pty_detach_main(argc - 2, argv + 2);
+#endif
     // Resolve our own path while argv0 and the cwd are still trustworthy.
     bridge_jobs_init_self(argv[0]);
 
