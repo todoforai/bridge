@@ -4219,17 +4219,21 @@ int bridge_main(int argc, char **argv) {
                   : attempt <= 6 ? 2
                   : attempt >= 8 ? 8   // also avoids UB shifts at high attempt counts
                   :                1 << (attempt - 5);
-        fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n", delay, attempt, max_attempts);
+        // ±20% jitter so a fleet doesn't reconnect in lockstep after a backend restart.
+        uint16_t r = 0;
+        noise_random((uint8_t *)&r, sizeof r);
+        int delay_ms = delay * (800 + (int)(r % 401));  // 0.8..1.2 × delay, in ms
+        fprintf(stderr, "Reconnecting in %.1fs (attempt %d/%d)...\n", delay_ms / 1000.0, attempt, max_attempts);
 #ifdef _WIN32
-        Sleep((DWORD)delay * 1000);
+        Sleep((DWORD)delay_ms);
 #else
         // No SIGINT handler installed — default disposition terminates the
         // process during sleep(), which is the desired behavior for Ctrl+C.
         // A mayfly keeps watching its CLI across the wait (up to 8s) so an
         // orphan doesn't sit out a backend outage before noticing.
-        for (int slept = 0; slept < delay; slept++) {
+        for (int slept = 0; slept < delay_ms; slept += 100) {
             if (e->mayfly_parent_pid && (long)getppid() != e->mayfly_parent_pid) { rc = 0; goto done; }
-            sleep(1);
+            usleep(100 * 1000);
         }
 #endif
         reset_connection_state(e);
