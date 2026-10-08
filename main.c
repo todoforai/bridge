@@ -692,7 +692,8 @@ static size_t build_init_line(char *out, size_t cap) {
     // pays even this at pre-warm, before the RUN arrives.
     int n = snprintf(out, cap,
         "stty -echo 2>/dev/null; PS1=; PS2=; "
-        "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER=\n");
+        "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
+        "AGENT_BROWSER_IDLE_TIMEOUT_MS=${AGENT_BROWSER_IDLE_TIMEOUT_MS:-1800000}\n");
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 

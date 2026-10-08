@@ -233,6 +233,9 @@ Type=simple
 ExecStart=$BRIDGE
 Restart=always
 RestartSec=2
+# Back off up to 5 min when it keeps exiting (e.g. another bridge holds the lock).
+RestartSteps=10
+RestartMaxDelaySec=300
 
 [Install]
 WantedBy=default.target
