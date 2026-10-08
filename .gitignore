@@ -4,3 +4,4 @@ a.out
 *.a
 .DS_Store
 vendor/
+logs/
