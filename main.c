@@ -4099,8 +4099,8 @@ int bridge_main(int argc, char **argv) {
 
     // Reconnect loop. PTY sessions survive across reconnects; in-flight RPCs
     // are rejected by handleClose, not replayed.
-    const int max_attempts_pre_auth  = 20;   // ~17 min — surfaces setup mistakes
-    const int max_attempts_post_auth = 60;   // ~5 h   — rides out server outages
+    const int max_attempts_pre_auth  = 20;   // ~2 min  — surfaces setup mistakes
+    const int max_attempts_post_auth = 2000; // ~4.5 h at the 8s cap — rides out server outages
     int attempt = 0;
     int ever_authenticated = 0;
     int relogin_hint_shown = 0;  // print the manual-recovery hint once per 4401 streak
@@ -4204,8 +4204,8 @@ int bridge_main(int argc, char **argv) {
         if (is_4401) {
             // Never give up on 4401 — an outage of the backend's device store
             // must not strand an unattended machine. Pin the backoff at its
-            // 300s ceiling instead of exhausting the attempt budget.
-            if (attempt > 14) attempt = 14;
+            // backoff ceiling instead of exhausting the attempt budget.
+            if (attempt > 8) attempt = 8;
         } else if (attempt >= max_attempts) {
             fprintf(stderr, "Giving up after %d attempts.\n", max_attempts);
             break;
@@ -4213,18 +4213,19 @@ int bridge_main(int argc, char **argv) {
 
         // Backoff: 1, then 2s for the first several retries so a routine
         // backend restart (down ~20s) is ridden out with tight polling, then
-        // exponential 4, 8, 16, … capped at 300s.
-        int delay = attempt <= 1  ? 1
-                  : attempt <= 6  ? 2
-                  : attempt >= 14 ? 300  // 1<<9=512 already capped; also avoids UB shifts at high attempt counts
-                  :                 1 << (attempt - 5);
+        // 4, then capped at 8s — a longer wait looks like "never reconnects"
+        // to the user (e.g. after laptop sleep), and a retry is cheap.
+        int delay = attempt <= 1 ? 1
+                  : attempt <= 6 ? 2
+                  : attempt >= 8 ? 8   // also avoids UB shifts at high attempt counts
+                  :                1 << (attempt - 5);
         fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n", delay, attempt, max_attempts);
 #ifdef _WIN32
         Sleep((DWORD)delay * 1000);
 #else
         // No SIGINT handler installed — default disposition terminates the
         // process during sleep(), which is the desired behavior for Ctrl+C.
-        // A mayfly keeps watching its CLI across the wait (up to 300s) so an
+        // A mayfly keeps watching its CLI across the wait (up to 8s) so an
         // orphan doesn't sit out a backend outage before noticing.
         for (int slept = 0; slept < delay; slept++) {
             if (e->mayfly_parent_pid && (long)getppid() != e->mayfly_parent_pid) { rc = 0; goto done; }
