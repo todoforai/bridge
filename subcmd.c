@@ -354,3 +354,152 @@ void print_help(void) {
            "  -v, --version        print version\n\n"
            "Docs: https://docs.todofor.ai\n");
 }
+
+// ---------------------------------------------------------------------------
+// `__adb connect|pair|disconnect <phone>[:port] [args…]` — target of the
+// adb() shell shim the daemon prepends to every RUN (ADB_SHIM_FMT, main.c).
+// Asks the daemon's loopback server (GET /adb?phone=&port=) for the relay
+// port and execs the real adb against 127.0.0.1:<port>. Anything that
+// already looks like host:port (digits/dots/colons only) is passed through
+// untouched, so `adb connect 192.168.1.5:5555` keeps working.
+// ---------------------------------------------------------------------------
+#ifndef _WIN32
+#include "identity_server.h"  // IDENTITY_SERVER_PORT*
+#include "json.h"
+#include "ws.h"               // ws_tcp_connect
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// Stock adb targets: `host:port`, `host` (default 5555), IPv6 `[::1]:5555`,
+// `vsock:…`, `localfilesystem:…`, `emulator-5554`, `localhost`, `*.local`.
+// A phone name has spaces or chars no hostname has (e.g. the apostrophe in
+// "Marcell's S24"), or no dot/colon at all — but "localhost"/"emulator-N"
+// are not phone names. Anything hostname-shaped goes to the real adb.
+static int looks_like_hostport(const char *s) {
+    if (!*s) return 0;
+    if (strncmp(s, "vsock:", 6) == 0 || strncmp(s, "localfilesystem:", 16) == 0 || strncmp(s, "emulator-", 9) == 0) return 1;
+    if (strcmp(s, "localhost") == 0) return 1;
+    int has_sep = 0;
+    for (const char *c = s; *c; c++) {
+        if (*c == '.' || *c == ':') has_sep = 1;
+        else if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || *c == '-' || *c == '[' || *c == ']' || *c == '_')) return 0;
+    }
+    return has_sep;
+}
+
+static int url_encode(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const char *c = in; *c; c++) {
+        unsigned char ch = (unsigned char)*c;
+        int safe = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.';
+        if (safe) { if (o + 1 >= cap) return -1; out[o++] = (char)ch; }
+        else { if (o + 4 >= cap) return -1; o += (size_t)snprintf(out + o, cap - o, "%%%02X", ch); }
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+// Returns relay port, or 0 with err. `last_err` (optional) receives the
+// backend's most recent close reason for this relay.
+static uint16_t ask_daemon(uint16_t srv_port, const char *phone, const char *pspec, char *err, size_t err_cap,
+                           char *last_err, size_t last_err_cap, int forget) {
+    char enc[256];
+    if (url_encode(phone, enc, sizeof enc) != 0) { snprintf(err, err_cap, "phone name too long"); return 0; }
+    ws_fd_t fd = ws_tcp_connect("127.0.0.1", srv_port, 1000, err, err_cap);
+    if (fd == WS_INVALID_FD) { snprintf(err, err_cap, "bridge daemon not running on this machine"); return 0; }
+    char req[512];
+    int n = snprintf(req, sizeof req, "GET /adb?phone=%s&port=%s%s HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n", enc, pspec, forget ? "&forget=1" : "");
+    size_t off = 0;
+    while (off < (size_t)n) {
+        struct pollfd p = { .fd = fd, .events = POLLOUT };
+        if (poll(&p, 1, 1000) <= 0) break;
+        ssize_t w = send(fd, req + off, (size_t)n - off, 0);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    char resp[1024] = {0}; size_t rl = 0;
+    for (;;) {
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        if (poll(&p, 1, 3000) <= 0) break;
+        ssize_t r = recv(fd, resp + rl, sizeof resp - 1 - rl, 0);
+        if (r <= 0) break;
+        rl += (size_t)r;
+        if (rl + 1 >= sizeof resp) break;
+    }
+    close(fd);
+    const char *body = strstr(resp, "\r\n\r\n");
+    if (!body) { snprintf(err, err_cap, "bad reply from bridge daemon"); return 0; }
+    body += 4;
+    if (strncmp(resp, "HTTP/1.0 200", 12) != 0) { snprintf(err, err_cap, "%s", *body ? body : "bridge refused"); return 0; }
+    long port = 0;
+    if (!json_get_long(body, strlen(body), "port", &port) || port <= 0 || port > 65535) { snprintf(err, err_cap, "bad reply from bridge daemon"); return 0; }
+    if (last_err) { size_t ln = 0; if (!json_get_str_decoded(body, strlen(body), "lastError", last_err, last_err_cap, &ln)) last_err[0] = 0; }
+    return (uint16_t)port;
+}
+
+// Dial the relay once and see whether the far end hangs up at once (phone
+// offline, dial refused): adbd never speaks first, so a quick EOF is a
+// refusal. Returns 1 if refused.
+static int probe_refused(uint16_t port) {
+    char err[64];
+    ws_fd_t fd = ws_tcp_connect("127.0.0.1", port, 1000, err, sizeof err);
+    if (fd == WS_INVALID_FD) return 1;
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    int refused = 0;
+    // Only an EOF/error within the window counts; silence is a live adbd.
+    if (poll(&p, 1, 1500) > 0) { char b[8]; refused = recv(fd, b, sizeof b, MSG_PEEK) <= 0; }
+    close(fd);
+    return refused;
+}
+
+int cmd_adb(int argc, char **argv) {
+    // argv: [__adb, verb, target, rest…]
+    if (argc < 2) { fprintf(stderr, "usage: adb connect|pair|disconnect <phone>\n"); return 2; }
+    const char *verb = argv[1];
+    char *target = argc >= 3 ? argv[2] : NULL;
+    char *exec_argv[64];
+    int ea = 0;
+    exec_argv[ea++] = "adb";
+    exec_argv[ea++] = (char *)verb;
+    char hostport[64];
+    if (target && !looks_like_hostport(target)) {
+        // "<phone>" — connect uses adbd's connect port, pair its pairing port.
+        const char *pspec = strcmp(verb, "pair") == 0 ? "pair" : "connect";
+        if (strlen(target) >= 64) { fprintf(stderr, "adb %s: phone name too long\n", verb); return 1; }
+        uint16_t srv = IDENTITY_SERVER_PORT;
+        const char *api = getenv("TODOFORAI_API_URL");
+        if (api && (strstr(api, "localhost") || strstr(api, "127.0.0.1"))) srv = IDENTITY_SERVER_PORT_LOCAL;
+        char err[256], last[192] = "";
+        if (strcmp(verb, "disconnect") == 0) {
+            // Drop the relay listener; the real adb forgets 127.0.0.1:<port>.
+            uint16_t port = ask_daemon(srv, target, pspec, err, sizeof err, NULL, 0, 1);
+            if (!port) { fprintf(stderr, "adb disconnect %s: %s\n", target, err); return 1; }
+            snprintf(hostport, sizeof hostport, "127.0.0.1:%u", port);
+            exec_argv[ea++] = hostport;
+            exec_argv[ea] = NULL;
+            execvp("adb", exec_argv);
+            fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
+            return 127;
+        }
+        uint16_t port = ask_daemon(srv, target, pspec, err, sizeof err, NULL, 0, 0);
+        if (!port) { fprintf(stderr, "adb %s %s: %s\n", verb, target, err); return 1; }
+        if (probe_refused(port)) {
+            if (ask_daemon(srv, target, pspec, err, sizeof err, last, sizeof last, 0))
+                fprintf(stderr, "adb %s %s: %s\n", verb, target, last[0] ? last : "phone did not answer");
+            else
+                fprintf(stderr, "adb %s %s: phone did not answer\n", verb, target);
+            return 1;
+        }
+        snprintf(hostport, sizeof hostport, "127.0.0.1:%u", port);
+        exec_argv[ea++] = hostport;
+        for (int i = 3; i < argc && ea < 62; i++) exec_argv[ea++] = argv[i];
+    } else {
+        for (int i = 2; i < argc && ea < 62; i++) exec_argv[ea++] = argv[i];
+    }
+    exec_argv[ea] = NULL;
+    execvp("adb", exec_argv);
+    fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
+    return 127;
+}
+#endif  // !_WIN32

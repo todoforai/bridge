@@ -38,4 +38,17 @@ void bridge_identity_server_serve(ws_fd_t listen_fd, const char *device_id);
 
 void bridge_identity_server_close(ws_fd_t listen_fd);
 
+// `GET /adb?phone=<name>&port=<connect|pair|n>` — the daemon-side half of the
+// adb() shim (adb_relay.h): returns the loopback port to dial as
+// {"port":N,"lastError":"…"}. The hook opens/reuses the relay listener; 0 + err = failure
+// (answered as 503 with the message). Requests carrying an Origin header are
+// refused: this is for the local `__adb` subcommand, never a web page.
+typedef uint16_t (*bridge_adb_hook_fn)(void *ctx, const char *phone, const char *port_spec,
+                                       char *err, size_t err_cap);
+typedef const char *(*bridge_adb_last_error_fn)(void *ctx, const char *phone, const char *port_spec);
+// `&forget=1`: drop the relay (adb disconnect); returns the port it had, 0 = none.
+typedef uint16_t (*bridge_adb_forget_fn)(void *ctx, const char *phone, const char *port_spec);
+void bridge_identity_server_set_adb_hook(bridge_adb_hook_fn fn, bridge_adb_last_error_fn last_err,
+                                         bridge_adb_forget_fn forget, void *ctx);
+
 #endif

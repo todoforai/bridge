@@ -14,6 +14,8 @@ int  bridge_login_run(const char *device_name, const char *token,
 int  cmd_logout(int argc, char **argv);
 int  cmd_enroll(int argc, char **argv);
 int  cmd_whoami(int argc, char **argv);
+// `<bridge> __adb connect|pair|disconnect …` (adb() shim target; POSIX only).
+int  cmd_adb(int argc, char **argv);
 void print_help(void);
 
 #endif

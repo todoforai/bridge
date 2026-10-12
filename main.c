@@ -98,6 +98,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "policy.h"
 #include "cloud_ssh.h"
 #include "login.h"
+#include "adb_relay.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
 // what /bin/sh would do for shell commands (write_file_b64 bypasses the shell,
@@ -527,6 +528,10 @@ static int output_tail_is_prompt(const session_t *s) {
 // job is only terminated once the step is reported, so in practice it wins.
 #ifdef _WIN32
 #  define DETACH_SHIM_FMT "nohup() { '%s' __detach \"$@\"; }; setsid() { nohup \"$@\"; }; "
+#else
+// `adb connect "<phone>"` → the daemon's ADB relay (adb_relay.h). Only the
+// addressing verbs are intercepted; everything else is the real adb.
+#  define ADB_SHIM_FMT "adb() { case \"$1\" in connect|pair|disconnect) '%s' __adb \"$@\" ;; *) command adb \"$@\" ;; esac; }; "
 #endif
 
 typedef struct {
@@ -547,6 +552,7 @@ typedef struct {
     // the bun edge); retried on each (re)connect, never fatal.
     ws_fd_t identity_fd;
     uint16_t identity_port;  // 43127 for prod, 43128 for a local/dev backend
+    adb_relay_t adb;         // loopback adb relays (adb_relay.h)
     // Mayfly mode (--mayfly <todoId>): ephemeral, task-scoped session. Auths
     // with the normal saved credentials but registers backend-side under the
     // in-memory id `mayfly-<todoId>` — never as the persistent device row —
@@ -846,6 +852,20 @@ static int send_json(edge_t *e, const char *s, size_t n) {
     debug_wire("→ send", (long)n, s);
     return noise_ws_send(&e->noise, &e->ws, (const uint8_t *)s, n);
 }
+
+// adb_relay.h glue: frames go out on the Noise channel; the loopback
+// `GET /adb` hook (identity_server.c) asks for a relay listener.
+static int adb_send_cb(void *ctx, const char *json, size_t len) { return send_json((edge_t *)ctx, json, len); }
+// Hold adb input while ≥1 MB is queued: the loop drains on POLLOUT and resumes.
+static int adb_busy_cb(void *ctx) { return ((edge_t *)ctx)->ws.tx_len >= (1u << 20); }
+static uint16_t adb_hook_cb(void *ctx, const char *phone, const char *pspec, char *err, size_t err_cap) {
+    edge_t *e = ctx;
+    if (!e->noise.handshake_done || !e->identity_sent) { snprintf(err, err_cap, "bridge is not connected to the backend"); return 0; }
+    return adb_relay_listener(&e->adb, phone, pspec, err, err_cap);
+}
+
+static const char *adb_last_error_cb(void *ctx, const char *phone, const char *pspec) { return adb_relay_last_error(&((edge_t *)ctx)->adb, phone, pspec); }
+static uint16_t adb_forget_cb(void *ctx, const char *phone, const char *pspec) { return adb_relay_forget(&((edge_t *)ctx)->adb, phone, pspec); }
 
 static int jfield_str(char *buf, size_t cap, size_t *u, const char *key, const char *val, long len, int comma) {
     if (comma && json_emit_raw(buf, cap, u, ",", 1) < 0) return -1;
@@ -2576,9 +2596,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[1024 * 4 + 128];   // g_self ≤ 1023, each ' may become '\''
+        char dshim[1024 * 4 + 256];   // g_self ≤ 1023, each ' may become '\''
         dshim[0] = '\0';
-#ifdef _WIN32
         {
             const char *self = bridge_jobs_self_path();
             if (self && *self) {
@@ -2588,11 +2607,14 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                     else q[qn++] = *c;
                 }
                 q[qn] = '\0';
+#ifdef _WIN32
                 int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q);
+#else
+                int dn = snprintf(dshim, sizeof dshim, ADB_SHIM_FMT, q);
+#endif
                 if (dn < 0 || (size_t)dn >= sizeof dshim) dshim[0] = '\0';
             }
         }
-#endif
         if (adopted && !pty_pool_cd_prefix(s->cwd, cdpre, sizeof cdpre)) {
             free(cmd); RUN_FAIL_CLEANUP();
             return send_error(e, NULL, 0, bid, bid_len, "INTERNAL", "cwd too long");
@@ -3247,6 +3269,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         }
     } else if (IS("cloud_ssh_offer") || IS("cloud_ssh_config")) {
         return handle_cloud_ssh(e, IS("cloud_ssh_offer"), msg, msg_len);
+    } else if (IS("adb:data") || IS("adb:close")) {
+        const char *payload = NULL; size_t payload_len = 0;
+        if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len)) return 0;
+        if (IS("adb:data")) adb_relay_on_data(&e->adb, payload, payload_len);
+        else                adb_relay_on_close(&e->adb, payload, payload_len);
+        return 0;
     } else if (IS("preview:http_request")) {
         // live_preview relay fetch. Payload-wrapped like FUNCTION_CALL_*:
         // {"payload":{requestId, port, method, path, headers{}, bodyB64?}}.
@@ -3484,6 +3512,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                const uint8_t pubkey[32]) {
     e->device_id = device_id;
     e->device_secret = device_secret;
+    adb_relay_drop_streams(&e->adb);   // backend streams died with the last connection
     e->identity_port = login_is_local_host(host) ? IDENTITY_SERVER_PORT_LOCAL : IDENTITY_SERVER_PORT;
     if (e->identity_fd == WS_INVALID_FD && !e->mayfly) e->identity_fd = bridge_identity_server_open(e->identity_port);
     // Derive the public HTTP API URL from the Noise host. In prod a TLS
@@ -3521,7 +3550,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     // pfds[0] is always the WS fd; remaining slots are active sessions' PTY
     // master fds so output wakes the loop immediately instead of waiting out
     // the timeout. +1 for the WS slot.
-    struct pollfd *pfds = calloc((size_t)g_max_sessions + 2, sizeof *pfds);
+    struct pollfd *pfds = calloc((size_t)g_max_sessions + 2 + ADB_MAX_LISTENERS + ADB_MAX_STREAMS, sizeof *pfds);
     if (!pfds) { fail(e, "out of memory allocating pollfds"); ws_close(&e->ws); noise_ws_wipe(&e->noise); return -1; }
 
     while (!e->done) {
@@ -3547,6 +3576,14 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             identity_slot = (int)nfds;
             pfds[nfds].fd = e->identity_fd; pfds[nfds].events = POLLIN; nfds++;
         }
+        size_t adb_first = (size_t)nfds, adb_n = (size_t)nfds;
+        adb_relay_fill_pfds(&e->adb, pfds, &adb_n, (size_t)g_max_sessions + 2 + ADB_MAX_LISTENERS + ADB_MAX_STREAMS);
+        adb_n -= adb_first;
+#ifdef _WIN32
+        nfds = (ULONG)(adb_first + adb_n);
+#else
+        nfds = (nfds_t)(adb_first + adb_n);
+#endif
         struct pollfd *pfd = &pfds[0];
         // Keep a 50ms ceiling so the awaiting-input probe and deadline checks in
         // service_sessions still tick when neither WS nor PTY has activity.
@@ -3597,6 +3634,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             }
             if (identity_slot >= 0 && (pfds[identity_slot].revents & POLLIN))
                 bridge_identity_server_serve(e->identity_fd, e->mayfly ? NULL : e->device_id);
+            if (adb_n && e->noise.handshake_done && e->identity_sent) adb_relay_service(&e->adb, pfds, adb_first, adb_n);
         }
         // Deferred identity send — gives the backend's async validateDevice()
         // time to settle before the second frame lands on the post-auth handler.
@@ -3867,6 +3905,8 @@ int bridge_main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "__job") == 0) return cmd_job_worker(argv[2]);
 #ifdef _WIN32
     if (argc >= 2 && strcmp(argv[1], "__detach") == 0) return bridge_pty_detach_main(argc - 2, argv + 2);
+#else
+    if (argc >= 2 && strcmp(argv[1], "__adb") == 0) return cmd_adb(argc - 1, argv + 1);
 #endif
     // Resolve our own path while argv0 and the cwd are still trustworthy.
     bridge_jobs_init_self(argv[0]);
@@ -4122,6 +4162,8 @@ int bridge_main(int argc, char **argv) {
     // Mayfly sessions are invisible to the UI; only the persistent daemon
     // answers "which device is this machine".
     e->identity_fd = WS_INVALID_FD;  // opened in run(), after e->mayfly is known
+    adb_relay_init(&e->adb, adb_send_cb, adb_busy_cb, e);
+    bridge_identity_server_set_adb_hook(adb_hook_cb, adb_last_error_cb, adb_forget_cb, e);
     e->session_token = session_token;        // login-less mayfly auth (NULL otherwise)
     if (mayfly_todo_id) {
         // Todo ids are CLI-minted uuids (enforced server-side too); reject
@@ -4324,6 +4366,7 @@ done:
         unstage_wrapper_file(&e->sessions[i]);
     }
     pty_pool_shutdown();
+    adb_relay_close_all(&e->adb);
     bridge_identity_server_close(e->identity_fd);
     free(e->sessions);
     free(e);

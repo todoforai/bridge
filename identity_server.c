@@ -33,6 +33,49 @@ static void is_cloexec(int s) { fcntl(s, F_SETFD, FD_CLOEXEC); }
 // loop, so a slow local client must never hold agent traffic for long.
 #define IO_BUDGET_MS 300
 
+static bridge_adb_hook_fn g_adb_hook = NULL;
+static bridge_adb_last_error_fn g_adb_last_error = NULL;
+static bridge_adb_forget_fn g_adb_forget = NULL;
+static void *g_adb_hook_ctx = NULL;
+void bridge_identity_server_set_adb_hook(bridge_adb_hook_fn fn, bridge_adb_last_error_fn last_err, bridge_adb_forget_fn forget, void *ctx) {
+    g_adb_hook = fn; g_adb_last_error = last_err; g_adb_forget = forget; g_adb_hook_ctx = ctx;
+}
+
+// 1 if the request carries header `name` at all (value ignored, any length).
+static int has_header(const char *req, const char *name) {
+    size_t nl = strlen(name);
+    for (const char *p = req; (p = strchr(p, '\n')) != NULL; ) {
+        p++;
+        if (strncasecmp(p, name, nl) == 0 && p[nl] == ':') return 1;
+    }
+    return 0;
+}
+
+// Percent-decode one query value of `key` from "GET /path?a=b&c=d HTTP/1.1".
+static int query_param(const char *req, const char *key, char *out, size_t cap) {
+    const char *q = strchr(req, '?');
+    const char *end = q ? strpbrk(q, " \r\n") : NULL;
+    if (!q || !end) return 0;
+    size_t kl = strlen(key);
+    for (const char *p = q + 1; p < end; ) {
+        const char *amp = memchr(p, '&', (size_t)(end - p));
+        const char *pe = amp ? amp : end;
+        if ((size_t)(pe - p) > kl && memcmp(p, key, kl) == 0 && p[kl] == '=') {
+            size_t o = 0;
+            for (const char *c = p + kl + 1; c < pe; c++) {
+                if (o + 1 >= cap) return 0;
+                if (*c == '%' && c + 2 < pe) { unsigned v; char h[3] = { c[1], c[2], 0 }; if (sscanf(h, "%x", &v) != 1) return 0; out[o++] = (char)v; c += 2; }
+                else if (*c == '+') out[o++] = ' ';
+                else out[o++] = *c;
+            }
+            out[o] = '\0';
+            return 1;
+        }
+        p = pe + 1;
+    }
+    return 0;
+}
+
 ws_fd_t bridge_identity_server_open(uint16_t port) {
 #ifdef _WIN32
     WSADATA wd;
@@ -154,7 +197,37 @@ void bridge_identity_server_serve(ws_fd_t listen_fd, const char *device_id) {
     }
 
     char out[2048];
-    if (strncmp(req, "OPTIONS /identity ", 18) == 0 || strncmp(req, "OPTIONS /file?", 14) == 0) {
+    if (strncmp(req, "GET /adb?", 9) == 0) {
+        char phone[64], pspec[16], err[256];
+        uint16_t port = 0;
+        // Any Origin (or an oversized one) ⇒ a browser sent this: refuse. Only
+        // the local `__adb` subcommand (no Origin, Host 127.0.0.1) may ask.
+        char host[64];
+        if (has_header(req, "Origin") || has_header(req, "Referer")) snprintf(err, sizeof err, "forbidden");
+        else if (!header_value(req, "Host", host, sizeof host) || strncmp(host, "127.0.0.1", 9) != 0) snprintf(err, sizeof err, "forbidden");
+        else if (!g_adb_hook) snprintf(err, sizeof err, "adb relay unavailable");
+        else if (!query_param(req, "phone", phone, sizeof phone)) snprintf(err, sizeof err, "phone required");
+        else {
+            char forget[4];
+            if (!query_param(req, "port", pspec, sizeof pspec)) snprintf(pspec, sizeof pspec, "connect");
+            if (query_param(req, "forget", forget, sizeof forget) && forget[0] == '1') {
+                port = g_adb_forget ? g_adb_forget(g_adb_hook_ctx, phone, pspec) : 0;
+                if (!port) snprintf(err, sizeof err, "no relay for that phone");
+            } else {
+                port = g_adb_hook(g_adb_hook_ctx, phone, pspec, err, sizeof err);
+            }
+        }
+        if (port) {
+            char body[512]; size_t u = 0;
+            int bad = snprintf(body, sizeof body, "{\"port\":%u,\"lastError\":", port) < 0;
+            u = strlen(body);
+            bad = bad || json_emit_str(body, sizeof body, &u, g_adb_last_error ? g_adb_last_error(g_adb_hook_ctx, phone, pspec) : "", -1) < 0
+                      || json_emit_raw(body, sizeof body, &u, "}", 1) < 0;
+            if (bad) { is_close_fd(fd); return; }
+            snprintf(out, sizeof out, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%.*s", u, (int)u, body);
+        }
+        else snprintf(out, sizeof out, "HTTP/1.0 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(err), err);
+    } else if (strncmp(req, "OPTIONS /identity ", 18) == 0 || strncmp(req, "OPTIONS /file?", 14) == 0) {
         snprintf(out, sizeof out, "HTTP/1.0 204 No Content\r\n%sConnection: close\r\n\r\n", cors);
     } else if (strncmp(req, "GET /identity ", 14) == 0 && device_id && device_id[0]) {
         // Only the id: the frontend already has name/os from the device list.
