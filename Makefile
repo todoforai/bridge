@@ -132,7 +132,7 @@ test-pty-win: | build
 	    -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006 -DWINVER=0x0A00 \
 	    -Wno-macro-redefined \
 	    $(CFLAGS) -I. \
-	    -o build/test-pty-win.exe test/test_pty_win.c pty_win.c env_path.c \
+	    -o build/test-pty-win.exe test/test_pty_win.c pty_win.c env_path.c tools.c json.c policy.c \
 	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
 
 # Sentinel-scanner smoke test: spawns a real PTY with echo off, runs a few
