@@ -521,6 +521,8 @@ int cmd_adb(int argc, char **argv) {
 #define LIVE_FLUSH_MS    200
 #define LIVE_FLUSH_BYTES (16 * 1024)
 #define LIVE_BUF_CAP     (64 * 1024)   // overflow while a POST is in flight → drop
+#define LIVE_LINES_PER_S 10            // display rate: token bucket, burst = 1s worth
+#define LIVE_LINE_LEN    300           // per-line width cap (as OB_LINE_LEN)
 
 static int64_t live_now_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -568,6 +570,31 @@ static pid_t live_post(const char *url, const char *hdr, const char *body, size_
     _exit(0);
 }
 
+static size_t count_lines(const char *p, size_t n) {
+    size_t c = 0;
+    for (size_t i = 0; i < n; i++) c += p[i] == '\n';
+    return c;
+}
+
+// Body for one POST: "[… N lines]" if any were skipped, then the last `keep`
+// lines of src[0..n) (n ends on '\n'), each cut to LIVE_LINE_LEN.
+static size_t live_body(char *dst, size_t cap, size_t skipped, const char *src, size_t n, size_t keep) {
+    size_t lines = count_lines(src, n), o = 0, i = 0;
+    for (size_t drop = lines > keep ? lines - keep : 0; drop > 0; i++) if (src[i] == '\n') { drop--; skipped++; }
+    if (skipped) {
+        int m = snprintf(dst, cap, "[\xe2\x80\xa6 %zu lines]\n", skipped);
+        if (m > 0 && (size_t)m < cap) o = (size_t)m;
+    }
+    size_t col = 0;
+    for (; i < n && o + 8 < cap; i++) {
+        if (src[i] == '\n') { dst[o++] = '\n'; col = 0; continue; }
+        if (col < LIVE_LINE_LEN) dst[o++] = src[i];
+        else if (col == LIVE_LINE_LEN) { memcpy(dst + o, "\xe2\x80\xa6", 3); o += 3; }
+        col++;
+    }
+    return o;
+}
+
 int cmd_live(int argc, char **argv) {
     (void)argc; (void)argv;
     signal(SIGPIPE, SIG_IGN);  // EPIPE instead: stop like cat would, but say so via rc
@@ -581,22 +608,33 @@ int cmd_live(int argc, char **argv) {
         int h = snprintf(hdr, sizeof hdr, "x-api-key: %s\n", tok);
         post = u > 0 && (size_t)u < sizeof url && h > 0 && (size_t)h < sizeof hdr;
     }
-    static char in[16 * 1024], buf[LIVE_BUF_CAP];
+    static char in[16 * 1024], buf[LIVE_BUF_CAP], body[LIVE_BUF_CAP];
     size_t blen = 0;
     pid_t inflight = 0;
-    int out_ok = 1;  // stdout still writable
-    int64_t first = 0;  // ms when the oldest unsent byte arrived
+    int out_ok = 1;        // stdout still writable
+    int64_t first = 0;     // ms when the oldest unsent byte arrived
+    size_t skipped = 0;    // lines dropped (rate limit / overflow) since the last POST
+    double credits = LIVE_LINES_PER_S;
+    int64_t refill_at = live_now_ms();
     for (;;) {
         if (inflight > 0) {
             pid_t w = waitpid(inflight, NULL, WNOHANG);
             if (w == inflight || (w < 0 && errno == ECHILD)) inflight = 0;
         }
+        int64_t now = live_now_ms();
+        credits += (double)(now - refill_at) * LIVE_LINES_PER_S / 1000.0;
+        if (credits > LIVE_LINES_PER_S) credits = LIVE_LINES_PER_S;
+        refill_at = now;
         int timeout = -1;
         if (post && blen > 0) {
-            int64_t left = first + LIVE_FLUSH_MS - live_now_ms();
-            timeout = left < 0 ? 0 : (int)left;
+            int64_t due = first + LIVE_FLUSH_MS;
+            if (credits < 1) {  // wait for the next line's credit, not a busy loop
+                int64_t c = now + (int64_t)((1 - credits) * 1000 / LIVE_LINES_PER_S) + 1;
+                if (c > due) due = c;
+            }
+            timeout = due <= now ? 0 : (int)(due - now);
         }
-        if (inflight > 0 && (timeout < 0 || timeout < 50)) timeout = 50;  // reap / retry the poster
+        if (inflight > 0 && (timeout < 0 || timeout > 50)) timeout = 50;  // reap the poster
         struct pollfd p = { .fd = 0, .events = POLLIN };
         int pr = poll(&p, 1, timeout);
         if (pr < 0 && errno != EINTR) break;
@@ -606,26 +644,39 @@ int cmd_live(int argc, char **argv) {
             if (r <= 0) break;
             if (write_all(1, in, (size_t)r) < 0) { out_ok = 0; break; }  // reader gone
             if (post) {
-                if (blen + (size_t)r > sizeof buf) blen = 0;  // display-only: drop the backlog
+                if (blen + (size_t)r > sizeof buf) { skipped += count_lines(buf, blen); blen = 0; }
                 if (blen == 0) first = live_now_ms();
                 memcpy(buf + blen, in, (size_t)r); blen += (size_t)r;
             }
         }
-        if (!post || blen == 0 || inflight > 0) continue;
+        if (!post || blen == 0 || inflight > 0 || credits < 1) continue;
         if (blen < LIVE_FLUSH_BYTES && live_now_ms() - first < LIVE_FLUSH_MS) continue;
-        // Prefer whole lines; a ≥16KB newline-less run (or an overflow drop) may split UTF-8.
+        // Whole lines only; a ≥16KB newline-less run is cut into one line.
         size_t n = blen;
         while (n > 0 && buf[n - 1] != '\n') n--;
-        if (n == 0) { if (blen < LIVE_FLUSH_BYTES) { first = live_now_ms(); continue; } n = blen; }
-        pid_t pid = live_post(url, hdr, buf, n);
+        if (n == 0) {
+            if (blen < LIVE_FLUSH_BYTES) { first = live_now_ms(); continue; }
+            buf[blen - 1] = '\n'; n = blen;
+        }
+        size_t lines = count_lines(buf, n), keep = (size_t)credits;
+        if (keep > lines) keep = lines;
+        size_t bn = live_body(body, sizeof body, skipped, buf, n, keep);
+        pid_t pid = live_post(url, hdr, body, bn);
         if (pid < 0) { post = 0; continue; }
         inflight = pid;
+        credits -= (double)keep;
+        skipped = 0;
         memmove(buf, buf + n, blen - n); blen -= n;
         if (blen) first = live_now_ms();
     }
-    // EOF: hand the rest off and return at once — the pipeline (and tail's
-    // final print) must not wait on the network. The poster is orphaned.
-    if (post && out_ok && blen > 0) live_post(url, hdr, buf, blen);
+    // EOF: hand the last lines off and return at once — the pipeline (and
+    // tail's final print) must not wait on the network. The poster is orphaned.
+    if (post && out_ok && blen > 0) {
+        if (buf[blen - 1] != '\n' && blen < sizeof buf) buf[blen++] = '\n';
+        size_t keep = credits >= 1 ? (size_t)credits : 1;
+        size_t bn = live_body(body, sizeof body, skipped, buf, blen, keep);
+        live_post(url, hdr, body, bn);
+    }
     return out_ok ? 0 : 141;  // 128+SIGPIPE, what cat reports under pipefail
 }
 #endif  // !_WIN32
