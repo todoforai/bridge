@@ -2616,6 +2616,23 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
+#ifndef _WIN32
+            // g_self may be the magic "/proc/self/exe" link — inside the RUN
+            // shell that names the SHELL, not us. Shims need the real file; a
+            // " (deleted)" suffix (upgraded in place) means the new build now
+            // sits at that path, which still speaks __adb/__live.
+            char real[1024];
+            if (self && strcmp(self, "/proc/self/exe") == 0) {
+                ssize_t rn = readlink(self, real, sizeof real - 1);
+                if (rn > 0) {
+                    real[rn] = '\0';
+                    const char *del = " (deleted)";
+                    size_t dl = strlen(del);
+                    if ((size_t)rn > dl && strcmp(real + rn - dl, del) == 0) real[rn - dl] = '\0';
+                    self = real;
+                } else self = NULL;
+            }
+#endif
             if (self && *self) {
                 char q[1024 * 4]; size_t qn = 0;
                 for (const char *c = self; *c && qn + 5 < sizeof q; c++) {
