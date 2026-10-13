@@ -76,7 +76,7 @@ static const char *home_dir(void) {
 }
 
 // Per-user config dir (same one login.h uses for credentials.json).
-static int config_dir(char *buf, size_t cap) {
+int bridge_config_dir(char *buf, size_t cap) {
     const char *home = home_dir();
     if (!home) return -1;
     int w;
@@ -293,7 +293,7 @@ void bridge_policy_load(void) {
     memset(&g_policy, 0, sizeof g_policy);
     g_home[0] = '\0';
     char raw_cfg[1024];
-    if (!home_dir() || config_dir(raw_cfg, sizeof raw_cfg) != 0) return;   // no HOME: no per-user policy
+    if (!home_dir() || bridge_config_dir(raw_cfg, sizeof raw_cfg) != 0) return;   // no HOME: no per-user policy
     // Canonical, like the workspaces, so a symlinked ~/.config or a relative
     // XDG_CONFIG_HOME can't slip past the overlap checks.
     if (canon(raw_cfg, g_cfgdir, sizeof g_cfgdir) != 0) snprintf(g_cfgdir, sizeof g_cfgdir, "%s", raw_cfg);

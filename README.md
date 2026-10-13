@@ -219,6 +219,37 @@ todoforai-bridge policy list            # restart bridge to apply
 - Fail closed: bad policy file ⇒ all paths denied, no shells, reason on
   stderr.
 
+## Keep awake while agents work (optional, off by default)
+
+While at least one task runs (a RUN step, incl. parked ones, or an open adb
+relay stream) the bridge holds an OS **system-sleep** inhibitor, and drops it
+~2 min after the last task ends. Display sleep and screen lock are never
+touched, nothing wakes a sleeping machine, and nothing is held while idle.
+
+```sh
+todoforai-bridge config keep-awake on    # or off; `config` shows the state
+```
+
+Or the HostCard menu → "Keep awake while agents work". Stored in
+`<config dir>/config.json` (`{"keep_awake": true}`, next to `credentials.json`).
+The backend may write this file (the UI toggle), so it never holds anything
+security-relevant — that is `policy.json`'s job.
+
+| OS | Mechanism |
+|----|-----------|
+| Linux | `systemd-inhibit --what=sleep --mode=block` child (logind). No logind ⇒ log line, no hold. |
+| macOS | `caffeinate -i` child (PreventUserIdleSystemSleep). **Lid closed on battery still sleeps.** |
+| Windows | `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED)` |
+
+The helper's stdin is a pipe only the bridge holds, so the hold dies with the
+bridge, even on SIGKILL. State goes to the backend as
+`{"type":"keep_awake_state","enabled":b,"active":b}` (→ `metadata.keepAwake`).
+Keep-awake grants no new access: tasks still run as your user. Lock your
+screen; Stop in the app ends the task and releases the hold. Check on Linux
+with `systemd-inhibit --list` during a task. The hold is also dropped while
+the bridge is disconnected, and `--mayfly` sessions (`tfa-cli --isolated`)
+don't take one.
+
 ## Native cloud SSH (`ssh tfa-cloud`)
 
 On a durable PC bridge the backend can set up plain OpenSSH access to the

@@ -68,6 +68,10 @@ const char *bridge_policy_deny_msg(const char *path, char *buf, size_t cap);
 // unconfined would void the policy.
 int bridge_policy_jail_child(void);
 
+// Per-user todoforai config dir (credentials.json, policy.json, config.json).
+// -1 when there is no HOME or the path does not fit.
+int bridge_config_dir(char *buf, size_t cap);
+
 // `todoforai-bridge policy init|add PATH|list`
 int cmd_policy(int argc, char **argv);
 

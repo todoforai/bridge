@@ -83,6 +83,9 @@ void adb_relay_service(adb_relay_t *r, const struct pollfd *pfds, size_t first, 
 void adb_relay_on_data(adb_relay_t *r, const char *payload, size_t len);
 void adb_relay_on_close(adb_relay_t *r, const char *payload, size_t len);
 
+// Streams currently open (keep-awake counts them as running work).
+int adb_relay_stream_count(const adb_relay_t *r);
+
 // Drop every stream (backend connection lost); listeners stay so a reconnect
 // keeps `adb connect` working.
 void adb_relay_drop_streams(adb_relay_t *r);

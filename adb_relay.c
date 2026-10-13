@@ -60,6 +60,12 @@ static void stream_free(adb_stream_t *s) {
     s->outq = NULL; s->outq_len = s->outq_cap = 0; s->remote_closed = 0;
 }
 
+int adb_relay_stream_count(const adb_relay_t *r) {
+    int n = 0;
+    for (int i = 0; i < ADB_MAX_STREAMS; i++) n += r->streams[i].fd != WS_INVALID_FD;
+    return n;
+}
+
 void adb_relay_drop_streams(adb_relay_t *r) {
     for (int i = 0; i < ADB_MAX_STREAMS; i++) stream_free(&r->streams[i]);
 }

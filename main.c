@@ -99,6 +99,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "cloud_ssh.h"
 #include "login.h"
 #include "adb_relay.h"
+#include "keep_awake.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
 // what /bin/sh would do for shell commands (write_file_b64 bypasses the shell,
@@ -2190,6 +2191,13 @@ static int handle_cloud_ssh(edge_t *e, int offer, const char *msg, size_t msg_le
     return 0;
 }
 
+// Report keep-awake {enabled, active} (keep_awake.h) once identity is out.
+static void send_keep_awake_state(edge_t *e) {
+    char buf[96];
+    int n = keep_awake_state_json(buf, sizeof buf);
+    if (n > 0 && e->identity_sent) (void)send_json(e, buf, (size_t)n);
+}
+
 static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
     const char *type = NULL; size_t type_len = 0;
     if (!json_get_str(msg, msg_len, "type", &type, &type_len)) return 0;
@@ -3267,6 +3275,14 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
+    } else if (IS("keep_awake")) {
+        // Owner's HostCard toggle. Persisted to config.json (not a security
+        // file — see keep_awake.h); the hold follows on the next tick.
+        int on = 0;
+        if (e->mayfly || !json_get_bool(msg, msg_len, "enabled", &on)) return 0;
+        keep_awake_set(on);
+        send_keep_awake_state(e);
+        return 0;
     } else if (IS("cloud_ssh_offer") || IS("cloud_ssh_config")) {
         return handle_cloud_ssh(e, IS("cloud_ssh_offer"), msg, msg_len);
     } else if (IS("adb:data") || IS("adb:close")) {
@@ -3485,6 +3501,20 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
     handle_command(e, (const char *)e->msg_buf, (size_t)n);
 }
 
+// ── Keep-awake (keep_awake.h) ───────────────────────────────────────────────
+
+// Running work = a RUN step in flight or an open adb relay stream. Parked
+// steps (agent driving by pid) still count: the process is alive.
+static void service_keep_awake(edge_t *e) {
+    // Mayfly sessions (tfa-cli --isolated) don't hold: the setting is the
+    // persistent daemon's, and it can't see their work. Documented gap.
+    if (e->mayfly) return;
+    int busy = adb_relay_stream_count(&e->adb) > 0;
+    for (int i = 0; i < g_max_sessions && !busy; i++)
+        busy = e->sessions[i].active && e->sessions[i].state == SESS_RUNNING;
+    if (keep_awake_tick(busy, monotonic_ms())) send_keep_awake_state(e);
+}
+
 // Apply an armed update once no PTY is busy. Idleness is the whole safety
 // story: the swap ends with exit(0), and killing the process mid-RUN would
 // take a user's running command with it. A bridge that is never idle simply
@@ -3644,8 +3674,10 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             int il = bridge_identity_json(id, sizeof id, 0);
             if (il <= 0 || send_json(e, id, (size_t)il) != 0) { fail(e, "failed to send identity frame"); break; }
             e->identity_sent = 1;
+            if (!e->mayfly) send_keep_awake_state(e);
         }
         service_sessions(e);
+        service_keep_awake(e);
         pty_pool_service(monotonic_ms());
         // Forward anything the off-loop workers produced (tool scan results,
         // preview chunks). Never blocks; sending stays on this thread.
@@ -3664,6 +3696,9 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         if (ws_want_write(&e->ws) && ws_io_out(&e->ws) < 0) { fail(e, "%s", e->ws.err); break; }
     }
     free(pfds);
+    // No backend ⇒ nobody can see or Stop the task: don't hold the machine
+    // awake through an outage. The next connected tick re-takes it if needed.
+    if (keep_awake_release()) fprintf(stderr, "keep-awake: released (disconnected)\n");
     // Workers outlive nothing: their requestIds die with this connection.
     bridge_jobs_shutdown(&e->jobs);
     ws_close(&e->ws);
@@ -3926,6 +3961,9 @@ int bridge_main(int argc, char **argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "whoami") == 0) {
         return cmd_whoami(argc - 1, argv + 1);
+    }
+    if (argc >= 2 && strcmp(argv[1], "config") == 0) {
+        return cmd_config(argc - 1, argv + 1);
     }
     if (argc >= 2 && strcmp(argv[1], "policy") == 0) {
         return cmd_policy(argc - 1, argv + 1);
