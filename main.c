@@ -532,7 +532,15 @@ static int output_tail_is_prompt(const session_t *s) {
 #else
 // `adb connect "<phone>"` → the daemon's ADB relay (adb_relay.h). Only the
 // addressing verbs are intercepted; everything else is the real adb.
-#  define ADB_SHIM_FMT "adb() { case \"$1\" in connect|pair|disconnect) '%s' __adb \"$@\" ;; *) command adb \"$@\" ;; esac; }; "
+// `… | tail -N` prints nothing until EOF: tee the pipe through `__live` so the
+// chat block shows lines meanwhile (display-only, the result is tail's). Only a
+// pipe on stdin and a whitelist of last-N/quiet options (`+N` already streams); a file arg, -f, a redirect,
+// a TTY or no block → the real tail untouched.
+#  define ADB_SHIM_FMT "adb() { case \"$1\" in connect|pair|disconnect) '%s' __adb \"$@\" ;; *) command adb \"$@\" ;; esac; }; " \
+    "tail() { __n=; if [ -p /dev/stdin ] && [ -n \"$TODOFORAI_BLOCK_ID\" ]; then __n=1; for __a; do " \
+    "if [ \"$__n\" = arg ]; then case $__a in [0-9]*) __n=1 ;; *) __n=; break ;; esac; continue; fi; " \
+    "case $__a in -n|-c) __n=arg ;; -[0-9]*|-n[0-9]*|-c[0-9]*|--lines=[0-9]*|--bytes=[0-9]*|-q|-v) ;; *) __n=; break ;; esac; done; fi; " \
+    "if [ \"$__n\" = 1 ]; then '%s' __live | command tail \"$@\"; else command tail \"$@\"; fi; }; "
 #endif
 
 typedef struct {
@@ -2604,7 +2612,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[1024 * 4 + 256];   // g_self ≤ 1023, each ' may become '\''
+        char dshim[2 * 1024 * 4 + 768];   // g_self ≤ 1023 (twice), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -2618,7 +2626,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 #ifdef _WIN32
                 int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q);
 #else
-                int dn = snprintf(dshim, sizeof dshim, ADB_SHIM_FMT, q);
+                int dn = snprintf(dshim, sizeof dshim, ADB_SHIM_FMT, q, q);
 #endif
                 if (dn < 0 || (size_t)dn >= sizeof dshim) dshim[0] = '\0';
             }
@@ -3942,6 +3950,7 @@ int bridge_main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "__detach") == 0) return bridge_pty_detach_main(argc - 2, argv + 2);
 #else
     if (argc >= 2 && strcmp(argv[1], "__adb") == 0) return cmd_adb(argc - 1, argv + 1);
+    if (argc >= 2 && strcmp(argv[1], "__live") == 0) return cmd_live(argc - 1, argv + 1);
 #endif
     // Resolve our own path while argv0 and the cwd are still trustworthy.
     bridge_jobs_init_self(argv[0]);

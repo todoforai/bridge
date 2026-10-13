@@ -504,3 +504,128 @@ int cmd_adb(int argc, char **argv) {
     return 127;
 }
 #endif  // !_WIN32
+
+#ifndef _WIN32
+// ── `<bridge> __live` — tee stdin to stdout, POST batches to the backend ──
+// The tail() shim (main.c) runs `cmd | <bridge> __live | command tail …` so a
+// `| tail -N` that would sit silent until EOF still shows lines in the chat
+// block. Display-only: the backend relays them as BLOCK_SH_MSG_RESULT and never
+// stores them, so the tool result is unchanged. Never breaks the pipe: without
+// env/curl or on any POST failure it is a plain `cat`.
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/wait.h>
+
+#define LIVE_FLUSH_MS    200
+#define LIVE_FLUSH_BYTES (16 * 1024)
+#define LIVE_BUF_CAP     (64 * 1024)   // overflow while a POST is in flight → drop
+
+static int64_t live_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int write_all(int fd, const char *p, size_t n) {
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
+
+// Fork a poster: it pipes `body` to curl's stdin and the auth header to fd 3
+// (`-H @/dev/fd/3`, so the token never shows in `ps`). Returns its pid or -1.
+static pid_t live_post(const char *url, const char *hdr, const char *body, size_t n) {
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    // Let go of the pipeline at once: holding its stdout would keep tail's
+    // input open (and its final print waiting) until the POST finishes.
+    { int dn = open("/dev/null", O_RDWR);
+      if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); if (dn > 2) close(dn); } }
+    int bp[2], hp[2];
+    if (pipe(bp) || pipe(hp)) _exit(1);
+    pid_t c = fork();
+    if (c == 0) {
+        // Pipe fds may sit on 0..3 themselves: dup2 into place, then close
+        // only the leftovers above 3, or we would close what we just placed.
+        if (hp[0] == 0) { int t = dup(hp[0]); close(hp[0]); hp[0] = t; }
+        dup2(bp[0], 0); dup2(hp[0], 3);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, 1); dup2(dn, 2); if (dn > 3) close(dn); }
+        int fds[4] = { bp[0], bp[1], hp[0], hp[1] };
+        for (int i = 0; i < 4; i++) if (fds[i] > 3) close(fds[i]);
+        execlp("curl", "curl", "-sS", "-m", "3", "-X", "POST", "-H", "@/dev/fd/3",
+               "-H", "Content-Type: text/plain; charset=utf-8", "--data-binary", "@-", url, (char *)NULL);
+        _exit(127);
+    }
+    close(bp[0]); close(hp[0]);
+    if (c > 0) { write_all(hp[1], hdr, strlen(hdr)); close(hp[1]); write_all(bp[1], body, n); }
+    close(bp[1]); close(hp[1]);
+    int st; if (c > 0) waitpid(c, &st, 0);
+    _exit(0);
+}
+
+int cmd_live(int argc, char **argv) {
+    (void)argc; (void)argv;
+    signal(SIGPIPE, SIG_IGN);  // EPIPE instead: stop like cat would, but say so via rc
+    const char *tok = getenv("TODOFORAI_API_TOKEN"), *api = getenv("TODOFORAI_API_URL");
+    const char *todo = getenv("TODOFORAI_TODO_ID"), *msg = getenv("TODOFORAI_MESSAGE_ID");
+    const char *blk = getenv("TODOFORAI_BLOCK_ID");
+    char url[1024], hdr[256];
+    int post = tok && *tok && api && *api && todo && *todo && msg && *msg && blk && *blk;
+    if (post) {
+        int u = snprintf(url, sizeof url, "%s/dst/v1/shell/live?todoId=%s&messageId=%s&blockId=%s", api, todo, msg, blk);
+        int h = snprintf(hdr, sizeof hdr, "x-api-key: %s\n", tok);
+        post = u > 0 && (size_t)u < sizeof url && h > 0 && (size_t)h < sizeof hdr;
+    }
+    static char in[16 * 1024], buf[LIVE_BUF_CAP];
+    size_t blen = 0;
+    pid_t inflight = 0;
+    int out_ok = 1;  // stdout still writable
+    int64_t first = 0;  // ms when the oldest unsent byte arrived
+    for (;;) {
+        if (inflight > 0) {
+            pid_t w = waitpid(inflight, NULL, WNOHANG);
+            if (w == inflight || (w < 0 && errno == ECHILD)) inflight = 0;
+        }
+        int timeout = -1;
+        if (post && blen > 0) {
+            int64_t left = first + LIVE_FLUSH_MS - live_now_ms();
+            timeout = left < 0 ? 0 : (int)left;
+        }
+        if (inflight > 0 && (timeout < 0 || timeout < 50)) timeout = 50;  // reap / retry the poster
+        struct pollfd p = { .fd = 0, .events = POLLIN };
+        int pr = poll(&p, 1, timeout);
+        if (pr < 0 && errno != EINTR) break;
+        if (pr > 0) {
+            ssize_t r = read(0, in, sizeof in);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            if (write_all(1, in, (size_t)r) < 0) { out_ok = 0; break; }  // reader gone
+            if (post) {
+                if (blen + (size_t)r > sizeof buf) blen = 0;  // display-only: drop the backlog
+                if (blen == 0) first = live_now_ms();
+                memcpy(buf + blen, in, (size_t)r); blen += (size_t)r;
+            }
+        }
+        if (!post || blen == 0 || inflight > 0) continue;
+        if (blen < LIVE_FLUSH_BYTES && live_now_ms() - first < LIVE_FLUSH_MS) continue;
+        // Prefer whole lines; a ≥16KB newline-less run (or an overflow drop) may split UTF-8.
+        size_t n = blen;
+        while (n > 0 && buf[n - 1] != '\n') n--;
+        if (n == 0) { if (blen < LIVE_FLUSH_BYTES) { first = live_now_ms(); continue; } n = blen; }
+        pid_t pid = live_post(url, hdr, buf, n);
+        if (pid < 0) { post = 0; continue; }
+        inflight = pid;
+        memmove(buf, buf + n, blen - n); blen -= n;
+        if (blen) first = live_now_ms();
+    }
+    // EOF: hand the rest off and return at once — the pipeline (and tail's
+    // final print) must not wait on the network. The poster is orphaned.
+    if (post && out_ok && blen > 0) live_post(url, hdr, buf, blen);
+    return out_ok ? 0 : 141;  // 128+SIGPIPE, what cat reports under pipefail
+}
+#endif  // !_WIN32
