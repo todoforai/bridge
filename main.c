@@ -1997,6 +1997,10 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         while (p < s->tail_len && s->tail_buf[p] >= '0' && s->tail_buf[p] <= '9') {
             v = v * 10 + (s->tail_buf[p] - '0'); p++; any = 1;
         }
+        // ConPTY repaints the line and pads it with spaces to the width it
+        // last drew ("__:0        \r\n"); rejecting that left the step running
+        // until its deadline parked it, with the sentinel leaked into output.
+        while (any && p < s->tail_len && s->tail_buf[p] == ' ') p++;
         if (!any) {
             reject = 1;
         } else if (p >= s->tail_len) {

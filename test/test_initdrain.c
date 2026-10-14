@@ -160,6 +160,7 @@ static int scanner_cases(void) {
 // (exactly like the RUN handler), drive to step_done, check captured output.
 static const char *g_shell = "/bin/sh";
 static int g_no_echo;   // 0 = ConPTY-like echo (default); 1 = real POSIX RUN
+static const char *g_sentinel_pad = "";  // after the exit code, as ConPTY's repaint pads it
 
 static int run_case(const char *label, const char *cmd, const char *expect_out) {
     g_out_len = 0; g_step_done = 0;
@@ -194,8 +195,8 @@ static int run_case(const char *label, const char *cmd, const char *expect_out) 
     ob_resolve(&s->ob, "raw", 3);
     char wrapped[8192];
     int wn = snprintf(wrapped, sizeof wrapped,
-        "printf '\\n__BRIDGE_''%s\\n'; { %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
-        s->begin_sentinel + 9, cmd, s->sentinel);
+        "printf '\\n__BRIDGE_''%s\\n'; { %s\n}; __RC=$?; printf '\\n%s:%%d%s\\n' \"$__RC\"\n",
+        s->begin_sentinel + 9, cmd, s->sentinel, g_sentinel_pad);
     assert(wn > 0 && (size_t)wn < sizeof wrapped);
     assert(bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) == 0);
 
@@ -368,6 +369,10 @@ int main(void) {
     // Output that contains the BEGIN prefix must survive (drain is over by then).
     fails += run_case("begin-lookalike", "printf '__BRIDGE_BEGIN_fake__\\n'", "__BRIDGE_BEGIN_fake__\r\n");
     fails += bash_utf8_heredoc_case();
+    // ConPTY pads the repainted sentinel line with spaces: still our line.
+    g_sentinel_pad = "        ";
+    fails += run_case("sentinel-space-pad", "echo hi", "hi\r\n");
+    g_sentinel_pad = "";
     if (fails) fprintf(stderr, "\n%d test(s) failed\n", fails);
     else       fprintf(stderr, "\nall init-drain tests passed\n");
     return fails ? 1 : 0;
