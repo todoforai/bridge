@@ -116,6 +116,8 @@ release-windows-x64: | build
 	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
 	strip build/todoforai-bridge-windows-x64.exe 2>/dev/null || true
 
+# Tests include the bridge headers with `-iquote .`, never `-I.`: that put the
+# bridge's own pty.h ahead of the system <pty.h> and broke forkpty() on Linux.
 # PTY helpers used by the test harnesses (pty_posix.c calls into env_path.c).
 TEST_DEPS = pty_posix.c env_path.c policy.c json.c
 # Full-daemon tests list json.c themselves; policy.c needs it too.
@@ -131,7 +133,7 @@ test-pty-win: | build
 	    -U_WIN32_WINNT -UNTDDI_VERSION -UWINVER \
 	    -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006 -DWINVER=0x0A00 \
 	    -Wno-macro-redefined \
-	    $(CFLAGS) -I. \
+	    $(CFLAGS) -iquote . \
 	    -o build/test-pty-win.exe test/test_pty_win.c pty_win.c env_path.c tools.c json.c policy.c \
 	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
 
@@ -139,31 +141,31 @@ test-pty-win: | build
 # wrapped commands, asserts the bridge's emit/parse logic matches.
 .PHONY: test-run
 test-run: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-run test/test_run.c $(TEST_DEPS) -lutil
+	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-run test/test_run.c $(TEST_DEPS) -lutil
 	./build/test-run
 
 # Tool scan + custom_tools.json overlay: hidden/override/non-catalog probing.
 .PHONY: test-tools
 test-tools: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-tools test/test_tools.c tools.c json.c env_path.c policy.c -lpthread
+	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-tools test/test_tools.c tools.c json.c env_path.c policy.c -lpthread
 	./build/test-tools
 
 # JSON parser: hostile nesting depth is rejected instead of recursed into.
 .PHONY: test-json
 test-json: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-json test/test_json.c json.c
+	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-json test/test_json.c json.c
 	ulimit -s 512; ./build/test-json
 
 # Device policy: prefix/symlink checks + Landlock jail on a real PTY child.
 .PHONY: test-policy
 test-policy: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-policy test/test_policy.c $(TEST_DEPS) -lutil
+	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-policy test/test_policy.c $(TEST_DEPS) -lutil
 	./build/test-policy
 
 # Loopback file streaming (file_server.c): grant, token gate, Range, CORS.
 .PHONY: test-file-server
 test-file-server: | build
-	$(CC) -O0 -g -Wall -Wextra -DIDENTITY_SERVER_PORT=43199 -I. -I$(CORE)/noise -o build/test-file-server test/test_file_server.c \
+	$(CC) -O0 -g -Wall -Wextra -DIDENTITY_SERVER_PORT=43199 -iquote . -I$(CORE)/noise -o build/test-file-server test/test_file_server.c \
 	    identity_server.c file_server.c json.c ws.c policy.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
 	./build/test-file-server
 
@@ -171,7 +173,7 @@ test-file-server: | build
 # reassembly, deadlines, slot cap and teardown reaping.
 .PHONY: test-jobs
 test-jobs: | build
-	$(CC) -O1 -g -Wall -Wextra -I. -o build/test-jobs test/test_jobs.c jobs.c
+	$(CC) -O1 -g -Wall -Wextra -iquote . -o build/test-jobs test/test_jobs.c jobs.c
 	./build/test-jobs
 
 # Native cloud SSH: validation, config render, conflicts, idempotence, and
@@ -179,32 +181,32 @@ test-jobs: | build
 .PHONY: test-keep-awake
 # Keep-awake: idle timer, config.json round-trip, real hold (when available).
 test-keep-awake: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-keep-awake test/test_keep_awake.c keep_awake.c policy.c json.c
+	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-keep-awake test/test_keep_awake.c keep_awake.c policy.c json.c
 	./build/test-keep-awake
 
 .PHONY: test-cloud-ssh
 test-cloud-ssh: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -o build/test-cloud-ssh test/test_cloud_ssh.c cloud_ssh.c json.c
+	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-cloud-ssh test/test_cloud_ssh.c cloud_ssh.c json.c
 	./build/test-cloud-ssh
 
 # Preview relay: local HTTP fetch + chunked response emission, no network.
 .PHONY: test-preview
 test-preview: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -o build/test-preview \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -o build/test-preview \
 	    test/test_preview.c preview.c jobs.c json.c ws.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
 	./build/test-preview
 
 # Bridge-side RUN timing: spawn/warmup/run breakdown per command, no network.
 .PHONY: test-timing
 test-timing: | build
-	$(CC) -O0 -g -Wall -I. -o build/test-timing test/test_timing.c $(TEST_DEPS) -lutil
+	$(CC) -O0 -g -Wall -iquote . -o build/test-timing test/test_timing.c $(TEST_DEPS) -lutil
 	./build/test-timing
 
 # OUTPUT frame coalescing: verbose RUN ships few, byte-exact frames, all before
 # step_done. Includes main.c with the Noise send shimmed (no network).
 .PHONY: test-coalesce
 test-coalesce: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
 	    test/test_coalesce.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
@@ -216,7 +218,7 @@ test-coalesce: | build
 # shimmed (no network).
 .PHONY: test-runenv
 test-runenv: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
 	    test/test_runenv.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
@@ -227,7 +229,7 @@ test-runenv: | build
 # drained up to the ready sentinel and step output must stay byte-exact.
 .PHONY: test-initdrain
 test-initdrain: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-initdrain \
 	    test/test_initdrain.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
@@ -239,7 +241,7 @@ test-initdrain: | build
 # child count stays flat across many one-shots.
 .PHONY: test-oneshot-leak
 test-oneshot-leak: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-oneshot-leak \
 	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
@@ -251,37 +253,36 @@ test-oneshot-leak: | build
 # the matching expectations.
 .PHONY: test-update
 test-update: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/cli -DBRIDGE_VERSION='"v1.5.7"' \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/cli -DBRIDGE_VERSION='"v1.5.7"' \
 	    -o build/test-update test/test_update.c update.c
 	./build/test-update
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/cli -DBRIDGE_VERSION='"v1.5.7-3-gabc1234-dirty"' \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/cli -DBRIDGE_VERSION='"v1.5.7-3-gabc1234-dirty"' \
 	    -o build/test-update-dev test/test_update.c update.c
 	./build/test-update-dev
 
 # A/B proof of the poll-loop fix: PTY fd out of vs in the pollset (50ms → ~1ms).
 .PHONY: test-pollfix
 test-pollfix: | build
-	$(CC) -O0 -g -Wall -I. -o build/test-pollfix test/test_pollfix.c $(TEST_DEPS) -lutil
+	$(CC) -O0 -g -Wall -iquote . -o build/test-pollfix test/test_pollfix.c $(TEST_DEPS) -lutil
 	./build/test-pollfix
 
 # Ctrl+C: `\x03` must raise SIGINT via the line discipline (VINTR), repeatably,
 # without killing the persistent shell.
 .PHONY: test-sigint
 test-sigint: | build
-	$(CC) -O0 -g -Wall -I. -o build/test-sigint test/test_sigint.c $(TEST_DEPS) -lutil
+	$(CC) -O0 -g -Wall -iquote . -o build/test-sigint test/test_sigint.c $(TEST_DEPS) -lutil
 	./build/test-sigint
 
 # Blocked-on-stdin detection: `read` prompts and /dev/tty getpass (sudo's path).
 .PHONY: test-probe
 test-probe: | build
-	$(CC) -O0 -g -Wall -I. -o build/test-probe test/test_probe.c $(TEST_DEPS) -lutil
+	$(CC) -O0 -g -Wall -iquote . -o build/test-probe test/test_probe.c $(TEST_DEPS) -lutil
 	./build/test-probe
 
 # Prompt-shaped output tail: the corroboration that stops a merely-slow command
 # (macOS has no wait channel, so the probe alone cannot tell) from being parked.
 # Trailing `| tail -N` strip on the RUN path: parser cases + live steps on a
-# real PTY (last-N cut, prefix exit code, park shows progress). No `-I.`: it
-# would shadow <pty.h> with the bridge's own pty.h on Linux.
+# real PTY (last-N cut, prefix exit code, park shows progress).
 .PHONY: test-tail-strip
 test-tail-strip: | build
 	$(CC) -O0 -g -Wall -Wextra -Wno-unused-function -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
@@ -292,7 +293,7 @@ test-tail-strip: | build
 
 .PHONY: test-prompt-tail
 test-prompt-tail: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-prompt-tail \
 	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
@@ -302,7 +303,7 @@ test-prompt-tail: | build
 # real prompt must park, and noInput must never park.
 .PHONY: test-park
 test-park: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-park \
 	    test/test_park.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
@@ -335,7 +336,7 @@ analyze-cppcheck: | build
 	@cppcheck --enable=all --inconclusive --std=c11 \
 	    --suppress=missingIncludeSystem --suppress=unusedFunction \
 	    --suppress=checkersReport \
-	    $(ANALYZE_INCLUDES) -I. $(BRIDGE_SRCS) 2> build/analysis/cppcheck.log || true
+	    $(ANALYZE_INCLUDES) -iquote . $(BRIDGE_SRCS) 2> build/analysis/cppcheck.log || true
 	@echo "cppcheck: $$(grep -cE '^[^:]+:[0-9]+:[0-9]+:' build/analysis/cppcheck.log) finding(s) -> build/analysis/cppcheck.log"
 
 analyze-scan-build: | build
@@ -397,7 +398,7 @@ clean:
 # Pre-warmed PTY pool: adopt / cd prefix / refill / reap / teardown.
 .PHONY: test-pool
 test-pool: | build
-	$(CC) -O0 -g -Wall -Wextra -I. -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-pool \
 	    test/test_pool.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
