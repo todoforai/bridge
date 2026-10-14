@@ -428,6 +428,8 @@ typedef struct {
 static int output_tail_is_prompt(const session_t *s) {
     size_t n = s->otail_len;
     if (n == 0) return 0;
+    // A line ending held back in tail_buf (sentinel_holdback_sep) still ends the line.
+    if (s->tail_len > 0 && (s->tail_buf[0] == '\n' || s->tail_buf[0] == '\r')) return 0;
 
     // Trailing spaces are part of the prompt ("Password: "), not a terminator.
     while (n > 0 && (s->otail[n - 1] == ' ' || s->otail[n - 1] == '\t')) n--;
@@ -712,7 +714,22 @@ static size_t gen_begin_sentinel(char *out, size_t cap) {
 // Spawn-time best-effort echo/prompt suppression. Works on shells that echo
 // themselves (Git Bash, POSIX ptys); a no-op on busybox-w32/ConPTY where
 // conhost echoes. Either way the per-step begin drain removes the leftovers.
+//
+// POSIX bash only (`[ -n "$BASH_VERSION" ]`): `set +o emacs +o vi +H` turns
+// readline and history expansion off. Our input is a program, not keystrokes:
+// with readline on and a non-UTF-8 locale (convert-meta), every UTF-8 byte
+// ≥0x80 became a Meta key — `ö` = C3 B6 = M-C M-6 → digit-argument 6, so the
+// next letter was inserted 6× ("kzzzzzzssssss"), and history-motion metas
+// pulled THIS init line back into a heredoc. `!` in a heredoc/string was
+// eaten by history expansion. Seen on macOS /bin/sh (bash 3.2); reproduces
+// on any bash with LC_ALL=C. Windows keeps readline: the wrapper is sourced
+// from a file there (stage_wrapper_file), and Git Bash relies on it to echo.
 static size_t build_init_line(char *out, size_t cap) {
+#ifdef _WIN32
+#  define NO_LINE_EDIT ""
+#else
+#  define NO_LINE_EDIT "[ -n \"$BASH_VERSION\" ] && set +o emacs +o vi +H; "
+#endif
     // The pager vars are also set at spawn (pty_posix.c/pty_win.c), but rc
     // files run after that and may override them — so they are re-set here,
     // once per shell, instead of in every RUN wrapper. Same effect, and on
@@ -720,9 +737,10 @@ static size_t build_init_line(char *out, size_t cap) {
     // so those 79 bytes cost ~31 ms of every step (measured). A pooled shell
     // pays even this at pre-warm, before the RUN arrives.
     int n = snprintf(out, cap,
-        "stty -echo 2>/dev/null; PS1=; PS2=; "
+        "stty -echo 2>/dev/null; " NO_LINE_EDIT "PS1=; PS2=; "
         "export PAGER=cat GH_PAGER=cat GIT_PAGER=cat MANPAGER=cat SYSTEMD_PAGER=cat AWS_PAGER= "
         "AGENT_BROWSER_IDLE_TIMEOUT_MS=${AGENT_BROWSER_IDLE_TIMEOUT_MS:-1800000}\n");
+#undef NO_LINE_EDIT
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
@@ -1354,6 +1372,21 @@ static size_t sentinel_holdback(const session_t *s) {
     return 0;
 }
 
+// Streaming variant: also hold the "\n"/"\r\n" separator just before that
+// prefix (or at the very end). bash's printf writes the wrapper's leading '\n'
+// and the sentinel line as two write()s, so a read can end right after the
+// separator; emitting it then left a stray trailing "\r\n" in the step output
+// that the success path can no longer trim. (park_step flushes it: there it
+// is real output.)
+static size_t sentinel_holdback_sep(const session_t *s) {
+    size_t k = sentinel_holdback(s);
+    const uint8_t *end = s->tail_buf + s->tail_len - k;
+    size_t avail = s->tail_len - k;
+    if (avail >= 1 && end[-1] == '\n') k += (avail >= 2 && end[-2] == '\r') ? 2 : 1;
+    else if (k == 0 && avail >= 1 && end[-1] == '\r') k = 1;  // "\r" of a split "\r\n"
+    return k;
+}
+
 // Append `data[len]` into the tail buffer. By construction (see TAIL_CAP),
 // the buffer always has room for one full PTY read plus the held-back tail.
 static void tail_append(session_t *s, const uint8_t *data, size_t len) {
@@ -1933,7 +1966,7 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         // Hold back only a trailing sentinel prefix — it could complete in
         // the next read. Everything else goes out now (a prompt with no
         // newline would otherwise sit here until the step ends).
-        size_t keep = sentinel_holdback(s);
+        size_t keep = sentinel_holdback_sep(s);
         size_t emit = s->tail_len - keep;
         if (emit > 0) {
             ob_append(e, s, s->tail_buf, emit);

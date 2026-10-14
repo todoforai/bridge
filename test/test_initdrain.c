@@ -158,6 +158,9 @@ static int scanner_cases(void) {
 
 // One case: spawn echo-ON shell, send init line + wrapped cmd back-to-back
 // (exactly like the RUN handler), drive to step_done, check captured output.
+static const char *g_shell = "/bin/sh";
+static int g_no_echo;   // 0 = ConPTY-like echo (default); 1 = real POSIX RUN
+
 static int run_case(const char *label, const char *cmd, const char *expect_out) {
     g_out_len = 0; g_step_done = 0;
 
@@ -169,7 +172,7 @@ static int run_case(const char *label, const char *cmd, const char *expect_out) 
 
     session_t *s = &e->sessions[0];
     // no_echo=0 ⇒ the PTY echoes every input line, like ConPTY does.
-    assert(bridge_pty_spawn(&s->pty, "/bin/sh", NULL, /*no_echo=*/0) == 0);
+    assert(bridge_pty_spawn(&s->pty, g_shell, NULL, g_no_echo) == 0);
     s->active = 1;
     snprintf(s->session_id, sizeof s->session_id, "00000000-0000-4000-8000-000000000000");
 
@@ -189,7 +192,7 @@ static int run_case(const char *label, const char *cmd, const char *expect_out) 
     s->tail_len = 0;
     s->one_shot = 0;
     ob_resolve(&s->ob, "raw", 3);
-    char wrapped[4096];
+    char wrapped[8192];
     int wn = snprintf(wrapped, sizeof wrapped,
         "printf '\\n__BRIDGE_''%s\\n'; { %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
         s->begin_sentinel + 9, cmd, s->sentinel);
@@ -323,6 +326,36 @@ static int redact_cases(void) {
     return fails;
 }
 
+// macOS /bin/sh is bash 3.2 and a launchd/ssh bridge often has a non-UTF-8
+// locale: readline (convert-meta) turned UTF-8 bytes into Meta keys —
+// "közös" arrived as "kzzzzzzssssss", and history keys pulled the init line
+// into the heredoc. `!` was eaten by history expansion. Same with any bash
+// under LC_ALL=C. The init line must turn line editing off. >1 kB body:
+// MAX_CANON on macOS.
+static int bash_utf8_heredoc_case(void) {
+    if (access("/bin/bash", X_OK) != 0) { fprintf(stderr, "[bash-utf8-heredoc] SKIP: no /bin/bash\n"); return 0; }
+    static const char line[] = "Tranzakció: Közös számla feltölteni, ü vége, 2 350 Ft! nézd \"a!b\"";
+    char cmd[4096], want[4096];
+    size_t cn = (size_t)snprintf(cmd, sizeof cmd, "cat <<'EOF'\n"), wn = 0;
+    for (int i = 0; i < 20; i++) {
+        cn += (size_t)snprintf(cmd + cn, sizeof cmd - cn, "%s\n", line);
+        wn += (size_t)snprintf(want + wn, sizeof want - wn, "%s\r\n", line);
+    }
+    // `!` outside the heredoc: history expansion bites on every bash version.
+    snprintf(cmd + cn, sizeof cmd - cn, "EOF\necho \"a!b\"");
+    snprintf(want + wn, sizeof want - wn, "a!b\r\n");
+    const char *old = getenv("LC_ALL");
+    char *saved = old ? strdup(old) : NULL;
+    setenv("LC_ALL", "C", 1);
+    setenv("INPUTRC", "/dev/null", 1);   // no /etc/inputrc on macOS; distro ones mask the bug
+    g_shell = "/bin/bash"; g_no_echo = 1;
+    int f = run_case("bash-utf8-heredoc", cmd, want);
+    g_shell = "/bin/sh";   g_no_echo = 0;
+    if (saved) { setenv("LC_ALL", saved, 1); free(saved); } else unsetenv("LC_ALL");
+    unsetenv("INPUTRC");
+    return f;
+}
+
 int main(void) {
     g_max_sessions = 4;
     int fails = 0;
@@ -334,6 +367,7 @@ int main(void) {
     fails += run_case("echo-on-empty",  "true",           "");
     // Output that contains the BEGIN prefix must survive (drain is over by then).
     fails += run_case("begin-lookalike", "printf '__BRIDGE_BEGIN_fake__\\n'", "__BRIDGE_BEGIN_fake__\r\n");
+    fails += bash_utf8_heredoc_case();
     if (fails) fprintf(stderr, "\n%d test(s) failed\n", fails);
     else       fprintf(stderr, "\nall init-drain tests passed\n");
     return fails ? 1 : 0;
