@@ -151,12 +151,13 @@ locations and reading `SKILL.md` files. Both `.agents/skills` and
 |--------|----------------------------------------------------------------|-------------------------------|
 | `repo` | `<workspace-root>/{.agents,.claude}/skills/**`                  | one per workspace root        |
 | `user` | `$HOME/{.agents,.claude}/skills/**`                             | resolved on the bridge device |
-| builtin | `${XDG_CACHE_HOME:-~/.cache}/todoforai/builtin-skills/<hash>/**` | shipped in `agent/builtin-skills/`, installed by the agent on first discovery |
 
 Discovery rules (`agent/src/agents/skills_info.jl`):
 
-- Priority order: repo `.agents` → repo `.claude` → user → builtin; skills are deduped by
-  `name`, first match wins.
+- Priority order: repo `.agents` → repo `.claude` → user; skills are deduped by
+  `name`, first match wins. Built-in skills (`agent/builtin-skills/`) are served by the
+  agent itself as `todoforai:skills/<name>/SKILL.md`; nothing is installed on the device,
+  and a device skill with the same name wins.
 - Walk depth: `find -maxdepth 6`; hidden entries (`.*`) are pruned.
 - Only files literally named `SKILL.md` are accepted.
 - Only the first 8 KiB of each file is read for metadata.
