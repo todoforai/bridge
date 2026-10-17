@@ -143,18 +143,19 @@ No new protocol messages, no in-binary HTTP client, no extra dependencies.
 
 ## Skills (`SKILL.md`)
 
-The TODOforAI agent discovers local skills on a bridge the same way it does on
-an edge — by walking well-known locations and reading `SKILL.md` files. Both
-`.agents/skills` and `.claude/skills` are scanned, per scope:
+The TODOforAI agent discovers skills on a bridge by walking well-known
+locations and reading `SKILL.md` files. Both `.agents/skills` and
+`.claude/skills` are scanned, per scope:
 
 | Scope  | Path                                                            | Source                        |
 |--------|----------------------------------------------------------------|-------------------------------|
 | `repo` | `<workspace-root>/{.agents,.claude}/skills/**`                  | one per workspace root        |
 | `user` | `$HOME/{.agents,.claude}/skills/**`                             | resolved on the bridge device |
+| builtin | `${XDG_CACHE_HOME:-~/.cache}/todoforai/builtin-skills/<hash>/**` | shipped in `agent/builtin-skills/`, installed by the agent on first discovery |
 
-Discovery rules (mirror `edge/bun/src/skills.ts`):
+Discovery rules (`agent/src/agents/skills_info.jl`):
 
-- Priority order: repo `.agents` → repo `.claude` → user; skills are deduped by
+- Priority order: repo `.agents` → repo `.claude` → user → builtin; skills are deduped by
   `name`, first match wins.
 - Walk depth: `find -maxdepth 6`; hidden entries (`.*`) are pruned.
 - Only files literally named `SKILL.md` are accepted.
@@ -166,8 +167,9 @@ Discovery rules (mirror `edge/bun/src/skills.ts`):
 
 On a bridge there's no `get_skills` RPC: the agent runs `find` + `head` over
 the same `machine_exec` channel used for shell tools, base64-encoding paths and
-file heads so the wire stays ASCII-clean. The full body is fetched on demand via
-the `Skill` tool, which reads the file via `base64 < <path>` like `ReadTool`.
+file heads so the wire stays ASCII-clean. Skills are listed in the system
+prompt (name, description, path); the model opens a SKILL.md with the normal
+`read` tool.
 
 Required tools on the bridge: `sh`, `find`, `head`, `base64`. Standard on
 GNU/BSD/macOS userspace; no extra installation needed.
