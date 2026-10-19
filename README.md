@@ -285,3 +285,7 @@ Limitations (v1):
   for all hosts) make it not ready instead of being overridden.
 - `~/.ssh` is taken from the passwd entry (as ssh does), not `$HOME`.
 - Removal is manual: delete the `Include` line and `~/.ssh/tfa_cloud*`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
