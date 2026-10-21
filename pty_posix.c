@@ -45,6 +45,16 @@ static void spawn_env_init(void) {
     if (g_env_ready) return;
     g_env_ready = 1;
     g_tools_path = bridge_build_tools_path();   // NULL ok: keep inherited PATH
+    // Command shims (agent-browser guard) go first so they shadow the real
+    // binaries for agent shells; the tool scan keeps the plain PATH.
+    char *shims = bridge_ensure_shims();
+    const char *base = g_tools_path ? g_tools_path : getenv("PATH");
+    if (shims && base) {
+        size_t n = strlen(shims) + strlen(base) + 2;
+        char *p = malloc(n);
+        if (p) { snprintf(p, n, "%s:%s", shims, base); free((char *)g_tools_path); g_tools_path = p; }
+    }
+    free(shims);
     g_askpass = bridge_ensure_askpass();        // NULL ok: no askpass routing
 }
 

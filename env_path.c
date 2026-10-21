@@ -231,49 +231,55 @@ static const char ASKPASS_SRC[] =
     "printf '\\n' >/dev/tty\n"
     "printf '%s\\n' \"$pw\"\n";
 
-// True iff `path` is already our script: a regular file we own, mode 0700,
-// exact content. Opened O_NOFOLLOW so a planted symlink never counts.
-static int askpass_is_current(const char *path) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Woverlength-strings"
+#include "agent_browser_guard.h"
+#pragma GCC diagnostic pop
+
+// True iff `path` is already exactly `src`: a regular file we own, mode 0700.
+// Opened O_NOFOLLOW so a planted symlink never counts.
+static int script_is_current(const char *path, const char *src, size_t len) {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return 0;
     struct stat st;
     int ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid()
-          && (st.st_mode & 07777) == 0700 && st.st_size == (off_t)(sizeof ASKPASS_SRC - 1);
-    char cur[sizeof ASKPASS_SRC];
-    if (ok) {
-        size_t n = 0;
-        while (n < sizeof ASKPASS_SRC - 1) {
-            ssize_t r = read(fd, cur + n, sizeof ASKPASS_SRC - 1 - n);
-            if (r <= 0) break;
-            n += (size_t)r;
-        }
-        ok = n == sizeof ASKPASS_SRC - 1 && memcmp(cur, ASKPASS_SRC, n) == 0;
+          && (st.st_mode & 07777) == 0700 && st.st_size == (off_t)len;
+    for (size_t off = 0; ok && off < len; ) {
+        char cur[4096];
+        size_t want = len - off < sizeof cur ? len - off : sizeof cur;
+        ssize_t r = read(fd, cur, want);
+        ok = r > 0 && memcmp(cur, src + off, (size_t)r) == 0;
+        if (ok) off += (size_t)r;
     }
     close(fd);
     return ok;
 }
 
-char *bridge_ensure_askpass(void) {
+// Write `src` to ~/.todoforai/<rel>/<name> (0700, idempotent); returns its
+// path or NULL. Caller frees.
+static char *ensure_script(const char *rel, const char *name, const char *src, size_t len) {
     const char *home = getenv("HOME");
     if (!home || !*home) return NULL;
-    char dir[1024], path[1100], tmp[1120];
-    if (snprintf(dir, sizeof dir, "%s/.todoforai/bin", home) >= (int)sizeof dir) return NULL;
-    snprintf(path, sizeof path, "%s/askpass", dir);
-    if (askpass_is_current(path)) return strdup(path);
+    char dir[1024], path[1200], tmp[1240];
+    if (snprintf(dir, sizeof dir, "%s/.todoforai/%s", home, rel) >= (int)sizeof dir) return NULL;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (script_is_current(path, src, len)) return strdup(path);
 
-    char parent[1024];
-    snprintf(parent, sizeof parent, "%s/.todoforai", home);
-    mkdir(parent, 0700);
-    mkdir(dir, 0700);
+    // mkdir -p, 0700 (every level is ours; existing ones are left alone).
+    for (char *p = dir + strlen(home) + 1; ; p++) {
+        if (*p != '/' && *p != '\0') continue;
+        char c = *p; *p = '\0'; mkdir(dir, 0700); *p = c;
+        if (!c) break;
+    }
     // Write to a fresh temp (O_EXCL, never follows anything) then rename
     // over the destination: readers see either the old or the new script,
     // and a symlink planted at `path` is replaced, not written through.
-    snprintf(tmp, sizeof tmp, "%s/.askpass.%ld", dir, (long)getpid());
+    snprintf(tmp, sizeof tmp, "%s/.%s.%ld", dir, name, (long)getpid());
     int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0700);
     if (fd < 0) return NULL;
-    size_t len = sizeof ASKPASS_SRC - 1, off = 0;
+    size_t off = 0;
     while (off < len) {
-        ssize_t w = write(fd, ASKPASS_SRC + off, len - off);
+        ssize_t w = write(fd, src + off, len - off);
         if (w <= 0) break;
         off += (size_t)w;
     }
@@ -282,6 +288,17 @@ char *bridge_ensure_askpass(void) {
     close(fd);
     if (!ok || rename(tmp, path) != 0) { unlink(tmp); return NULL; }
     return strdup(path);
+}
+
+char *bridge_ensure_askpass(void) {
+    return ensure_script("bin", "askpass", ASKPASS_SRC, sizeof ASKPASS_SRC - 1);
+}
+
+char *bridge_ensure_shims(void) {
+    char *p = ensure_script("bin/shims", "agent-browser", AGENT_BROWSER_GUARD_SRC, sizeof AGENT_BROWSER_GUARD_SRC - 1);
+    if (!p) return NULL;
+    *strrchr(p, '/') = '\0';
+    return p;
 }
 
 #endif

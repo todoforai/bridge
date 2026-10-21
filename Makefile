@@ -37,7 +37,7 @@ COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_serv
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = noise_ws.h pty.h pty_win.c identity.h identity_server.h adb_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
+HDRS = agent_browser_guard.h noise_ws.h pty.h pty_win.c identity.h identity_server.h adb_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -64,10 +64,23 @@ build/todoforai-bridge: $(SRCS) $(HDRS) build/.version-stamp | build
 build:
 	mkdir -p build
 
+# The agent-browser guard is shipped inside the binary (written to
+# ~/.todoforai/bin/shims at startup). The header is generated but committed,
+# so release builds need no extra tooling; edit the .sh, then `make`.
+agent_browser_guard.h: agent-browser-guard.sh
+	{ echo '// Generated from agent-browser-guard.sh by make. Do not edit.'; \
+	  echo 'static const char AGENT_BROWSER_GUARD_SRC[] ='; \
+	  sed 's/\\/\\\\/g; s/"/\\"/g; s/^/    "/; s/$$/\\n"/' $<; echo ';'; } > $@
+
+# Guard behaviour against a real Chrome: pin, fail-closed on loss, no local fallback.
+.PHONY: test-agent-browser-guard
+test-agent-browser-guard:
+	sh test/test_agent_browser_guard.sh
+
 # Static musl build via zig cc (drop-anywhere binary, no deps).
 # Requires `zig` in PATH.
 .PHONY: static
-static: | build
+static: agent_browser_guard.h | build
 	zig cc -target x86_64-linux-musl -static $(CFLAGS) $(HARDEN_LD) -o build/todoforai-bridge-static \
 	    $(SRCS) -lutil
 	strip build/todoforai-bridge-static 2>/dev/null || true
@@ -78,11 +91,11 @@ static: | build
 
 .PHONY: release-linux-x64 release-linux-arm64 release-darwin-x64 release-darwin-arm64 release-windows-x64
 
-release-linux-x64: | build
+release-linux-x64: agent_browser_guard.h | build
 	zig cc -target x86_64-linux-musl -static $(CFLAGS) $(HARDEN_LD) -o build/todoforai-bridge-linux-x64 $(SRCS) -lutil
 	strip build/todoforai-bridge-linux-x64 2>/dev/null || true
 
-release-linux-arm64: | build
+release-linux-arm64: agent_browser_guard.h | build
 	zig cc -target aarch64-linux-musl -static $(CFLAGS) $(HARDEN_LD) -o build/todoforai-bridge-linux-arm64 $(SRCS) -lutil
 	strip build/todoforai-bridge-linux-arm64 2>/dev/null || true
 
@@ -93,12 +106,12 @@ release-linux-arm64: | build
 # exec a binary whose signature is broken — so re-apply an ad-hoc signature
 # after stripping. CI replaces this with a real Developer ID signature (which
 # must likewise be applied after strip) before notarizing.
-release-darwin-x64: | build
+release-darwin-x64: agent_browser_guard.h | build
 	clang -target x86_64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/todoforai-bridge-darwin-x64 $(SRCS)
 	strip build/todoforai-bridge-darwin-x64 2>/dev/null || true
 	codesign --force --sign - build/todoforai-bridge-darwin-x64 2>/dev/null || true
 
-release-darwin-arm64: | build
+release-darwin-arm64: agent_browser_guard.h | build
 	clang -target arm64-apple-macos11 -D_DARWIN_C_SOURCE $(CFLAGS) -o build/todoforai-bridge-darwin-arm64 $(SRCS)
 	strip build/todoforai-bridge-darwin-arm64 2>/dev/null || true
 	codesign --force --sign - build/todoforai-bridge-darwin-arm64 2>/dev/null || true
@@ -106,7 +119,7 @@ release-darwin-arm64: | build
 # Windows: ConPTY backend (pty_win.c) + winsock (ws.c uses WSAPoll). zig cc
 # bundles a recent mingw-w64.
 # _WIN32_WINNT=0x0A00 unlocks CreatePseudoConsole (Win10 1809+).
-release-windows-x64: | build
+release-windows-x64: agent_browser_guard.h | build
 	zig cc -target x86_64-windows-gnu \
 	    -U_WIN32_WINNT -UNTDDI_VERSION -UWINVER \
 	    -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006 -DWINVER=0x0A00 \
