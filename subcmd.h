@@ -8,6 +8,9 @@ extern const char *USAGE_MAIN;
 enum { CMD_RC_HELP = 2 };
 
 int  cmd_login(int argc, char **argv);
+// Pick the credential profile: explicit --profile wins, else a local --host
+// means "dev" (mirrors the daemon), else the default. Returns <0 if invalid.
+int  bridge_select_profile(const char *profile, const char *host);
 // NULL args fall through to env / saved-creds / defaults.
 int  bridge_login_run(const char *device_name, const char *token,
                       const char *host, const char *port_s);

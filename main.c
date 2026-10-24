@@ -4132,8 +4132,7 @@ int bridge_main(int argc, char **argv) {
     // default to the "dev" profile instead of "default": dev creds are minted
     // against the local backend (own device id/secret + TOFU'd pubkey), so the
     // prod-pinned default profile would otherwise fail the Noise handshake.
-    if (!profile && login_is_local_host(host)) profile = "dev";
-    if (profile && login_set_profile(profile) < 0) return 2;
+    if (bridge_select_profile(profile, host) < 0) return 2;
 
     // Load saved device credentials from `bridge login`
     login_credentials_t saved_creds;
@@ -4412,10 +4411,14 @@ int bridge_main(int argc, char **argv) {
             }
             if (!relogin_hint_shown) {
                 relogin_hint_shown = 1;
+                // Name the active profile: a bare `logout` would clear the
+                // prod default even when this daemon runs on "dev".
+                const char *pf = login_get_profile();
                 fprintf(stderr,
                     "Device credentials rejected by server — keeping local credentials and retrying.\n"
-                    "If this persists, run `todoforai-bridge logout && todoforai-bridge login` in another\n"
-                    "terminal; this daemon will pick up the new credentials automatically.\n");
+                    "If this persists, run `todoforai-bridge logout --profile %s && todoforai-bridge login%s%s`\n"
+                    "in another terminal; this daemon will pick up the new credentials automatically.\n",
+                    pf, login_is_local_host(host) ? " --host " : "", login_is_local_host(host) ? host : "");
             }
         }
 

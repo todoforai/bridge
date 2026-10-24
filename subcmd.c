@@ -21,6 +21,11 @@
 // --host / --port / --ttl are dev flags, parsed but omitted from help.
 const char *USAGE_MAIN = "";
 
+int bridge_select_profile(const char *profile, const char *host) {
+    if (!profile && login_is_local_host(host)) profile = "dev";
+    return profile ? login_set_profile(profile) : 0;
+}
+
 static void resolve_backend_addr(const char *host, const char *port_s,
                                  char *addr_buf, size_t addr_cap) {
     // Precedence: --host flag → saved profile creds → env → prod default.
@@ -213,8 +218,7 @@ int cmd_login(int argc, char **argv) {
     }
     // Mirror the daemon: a local --host with no explicit --profile logs into
     // the "dev" profile so dev creds land in the same place the daemon reads.
-    if (!profile && login_is_local_host(host)) profile = "dev";
-    if (profile && login_set_profile(profile) < 0) return 2;
+    if (bridge_select_profile(profile, host) < 0) return 2;
     return bridge_login_run(device_name, token, host, port_s);
 }
 
@@ -295,20 +299,22 @@ int cmd_enroll(int argc, char **argv) {
 
 int cmd_whoami(int argc, char **argv) {
     static const char *USAGE = "whoami";
-    const char *profile = NULL;
+    const char *profile = NULL, *host = NULL;
     ko_longopt_t longopts[] = {
         { "help",    ko_no_argument,       'h' },
         { "profile", ko_required_argument, 'P' },
+        { "host",    ko_required_argument, 'H' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hP:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hP:H:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
         else if (c == 'P') profile = opt.arg;
+        else if (c == 'H') host = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
-    if (profile && login_set_profile(profile) < 0) return 2;
+    if (bridge_select_profile(profile, host) < 0) return 2;
     return login_print_whoami("todoforai-bridge");
 }
 
@@ -316,20 +322,24 @@ int cmd_whoami(int argc, char **argv) {
 
 int cmd_logout(int argc, char **argv) {
     static const char *USAGE = "logout";
-    const char *profile = NULL;
+    const char *profile = NULL, *host = NULL;
     ko_longopt_t longopts[] = {
         { "help",    ko_no_argument,       'h' },
         { "profile", ko_required_argument, 'P' },
+        { "host",    ko_required_argument, 'H' },
         { 0, 0, 0 }
     };
     ketopt_t opt = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&opt, argc, argv, 1, "hP:", longopts)) >= 0) {
+    while ((c = ketopt(&opt, argc, argv, 1, "hP:H:", longopts)) >= 0) {
         if      (c == 'h') { cli_usage(stdout, "todoforai-bridge", USAGE); return 0; }
         else if (c == 'P') profile = opt.arg;
+        else if (c == 'H') host = opt.arg;
         else cli_parse_error("todoforai-bridge", USAGE, argc, argv, &opt, c);
     }
-    if (profile && login_set_profile(profile) < 0) return 2;
+    // Same profile resolution as login/daemon, so `logout --host localhost`
+    // clears the dev profile instead of the prod default.
+    if (bridge_select_profile(profile, host) < 0) return 2;
     return login_logout("todoforai-bridge");
 }
 
