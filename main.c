@@ -4005,6 +4005,11 @@ int bridge_main(int argc, char **argv) {
 #else
     if (argc >= 2 && strcmp(argv[1], "__adb") == 0) return cmd_adb(argc - 1, argv + 1);
     if (argc >= 2 && strcmp(argv[1], "__live") == 0) return cmd_live(argc - 1, argv + 1);
+    {   // Invoked through the tfa-cat symlink (busybox-style).
+        const char *a0 = argc ? strrchr(argv[0], '/') : NULL;
+        a0 = a0 ? a0 + 1 : (argc ? argv[0] : "");
+        if (strcmp(a0, "tfa-cat") == 0) return cmd_cat(argc, argv);
+    }
 #endif
     // Resolve our own path while argv0 and the cwd are still trustworthy.
     bridge_jobs_init_self(argv[0]);
@@ -4234,6 +4239,9 @@ int bridge_main(int argc, char **argv) {
     // rather than "id truncated". Full id is in ~/.config/todoforai/credentials.json.
     fprintf(stderr, "Connecting to %s:%u (device: %.8s…, bridge %s) ...\n",
             host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
+#ifndef _WIN32
+    bridge_link_tfa_cat(bridge_jobs_self_path());   // on PATH for every RUN
+#endif
     bridge_policy_load();
     if (g_policy.active && g_policy.broken)
         fprintf(stderr, "policy: %s is UNUSABLE (%s) — denying all paths and shells until fixed\n",

@@ -689,4 +689,229 @@ int cmd_live(int argc, char **argv) {
     }
     return out_ok ? 0 : 141;  // 128+SIGPIPE, what cat reports under pipefail
 }
+
+// ── `tfa-cat` — cat, except media printed to the agent's terminal reaches the model ──
+// The bridge symlinks ~/.todoforai/tools/bin/tfa-cat to itself (on PATH in every
+// RUN) and dispatches on argv[0]. stdout = the RUN's PTY and TODOFORAI_BLOCK_ID set
+// → images/PDFs (sniffed by magic bytes) are uploaded via curl to /resources/show
+// with that blockId; the backend hands them to the agent with this bash call's
+// result. Text, and any redirected/piped stdout, is plain cat.
+#include <sys/stat.h>
+
+#define CAT_MAX_BYTES (20L * 1024 * 1024)   // backend per-command cap
+
+static const char *cat_sniff(const unsigned char *b, size_t n, const char **ext) {
+    if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) { *ext = "png"; return "image/png"; }
+    if (n >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) { *ext = "jpg"; return "image/jpeg"; }
+    if (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6))) { *ext = "gif"; return "image/gif"; }
+    if (n >= 12 && !memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4)) { *ext = "webp"; return "image/webp"; }
+    if (n >= 5 && !memcmp(b, "%PDF-", 5)) { *ext = "pdf"; return "application/pdf"; }
+    return NULL;
+}
+
+// Could b[0..n) still grow into a supported magic? (Stop sniffing as soon as not,
+// so a short line on an open pipe prints at once, like cat.)
+static int cat_may_match(const unsigned char *b, size_t n) {
+    static const char *const pre[] = { "\x89PNG\r\n\x1a\n", "\xff\xd8\xff", "GIF8", "RIFF", "%PDF-" };
+    for (size_t i = 0; i < sizeof pre / sizeof *pre; i++) {
+        size_t m = strlen(pre[i]);
+        if (!memcmp(b, pre[i], n < m ? n : m) && (n < m || i == 2 || i == 3)) return 1;
+    }
+    return 0;
+}
+
+// Read up to 16 bytes, but only while a magic is still possible.
+static ssize_t cat_head(int fd, unsigned char *p, size_t cap) {
+    size_t got = 0;
+    while (got < cap) {
+        ssize_t r = read(fd, p + got, cap - got);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) break;
+        got += (size_t)r;
+        if (!cat_may_match(p, got)) break;
+        const char *ext; if (cat_sniff(p, got, &ext) && got >= 12) break;
+    }
+    return (ssize_t)got;
+}
+
+// Rest of `fd` after `head` → out. 0 ok, -1 read error, -2 write error.
+static int cat_copy(int fd, int out, const unsigned char *head, size_t hn) {
+    if (hn && write_all(out, (const char *)head, hn) < 0) return -2;
+    char buf[64 * 1024];
+    for (;;) {
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return 0;
+        if (write_all(out, buf, (size_t)r) < 0) return -2;
+    }
+}
+
+// Upload head + rest of fd as one multipart file. Returns NULL on success,
+// else a static/err message (printed as "not attached: …").
+static const char *cat_upload(int fd, const unsigned char *head, size_t hn,
+                              const char *name, const char *mime, char *err, size_t errcap) {
+    const char *tok = getenv("TODOFORAI_API_TOKEN"), *api = getenv("TODOFORAI_API_URL");
+    const char *todo = getenv("TODOFORAI_TODO_ID"), *blk = getenv("TODOFORAI_BLOCK_ID");
+    if (!tok || !*tok || !api || !*api || !todo || !*todo)
+        return "no TODOFORAI_API_TOKEN/API_URL/TODO_ID in this shell";
+    char url[1024], hdr[256], f_todo[160], f_blk[160], f_mime[64], f_file[512];
+    size_t al = strlen(api); while (al && api[al - 1] == '/') al--;
+    snprintf(url, sizeof url, "%.*s%s/resources/show", (int)al, api,
+             strncmp(tok, "dst_", 4) == 0 ? "/dst/v1" : "/api/v1");
+    snprintf(hdr, sizeof hdr, "x-api-key: %s\n", tok);
+    snprintf(f_todo, sizeof f_todo, "todoId=%s", todo);
+    snprintf(f_blk, sizeof f_blk, "blockId=%s", blk);
+    snprintf(f_mime, sizeof f_mime, "mime=%s", mime);
+    snprintf(f_file, sizeof f_file, "file=@-;type=%s;filename=\"%s\"", mime, name);
+
+    int in[2], out[2], hp[2];
+    if (pipe(in) || pipe(out) || pipe(hp)) return "pipe failed";
+    pid_t c = fork();
+    if (c < 0) return "fork failed";
+    if (c == 0) {
+        // Same fd dance as live_post: header on fd 3 (token never in `ps`).
+        if (hp[0] == 0 || hp[0] == 1) { int t = dup(hp[0]); close(hp[0]); hp[0] = t; }
+        if (out[1] == 0) { int t = dup(out[1]); close(out[1]); out[1] = t; }
+        dup2(in[0], 0); dup2(out[1], 1); dup2(out[1], 2); dup2(hp[0], 3);
+        int fds[6] = { in[0], in[1], out[0], out[1], hp[0], hp[1] };
+        for (int i = 0; i < 6; i++) if (fds[i] > 3) close(fds[i]);
+        execlp("curl", "curl", "-sS", "-m", "60", "-H", "@/dev/fd/3", "-w", "\n%{http_code}",
+               "-F", f_todo, "-F", f_blk, "-F", f_mime, "-F", f_file, url, (char *)NULL);
+        static const char nf[] = "curl not found\n000";
+        (void)!write(1, nf, sizeof nf - 1);
+        _exit(127);
+    }
+    signal(SIGPIPE, SIG_IGN);   // before any write: curl may already be gone
+    close(in[0]); close(out[1]); close(hp[0]);
+    write_all(hp[1], hdr, strlen(hdr)); close(hp[1]);
+    // curl -F @- slurps stdin before sending, so feed it all, then read the reply.
+    const char *fail = NULL;
+    long total = (long)hn;
+    char buf[64 * 1024];
+    if (hn && write_all(in[1], (const char *)head, hn) < 0) fail = "curl failed";
+    while (!fail) {
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r < 0) { if (errno == EINTR) continue; fail = "read error"; break; }
+        if (r == 0) break;
+        if ((total += r) > CAT_MAX_BYTES) {
+            snprintf(err, errcap, "over %ld bytes — compress/downscale it first", CAT_MAX_BYTES);
+            fail = err; break;
+        }
+        if (write_all(in[1], buf, (size_t)r) < 0) fail = "curl failed";
+    }
+    if (fail) kill(c, SIGTERM);
+    close(in[1]);
+    // Drain everything (curl must never block on us); keep the tail, where the
+    // -w status line and a JSON error body sit.
+    char resp[8192]; size_t rn = 0;
+    for (;;) {
+        if (rn == sizeof resp - 1) { memmove(resp, resp + rn / 2, rn - rn / 2); rn -= rn / 2; }
+        ssize_t r = read(out[0], resp + rn, sizeof resp - 1 - rn);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        rn += (size_t)r;
+    }
+    resp[rn] = '\0';
+    close(out[0]);
+    int st = 0;
+    while (waitpid(c, &st, 0) < 0 && errno == EINTR) {}
+    if (fail) return fail;
+    // Last line is the HTTP code (-w); everything before is the body / curl's error.
+    char *nl = strrchr(resp, '\n');
+    int code = nl ? atoi(nl + 1) : 0;
+    if (nl) *nl = '\0';
+    for (size_t l = strlen(resp); l && (resp[l - 1] == '\n' || resp[l - 1] == '\r'); ) resp[--l] = '\0';
+    if (code >= 200 && code < 300 && WIFEXITED(st) && WEXITSTATUS(st) == 0) return NULL;
+    size_t ml = 0;
+    if (code && json_get_str_decoded(resp, strlen(resp), "error", err, errcap, &ml)) return err;
+    snprintf(err, errcap, "%.200s%s(http %d)", resp, *resp ? " " : "", code);
+    return err;
+}
+
+// One input. 0 ok, 1 error (already reported).
+static int cat_one(const char *arg, int attach, int *stdin_seq) {
+    int is_stdin = strcmp(arg, "-") == 0;
+    int fd = is_stdin ? 0 : open(arg, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); return 1; }
+    unsigned char head[16];
+    // Redirected/piped stdout: plain cat, no sniffing (and no waiting for 16 bytes).
+    int tty = isatty(1);
+    ssize_t hn = tty ? cat_head(fd, head, sizeof head) : 0;
+    int rc = 0;
+    const char *ext = NULL, *mime = hn > 0 ? cat_sniff(head, (size_t)hn, &ext) : NULL;
+    if (hn < 0) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); rc = 1; }
+    else if (mime) {
+        // Raw image bytes on a terminal help nobody — upload, or say why not.
+        char name[128], err[512];
+        if (is_stdin) snprintf(name, sizeof name, "stdin-%d.%s", ++*stdin_seq, ext);
+        else {
+            const char *b = strrchr(arg, '/'); b = b ? b + 1 : arg;
+            snprintf(name, sizeof name, "%s", b);
+            for (char *p = name; *p; p++) if (*p == '"' || *p == ';' || *p == '\\' || (unsigned char)*p < 32) *p = '_';
+        }
+        const char *e = !attach
+            ? "not in an agent shell (remote/ssh? pipe it: `ssh host cat f | tfa-cat`)"
+            : cat_upload(fd, head, (size_t)hn, name, mime, err, sizeof err);
+        if (e) { fprintf(stderr, "tfa-cat: %s: not attached: %s\n", arg, e); rc = 1; }
+    } else {
+        int r = cat_copy(fd, 1, head, hn > 0 ? (size_t)hn : 0);
+        if (r == -1) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); rc = 1; }
+        else if (r == -2) rc = 141;
+    }
+    if (!is_stdin) close(fd);
+    return rc;
+}
+
+int cmd_cat(int argc, char **argv) {
+    if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) {
+        printf("tfa-cat %s\n", BRIDGE_VERSION); return 0;
+    }
+    if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        printf("Usage: tfa-cat [FILE]...   (no FILE or - = stdin)\n"
+               "cat, but images/PDFs printed to an agent's terminal are attached to the bash call,\n"
+               "so the model sees them. Redirected/piped output is raw bytes, exactly like cat.\n");
+        return 0;
+    }
+    const char *blk = getenv("TODOFORAI_BLOCK_ID");
+    int attach = blk && *blk, seq = 0, rc = 0;
+    if (argc < 2) return cat_one("-", attach, &seq);
+    for (int i = 1; i < argc; i++) {
+        int r = cat_one(argv[i], attach, &seq);
+        if (r == 141) return 141;
+        if (r) rc = 1;
+    }
+    return rc;
+}
+
+void bridge_link_tfa_cat(const char *self) {
+    char real[1024];
+    if (!self || !*self) return;
+    if (strcmp(self, "/proc/self/exe") == 0) {
+        ssize_t rn = readlink(self, real, sizeof real - 1);
+        if (rn <= 0) return;
+        real[rn] = '\0';
+        size_t dl = strlen(" (deleted)");
+        if ((size_t)rn > dl && strcmp(real + rn - dl, " (deleted)") == 0) real[rn - dl] = '\0';
+        self = real;
+    }
+    char abs[4096];
+    if (self[0] != '/') {   // macOS/BSD argv0 fallback may be relative
+        if (!realpath(self, abs)) return;
+        self = abs;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !*home) return;
+    char dir[1024], link[1100], tmp[1120], cur[1024];
+    if (snprintf(dir, sizeof dir, "%s/.todoforai/tools/bin", home) >= (int)sizeof dir) return;
+    snprintf(link, sizeof link, "%s/tfa-cat", dir);
+    ssize_t cn = readlink(link, cur, sizeof cur - 1);
+    if (cn > 0) { cur[cn] = '\0'; if (strcmp(cur, self) == 0) return; }
+    char p1[1024]; snprintf(p1, sizeof p1, "%s/.todoforai", home); mkdir(p1, 0755);
+    snprintf(p1, sizeof p1, "%s/.todoforai/tools", home); mkdir(p1, 0755);
+    mkdir(dir, 0755);
+    // Replace atomically (an old link or a stale npm shim alike).
+    snprintf(tmp, sizeof tmp, "%s/.tfa-cat.%ld", dir, (long)getpid());
+    unlink(tmp);
+    if (symlink(self, tmp) == 0 && rename(tmp, link) != 0) unlink(tmp);
+}
 #endif  // !_WIN32

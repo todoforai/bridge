@@ -21,6 +21,11 @@ int  cmd_whoami(int argc, char **argv);
 int  cmd_adb(int argc, char **argv);
 // `<bridge> __live` (tail() shim): tee stdin→stdout, POST lines to the block (POSIX only).
 int  cmd_live(int argc, char **argv);
+// `tfa-cat` (argv[0] dispatch via the ~/.todoforai/tools/bin/tfa-cat symlink): cat
+// that attaches images/PDFs to the running bash block (POSIX only).
+int  cmd_cat(int argc, char **argv);
+// (Re)point ~/.todoforai/tools/bin/tfa-cat at this binary. Idempotent, best effort.
+void bridge_link_tfa_cat(const char *self);
 void print_help(void);
 
 #endif
