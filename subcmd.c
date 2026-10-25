@@ -374,13 +374,20 @@ void print_help(void) {
 // already looks like host:port (digits/dots/colons only) is passed through
 // untouched, so `adb connect 192.168.1.5:5555` keeps working.
 // ---------------------------------------------------------------------------
-#ifndef _WIN32
 #include "identity_server.h"  // IDENTITY_SERVER_PORT*
 #include "json.h"
-#include "ws.h"               // ws_tcp_connect
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "ws.h"               // ws_tcp_connect (also WSAStartup on Windows)
+#ifdef _WIN32
+#  include <windows.h>
+#  include "tools.h"          // bridge_win_quote_arg
+#  define poll WSAPoll
+#  define adb_sock_close closesocket
+#else
+#  include <poll.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#  define adb_sock_close close
+#endif
 
 // Stock adb targets: `host:port`, `host` (default 5555), IPv6 `[::1]:5555`,
 // `vsock:…`, `localfilesystem:…`, `emulator-5554`, `localhost`, `*.local`.
@@ -425,7 +432,7 @@ static uint16_t ask_daemon(uint16_t srv_port, const char *phone, const char *psp
     while (off < (size_t)n) {
         struct pollfd p = { .fd = fd, .events = POLLOUT };
         if (poll(&p, 1, 1000) <= 0) break;
-        ssize_t w = send(fd, req + off, (size_t)n - off, 0);
+        int w = (int)send(fd, req + off, (int)((size_t)n - off), 0);
         if (w <= 0) break;
         off += (size_t)w;
     }
@@ -433,12 +440,12 @@ static uint16_t ask_daemon(uint16_t srv_port, const char *phone, const char *psp
     for (;;) {
         struct pollfd p = { .fd = fd, .events = POLLIN };
         if (poll(&p, 1, 3000) <= 0) break;
-        ssize_t r = recv(fd, resp + rl, sizeof resp - 1 - rl, 0);
+        int r = (int)recv(fd, resp + rl, (int)(sizeof resp - 1 - rl), 0);
         if (r <= 0) break;
         rl += (size_t)r;
         if (rl + 1 >= sizeof resp) break;
     }
-    close(fd);
+    adb_sock_close(fd);
     const char *body = strstr(resp, "\r\n\r\n");
     if (!body) { snprintf(err, err_cap, "bad reply from bridge daemon"); return 0; }
     body += 4;
@@ -460,8 +467,40 @@ static int probe_refused(uint16_t port) {
     int refused = 0;
     // Only an EOF/error within the window counts; silence is a live adbd.
     if (poll(&p, 1, 1500) > 0) { char b[8]; refused = recv(fd, b, sizeof b, MSG_PEEK) <= 0; }
-    close(fd);
+    adb_sock_close(fd);
     return refused;
+}
+
+// Hand off to the real adb. POSIX: exec (inherits stdio, exit code is adb's).
+// Windows has no exec: spawn with quoted args, wait, forward the exit code.
+static int run_adb(char **av) {
+#ifdef _WIN32
+    char cmdline[8192]; size_t o = 0;
+    for (int i = 0; av[i]; i++) {
+        char q[2048];
+        int qn = bridge_win_quote_arg(av[i], q, sizeof q);
+        if (qn < 0 || o + (size_t)qn + 2 >= sizeof cmdline) { fprintf(stderr, "adb: argument too long\n"); return 2; }
+        if (o) cmdline[o++] = ' ';
+        memcpy(cmdline + o, q, (size_t)qn); o += (size_t)qn;
+    }
+    cmdline[o] = '\0';
+    STARTUPINFOA si = { .cb = sizeof si };
+    PROCESS_INFORMATION pi;
+    // NULL app name → CreateProcess searches PATH for adb(.exe).
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
+        return 127;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return (int)code;
+#else
+    execvp("adb", av);
+    fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
+    return 127;
+#endif
 }
 
 int cmd_adb(int argc, char **argv) {
@@ -489,9 +528,7 @@ int cmd_adb(int argc, char **argv) {
             snprintf(hostport, sizeof hostport, "127.0.0.1:%u", port);
             exec_argv[ea++] = hostport;
             exec_argv[ea] = NULL;
-            execvp("adb", exec_argv);
-            fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
-            return 127;
+            return run_adb(exec_argv);
         }
         uint16_t port = ask_daemon(srv, target, pspec, err, sizeof err, NULL, 0, 0);
         if (!port) { fprintf(stderr, "adb %s %s: %s\n", verb, target, err); return 1; }
@@ -509,8 +546,5 @@ int cmd_adb(int argc, char **argv) {
         for (int i = 2; i < argc && ea < 62; i++) exec_argv[ea++] = argv[i];
     }
     exec_argv[ea] = NULL;
-    execvp("adb", exec_argv);
-    fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
-    return 127;
+    return run_adb(exec_argv);
 }
-#endif  // !_WIN32

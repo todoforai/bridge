@@ -17,7 +17,7 @@ int  bridge_login_run(const char *device_name, const char *token,
 int  cmd_logout(int argc, char **argv);
 int  cmd_enroll(int argc, char **argv);
 int  cmd_whoami(int argc, char **argv);
-// `<bridge> __adb connect|pair|disconnect …` (adb() shim target; POSIX only).
+// `<bridge> __adb connect|pair|disconnect …` (adb() shim target).
 int  cmd_adb(int argc, char **argv);
 // shell_cli.c — both go through the daemon's loopback shell relay (shell_relay.h).
 // `<bridge> __live` (tail() shim): tee stdin→stdout, lines also to the chat block.

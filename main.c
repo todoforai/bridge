@@ -546,16 +546,15 @@ static int output_tail_is_prompt(const session_t *s) {
     "if [ \"$__n\" = arg ]; then case $__a in [0-9]*) __n=1 ;; *) __n=; break ;; esac; continue; fi; " \
     "case $__a in -n|-c) __n=arg ;; -[0-9]*|-n[0-9]*|-c[0-9]*|--lines=[0-9]*|--bytes=[0-9]*|-q|-v) ;; *) __n=; break ;; esac; done; fi; " \
     "if [ \"$__n\" = 1 ]; then '%s' __live | command tail \"$@\"; else command tail \"$@\"; fi; }; "
+// `adb connect "<phone>"` → the daemon's ADB relay (adb_relay.h). Only the
+// addressing verbs are intercepted; everything else is the real adb.
+#define ADB_SHIM_FMT "adb() { case \"$1\" in connect|pair|disconnect) '%s' __adb \"$@\" ;; *) command adb \"$@\" ;; esac; }; " \
+    TAIL_SHIM_FMT
 #ifdef _WIN32
 // tfa-cat: POSIX gets a PATH symlink (bridge_link_tfa_cat); Windows has no
 // symlinks for us, so a function (bash/busybox accept the hyphen).
 #  define DETACH_SHIM_FMT "nohup() { '%s' __detach \"$@\"; }; setsid() { nohup \"$@\"; }; " \
-    "tfa-cat() { '%s' __cat \"$@\"; }; " TAIL_SHIM_FMT
-#else
-// `adb connect "<phone>"` → the daemon's ADB relay (adb_relay.h). Only the
-// addressing verbs are intercepted; everything else is the real adb.
-#  define ADB_SHIM_FMT "adb() { case \"$1\" in connect|pair|disconnect) '%s' __adb \"$@\" ;; *) command adb \"$@\" ;; esac; }; " \
-    TAIL_SHIM_FMT
+    "tfa-cat() { '%s' __cat \"$@\"; }; " ADB_SHIM_FMT
 #endif
 
 typedef struct {
@@ -2668,7 +2667,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[3 * 1024 * 4 + 1024];  // g_self ≤ 1023 (≤3×), each ' may become '\''
+        char dshim[4 * 1024 * 4 + 1536];  // g_self ≤ 1023 (≤4×), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -2697,7 +2696,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q);
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q);
 #else
                 int dn = snprintf(dshim, sizeof dshim, ADB_SHIM_FMT, q, q);
 #endif
@@ -4031,11 +4030,11 @@ int bridge_main(int argc, char **argv) {
     // fall through into daemon startup. Hidden from --help; not a user command.
     if (argc >= 3 && strcmp(argv[1], "__job") == 0) return cmd_job_worker(argv[2]);
     if (argc >= 2 && strcmp(argv[1], "__live") == 0) return cmd_live(argc - 1, argv + 1);
+    if (argc >= 2 && strcmp(argv[1], "__adb") == 0) return cmd_adb(argc - 1, argv + 1);
 #ifdef _WIN32
     if (argc >= 2 && strcmp(argv[1], "__detach") == 0) return bridge_pty_detach_main(argc - 2, argv + 2);
     if (argc >= 2 && strcmp(argv[1], "__cat") == 0) return cmd_cat(argc - 1, argv + 1);
 #else
-    if (argc >= 2 && strcmp(argv[1], "__adb") == 0) return cmd_adb(argc - 1, argv + 1);
     {   // Invoked through the tfa-cat symlink (busybox-style).
         const char *a0 = argc ? strrchr(argv[0], '/') : NULL;
         a0 = a0 ? a0 + 1 : (argc ? argv[0] : "");
