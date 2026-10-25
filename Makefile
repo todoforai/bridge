@@ -33,11 +33,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c \
+COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = agent_browser_guard.h noise_ws.h pty.h pty_win.c identity.h identity_server.h adb_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
+HDRS = agent_browser_guard.h noise_ws.h pty.h pty_win.c identity.h identity_server.h adb_relay.h shell_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -163,6 +163,13 @@ test-tools: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-tools test/test_tools.c tools.c json.c env_path.c policy.c -lpthread
 	./build/test-tools
 
+# tfa-cat / __live through the loopback shell relay (real binary as the client).
+.PHONY: test-shell-relay
+test-shell-relay: all | build
+	$(CC) -O0 -g -Wall -Wextra -iquote . -o build/test-shell-relay \
+	    -I$(CORE)/noise test/test_shell_relay.c shell_relay.c json.c ws.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil
+	./build/test-shell-relay
+
 # JSON parser: hostile nesting depth is rejected instead of recursed into.
 .PHONY: test-json
 test-json: | build
@@ -221,7 +228,7 @@ test-timing: | build
 test-coalesce: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
-	    test/test_coalesce.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_coalesce.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-coalesce
 
@@ -233,7 +240,7 @@ test-coalesce: | build
 test-runenv: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
-	    test/test_runenv.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_runenv.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
@@ -244,7 +251,7 @@ test-runenv: | build
 test-initdrain: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-initdrain \
-	    test/test_initdrain.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_initdrain.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-initdrain
 
@@ -256,7 +263,7 @@ test-initdrain: | build
 test-oneshot-leak: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-oneshot-leak \
-	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-oneshot-leak
 
@@ -300,7 +307,7 @@ test-probe: | build
 test-tail-strip: | build
 	$(CC) -O0 -g -Wall -Wextra -Wno-unused-function -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-tail-strip \
-	    test/test_tail_strip.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_tail_strip.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-tail-strip
 
@@ -308,7 +315,7 @@ test-tail-strip: | build
 test-prompt-tail: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-prompt-tail \
-	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-prompt-tail
 
@@ -318,13 +325,13 @@ test-prompt-tail: | build
 test-park: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-park \
-	    test/test_park.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_park.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-park
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c
+BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c shell_relay.c shell_cli.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 
@@ -413,6 +420,6 @@ clean:
 test-pool: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-pool \
-	    test/test_pool.c noise_ws.c identity.c identity_server.c adb_relay.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_pool.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-pool

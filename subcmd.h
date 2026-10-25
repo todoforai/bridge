@@ -19,13 +19,17 @@ int  cmd_enroll(int argc, char **argv);
 int  cmd_whoami(int argc, char **argv);
 // `<bridge> __adb connect|pair|disconnect …` (adb() shim target; POSIX only).
 int  cmd_adb(int argc, char **argv);
-// `<bridge> __live` (tail() shim): tee stdin→stdout, POST lines to the block (POSIX only).
+// shell_cli.c — both go through the daemon's loopback shell relay (shell_relay.h).
+// `<bridge> __live` (tail() shim): tee stdin→stdout, lines also to the chat block.
 int  cmd_live(int argc, char **argv);
-// `tfa-cat` (argv[0] dispatch via the ~/.todoforai/tools/bin/tfa-cat symlink): cat
-// that attaches images/PDFs to the running bash block (POSIX only).
+// `tfa-cat`: cat that attaches images/PDFs to the running bash block. POSIX:
+// argv[0] dispatch via the ~/.todoforai/tools/bin/tfa-cat symlink; Windows:
+// the tfa-cat() shell function → `<bridge> __cat`.
 int  cmd_cat(int argc, char **argv);
+#ifndef _WIN32
 // (Re)point ~/.todoforai/tools/bin/tfa-cat at this binary. Idempotent, best effort.
 void bridge_link_tfa_cat(const char *self);
+#endif
 void print_help(void);
 
 #endif

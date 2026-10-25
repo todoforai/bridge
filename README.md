@@ -148,7 +148,16 @@ No new protocol messages, no in-binary HTTP client, no extra dependencies.
 ## Shell helpers (`tfa-cat`, `tail`, `adb`)
 
 Small tools the agent uses inside its bash, built into the bridge binary — no
-npm/pip install, always the bridge's version. POSIX only (Linux, macOS).
+npm/pip install, always the bridge's version. Linux, macOS and Windows
+(`adb` interception: Linux/macOS only).
+
+They don't call the API themselves: they hand bytes to the running bridge
+daemon over loopback (`127.0.0.1:$TODOFORAI_BRIDGE_PORT`, an ephemeral port
+exported to every RUN), and the daemon relays them on its already-open Noise
+channel (`shell:open` / `shell:data` / `shell:end` → `shell:close`). No
+curl, no TLS handshake per call. The backend accepts a stream only with the
+RUN's own token (`TODOFORAI_API_TOKEN`) for a block that is still running on
+this device. See `shell_relay.h`.
 
 ### `tfa-cat` — cat for AI agents that shows images and PDFs to the model
 
@@ -166,19 +175,21 @@ tfa-cat shot.png > copy.png     # stdout redirected/piped → raw bytes, like ca
 ```
 
 - Formats: PNG, JPEG, GIF, WebP, PDF (≤ 20 MB per command).
-- Media goes only to a TTY stdout inside an agent RUN (`TODOFORAI_BLOCK_ID`
-  set): it's uploaded (`curl -F`) to `/dst/v1/resources/show` for the
-  running bash block, and the backend hands it to the agent with that
-  command's result. Prints nothing on success; on failure
-  `tfa-cat: <file>: not attached: <reason>`, exit 1.
-- Installed as a symlink `~/.todoforai/tools/bin/tfa-cat` → the bridge (on
-  PATH in every RUN), dispatched on `argv[0]`.
+- Media goes only to a terminal stdout inside an agent RUN
+  (`TODOFORAI_BLOCK_ID` set): it's attached to the running bash block, and
+  the backend hands it to the agent with that command's result. Prints
+  nothing on success; on failure `tfa-cat: <file>: not attached: <reason>`,
+  exit 1.
+- Linux/macOS: a symlink `~/.todoforai/tools/bin/tfa-cat` → the bridge (on
+  PATH in every RUN), dispatched on `argv[0]`. Windows: a `tfa-cat` shell
+  function in the RUN shell → `<bridge> __cat`.
 
 ### Live `tail`, phone `adb`
 
 - `cmd | tail -N` would print nothing until EOF; the RUN shell's `tail()`
   wrapper tees the pipe through `<bridge> __live`, so the chat block shows
-  lines as they come (display only — the tool result is still tail's).
+  lines as they come (display only — the tool result is still tail's). The
+  daemon batches and rate-limits them; the pipe itself never waits.
 - `adb connect|pair|disconnect <phone>` → `<bridge> __adb` resolves a paired
   phone through the device's ADB relay; other `adb` commands pass through.
 
