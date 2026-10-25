@@ -192,6 +192,12 @@ void shell_relay_fill_pfds(shell_relay_t *r, struct pollfd *pfds, size_t *n, siz
     for (int i = 0; i < SHELL_MAX_STREAMS && *n < cap; i++) {
         shell_stream_t *s = &r->streams[i];
         if (s->fd == WS_INVALID_FD) continue;
+#ifdef _WIN32
+        // WSAPoll reports POLLHUP for the client's half-close even with
+        // events=0, which would drop the stream before the reply. Don't poll a
+        // waiting stream: the reply or the tick deadline ends it.
+        if (s->state == ST_WAIT) continue;
+#endif
         // Backed-up channel: stop reading an attach (the client blocks) instead
         // of buffering. A live stream is always read (it drops lines instead).
         short ev = s->state == ST_WAIT || (busy && s->state == ST_STREAM && !s->live) ? 0 : POLLIN;
