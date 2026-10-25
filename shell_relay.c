@@ -25,6 +25,7 @@ typedef int sr_ssize;
 #  include <fcntl.h>
 #  include <netinet/in.h>
 #  include <sys/socket.h>
+#  include <sys/time.h>
 #  include <unistd.h>
 static int sr_close(int s) { return close(s); }
 static void sr_cloexec(int s) { fcntl(s, F_SETFD, FD_CLOEXEC); }
