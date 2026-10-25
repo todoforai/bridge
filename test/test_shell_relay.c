@@ -311,6 +311,17 @@ int main(void) {
     run(cmd, 1, out, sizeof out);
     assert(strstr(out, "No such resource") && strstr(out, "rc=1"));
     printf("ok 15 fetch attach/error\n");
+
+    // 16. fetch of a binary on a TTY → a hint, not bytes; redirected → bytes.
+    reset(); fetch_body = "PK\003\004\0\0xyz"; fetch_len = 9;
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/a.docx; echo rc=$?", env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "binary (text/plain, 9 bytes)") && strstr(out, "> 'a.docx'") && strstr(out, "rc=1") && !strstr(out, "xyz"));
+    reset(); fetch_body = "PK\003\004\0\0xyz"; fetch_len = 9;
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/a.docx > build/sr/a.docx; wc -c < build/sr/a.docx", env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "9"));
+    printf("ok 16 binary hint\n");
     assert(shell_relay_stream_count(&R) == 0);
 
     shell_relay_close_all(&R);

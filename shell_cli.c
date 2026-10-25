@@ -245,6 +245,16 @@ static int cat_ref(const char *ref, int attach, int tty) {
     while (got < size) {
         long n = shell_client_recv(s, buf, sizeof buf);
         if (n <= 0) break;
+        // Binary (a NUL early on: docx/xlsx/zip/…) on the agent's terminal is
+        // noise: say how to get it instead. Piped/redirected → bytes, like cat.
+        if (tty && got == 0 && memchr(buf, 0, (size_t)n)) {
+            const char *b = ref;
+            for (const char *c = ref; *c; c++) if (*c == '/' || *c == ':') b = c + 1;
+            fprintf(stderr, "tfa-cat: %s: binary (%s, %ld bytes), not printed. Save it: tfa-cat '%s' > '%s'\n",
+                    ref, mime, size, ref, *b ? b : "file");
+            shell_client_close(s);
+            return 1;
+        }
         got += n;
         if (write_all(1, buf, (size_t)n) < 0) { rc = 141; break; }
     }
