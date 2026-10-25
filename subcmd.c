@@ -484,10 +484,17 @@ static int run_adb(char **av) {
         memcpy(cmdline + o, q, (size_t)qn); o += (size_t)qn;
     }
     cmdline[o] = '\0';
+    // Resolve against PATH only, like the shell's `command adb`: a NULL app
+    // name would try the exe dir and cwd first (a repo's adb.exe could shadow).
+    char exe[MAX_PATH];
+    const char *path = getenv("PATH");
+    if (!path || !SearchPathA(path, "adb", ".exe", sizeof exe, exe, NULL)) {
+        fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
+        return 127;
+    }
     STARTUPINFOA si = { .cb = sizeof si };
     PROCESS_INFORMATION pi;
-    // NULL app name → CreateProcess searches PATH for adb(.exe).
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+    if (!CreateProcessA(exe, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
         return 127;
     }
