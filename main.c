@@ -3371,9 +3371,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (IS("adb:data")) adb_relay_on_data(&e->adb, payload, payload_len);
         else                adb_relay_on_close(&e->adb, payload, payload_len);
         return 0;
-    } else if (IS("shell:close")) {
+    } else if (IS("shell:close") || IS("shell:ready") || IS("shell:data")) {
         const char *payload = NULL; size_t payload_len = 0;
-        if (json_get_obj(msg, msg_len, "payload", &payload, &payload_len)) shell_relay_on_close(&e->shell, payload, payload_len);
+        if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len)) return 0;
+        if (IS("shell:close"))      shell_relay_on_close(&e->shell, payload, payload_len);
+        else if (IS("shell:ready")) shell_relay_on_ready(&e->shell, payload, payload_len);
+        else                        shell_relay_on_data(&e->shell, payload, payload_len);
         return 0;
     } else if (IS("preview:http_request")) {
         // live_preview relay fetch. Payload-wrapped like FUNCTION_CALL_*:

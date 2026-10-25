@@ -10,6 +10,12 @@
 //   client → {"kind":"attach"|"live","token":…,"todoId":…,"blockId":…,
 //             "messageId":…,"name":…,"mime":…,"size":N}\n  then raw bytes, then half-close
 //   daemon → "ok\n" | "error: <reason>\n", then close
+// A `fetch` (`tfa-cat todoforai:…`) sends {"kind":"fetch","ref":…,"tty":true?}\n
+// and keeps its write side open (closing it = giving up); the daemon answers
+//   "data <size> <mime>\n" + exactly <size> bytes, then close  — the resource
+//   "ok\n"     — the backend attached it to the block (image/PDF on a tty)
+//   "error: <reason>\n"
+// A body shorter than <size> means the transfer broke.
 // An attach declares `size`; anything but exactly that many bytes before EOF
 // (a killed client, a shrinking file) is aborted and stored nowhere. Every
 // state has a deadline, so a stuck or hostile local client can't pin a slot.
@@ -34,6 +40,7 @@
 #define SHELL_IDLE_MS     30000         // attach: max gap between reads
 #define SHELL_DRAIN_MS    10000         // rejected: wait for the client's EOF
 #define SHELL_LIVE_IDLE_MS (10 * 60000) // live: silent this long → stop relaying (the tee goes on)
+#define SHELL_FETCH_MAX   (20L * 1024 * 1024 + 256)  // fetch: body bytes buffered for a slow client
 
 // `live` streams (tail shim) are throttled here, not in the CLI: the CLI is a
 // plain tee, and we batch lines (≤ every SHELL_LIVE_FLUSH_MS, ≤ SHELL_LIVE_LINES_PER_S,
@@ -51,11 +58,15 @@ typedef struct {
     uint32_t id;           // streamId on the wire (never reused)
     int state;             // see shell_relay.c
     int live;              // kind == "live"
+    int fetch;             // kind == "fetch"
     char hdr[SHELL_HDR_CAP];
     size_t hdr_len;
     char err[200];         // backend's early rejection, replied after EOF
     int64_t deadline_ms;   // current state's deadline
-    long size, got;        // attach: declared / received bytes
+    long size, got;        // attach: declared / received bytes; fetch: announced / received
+    int ready;             // fetch: "data …" line queued
+    // fetch: bytes for the client, drained on POLLOUT
+    char *outq; size_t outq_len, outq_cap;
     // live only
     char *lbuf; size_t llen;
     int64_t first_ms;      // when the oldest unsent byte arrived
@@ -92,6 +103,9 @@ void shell_relay_tick(shell_relay_t *r);
 
 // SHELL_CLOSE from the backend. `payload` spans the JSON payload object.
 void shell_relay_on_close(shell_relay_t *r, const char *payload, size_t len);
+// SHELL_READY / SHELL_DATA from the backend (a `fetch` body).
+void shell_relay_on_ready(shell_relay_t *r, const char *payload, size_t len);
+void shell_relay_on_data(shell_relay_t *r, const char *payload, size_t len);
 // Backend connection lost: fail every stream (the backend forgot them).
 void shell_relay_drop_streams(shell_relay_t *r, const char *why);
 
@@ -101,8 +115,15 @@ int shell_relay_stream_count(const shell_relay_t *r);
 // Connects to 127.0.0.1:$TODOFORAI_BRIDGE_PORT and sends the header line built
 // from the RUN env (token, todo, block, message ids). Returns the socket
 // (blocking) or WS_INVALID_FD with `err`.
-// `size`: an attach's exact byte count (-1 for live).
-ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, long size, char *err, size_t err_cap);
+// `size`: an attach's exact byte count (-1 otherwise). `ref`: a fetch's URI
+// (`tty`: stdout is the agent's terminal), NULL otherwise.
+ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, long size,
+                          const char *ref, int tty, char *err, size_t err_cap);
+// Fetch: read the daemon's first line. Returns 1 = body follows (`size`,
+// `mime` set), 0 = attached (nothing to print), -1 = error (in err).
+int shell_client_fetch_head(ws_fd_t fd, long *size, char *mime, size_t mime_cap, char *err, size_t err_cap);
+// Blocking read with the SHELL_IDLE_MS timeout. >0 bytes, 0 EOF, -1 error.
+long shell_client_recv(ws_fd_t fd, void *p, size_t n);
 // Half-close, then read the daemon's reply. NULL = ok, else the reason (in err).
 const char *shell_client_finish(ws_fd_t fd, int timeout_ms, char *err, size_t err_cap);
 // Blocking send of all bytes. 0 / -1.

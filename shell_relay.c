@@ -47,6 +47,8 @@ enum {
     ST_STREAM,    // forwarding bytes as SHELL_DATA
     ST_DRAIN,     // rejected: discard input until EOF, then reply err
     ST_WAIT,      // EOF seen, SHELL_END sent: waiting for SHELL_CLOSE
+    ST_FETCH,     // fetch: waiting for READY / DATA / CLOSE from the backend
+    ST_FLUSH,     // fetch: backend done; close once the out queue is written
 };
 
 void shell_relay_init(shell_relay_t *r, shell_send_fn send, shell_busy_fn busy, shell_ready_fn ready, void *ctx) {
@@ -74,6 +76,7 @@ void shell_relay_init(shell_relay_t *r, shell_send_fn send, shell_busy_fn busy, 
 static void stream_free(shell_stream_t *s) {
     if (s->fd != WS_INVALID_FD) sr_close(s->fd);
     free(s->lbuf);
+    free(s->outq);
     memset(s, 0, sizeof *s);
     s->fd = WS_INVALID_FD;
 }
@@ -87,10 +90,73 @@ static void reply(shell_stream_t *s, const char *err) {
     stream_free(s);
 }
 
+// ── fetch: bytes for the client go through a bounded out queue ──
+
+static int sr_would_block(void) {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
+// Queue (after a direct write when nothing is queued). -1: client gone / over cap.
+static int fetch_push(shell_stream_t *s, const void *p, size_t n) {
+    const char *b = p;
+    if (!s->outq_len) {
+        sr_ssize w = sr_send(s->fd, b, n);
+        if (w < 0 && !sr_would_block()) return -1;
+        if (w > 0) { b += w; n -= (size_t)w; }
+    }
+    if (!n) return 0;
+    if (s->outq_len + n > SHELL_FETCH_MAX) return -1;
+    if (s->outq_len + n > s->outq_cap) {
+        size_t cap = s->outq_cap ? s->outq_cap : 64 * 1024;
+        while (cap < s->outq_len + n) cap *= 2;
+        if (cap > SHELL_FETCH_MAX) cap = SHELL_FETCH_MAX;
+        char *q = realloc(s->outq, cap);
+        if (!q) return -1;
+        s->outq = q; s->outq_cap = cap;
+    }
+    memcpy(s->outq + s->outq_len, b, n);
+    s->outq_len += n;
+    return 0;
+}
+
+// POLLOUT. Frees the stream when a finished fetch has written everything.
+static void fetch_flush(shell_stream_t *s) {
+    size_t off = 0;
+    while (off < s->outq_len) {
+        sr_ssize w = sr_send(s->fd, s->outq + off, s->outq_len - off);
+        if (w < 0 && sr_would_block()) break;
+        if (w <= 0) { stream_free(s); return; }
+        off += (size_t)w;
+    }
+    if (off) { memmove(s->outq, s->outq + off, s->outq_len - off); s->outq_len -= off; s->deadline_ms = ws_monotonic_ms() + SHELL_IDLE_MS; }
+    if (s->state == ST_FLUSH && !s->outq_len) stream_free(s);
+}
+
+// The backend is done with a fetch: a final line if no body was announced,
+// then close once written. Mid-body (`err` set): close now, the client sees
+// fewer bytes than announced.
+static void fetch_finish(shell_stream_t *s, const char *err) {
+    if (s->ready && err) { stream_free(s); return; }
+    if (!s->ready) {
+        char line[256];
+        int n = err ? snprintf(line, sizeof line, "error: %.200s\n", *err ? err : "failed") : snprintf(line, sizeof line, "ok\n");
+        if (n <= 0 || fetch_push(s, line, (size_t)n) != 0) { stream_free(s); return; }
+    }
+    s->state = ST_FLUSH;
+    s->deadline_ms = ws_monotonic_ms() + SHELL_IDLE_MS;
+    if (!s->outq_len) stream_free(s);
+}
+
 // Rejected: the reply waits for the client's EOF (so it is read, not lost to
 // an RST) — but at most SHELL_DRAIN_MS. __live never reads a reply: just close.
+// A fetch client never half-closes: it gets the line at once.
 static void fail(shell_stream_t *s, const char *err) {
     if (s->live) { stream_free(s); return; }
+    if (s->fetch) { fetch_finish(s, err); return; }
     snprintf(s->err, sizeof s->err, "%s", err);
     s->state = ST_DRAIN;
     s->deadline_ms = ws_monotonic_ms() + SHELL_DRAIN_MS;
@@ -108,7 +174,7 @@ void shell_relay_drop_streams(shell_relay_t *r, const char *why) {
         shell_stream_t *s = &r->streams[i];
         if (s->fd == WS_INVALID_FD) continue;
         if (s->state == ST_WAIT) reply(s, why);
-        else if (s->state != ST_DRAIN) fail(s, why);
+        else if (s->state != ST_DRAIN && s->state != ST_FLUSH) fail(s, why);
     }
 }
 
@@ -129,6 +195,7 @@ void shell_relay_fill_pfds(shell_relay_t *r, struct pollfd *pfds, size_t *n, siz
         // Backed-up channel: stop reading an attach (the client blocks) instead
         // of buffering. A live stream is always read (it drops lines instead).
         short ev = s->state == ST_WAIT || (busy && s->state == ST_STREAM && !s->live) ? 0 : POLLIN;
+        if (s->outq_len) ev |= POLLOUT;
         pfds[*n].fd = s->fd; pfds[*n].events = ev; pfds[*n].revents = 0; (*n)++;
     }
 }
@@ -230,40 +297,46 @@ static void live_flush(shell_relay_t *r, shell_stream_t *s, int final) {
 // Header line complete: relay it as SHELL_OPEN. Every field is re-emitted
 // through json_emit_str, so the client can't inject JSON.
 static void open_stream(shell_relay_t *r, shell_stream_t *s, const char *hdr, size_t len) {
-    static const char *const keys[] = { "kind", "token", "todoId", "blockId", "messageId", "name", "mime" };
+    static const char *const keys[] = { "kind", "token", "todoId", "blockId", "messageId", "name", "mime", "ref" };
+    enum { NKEYS = sizeof keys / sizeof *keys };
     long size = -1;
     if (!json_get_long(hdr, len, "size", &size)) size = -1;
-    char vals[7][256];
-    for (int i = 0; i < 7; i++) {
+    int tty = 0;
+    if (!json_get_bool(hdr, len, "tty", &tty)) tty = 0;
+    char vals[NKEYS][1024];
+    for (int i = 0; i < NKEYS; i++) {
         size_t vl = 0;
         if (!json_get_str_decoded(hdr, len, keys[i], vals[i], sizeof vals[i], &vl)) vals[i][0] = '\0';
     }
-    if (!vals[0][0] || !vals[1][0] || !vals[2][0] || !vals[3][0]) { fail(s, "bad request"); return; }
+    s->fetch = strcmp(vals[0], "fetch") == 0;
+    if (!vals[0][0] || !vals[1][0] || !vals[2][0] || !vals[3][0] || (s->fetch && !vals[7][0])) { fail(s, "bad request"); return; }
     if (!r->ready || !r->ready(r->ctx)) { fail(s, "bridge is not connected to the backend"); return; }
     s->live = strcmp(vals[0], "live") == 0;
     // An attach declares its size up front: EOF alone can't tell a finished
     // upload from a killed client, so a short (or long) stream is never stored.
-    if (!s->live && size < 0) { fail(s, "bad request"); return; }
+    if (!s->live && !s->fetch && size < 0) { fail(s, "bad request"); return; }
     s->size = size;
     if (s->live) {
         if (!(s->lbuf = malloc(SHELL_LIVE_BUF))) { fail(s, "out of memory"); return; }
         s->credits = SHELL_LIVE_LINES_PER_S;
         s->refill_ms = ws_monotonic_ms();
     }
-    char buf[SHELL_HDR_CAP + 512]; size_t u = 0;
+    char buf[SHELL_HDR_CAP * 2 + 512]; size_t u = 0;
     int n = snprintf(buf, sizeof buf, "{\"type\":\"shell:open\",\"payload\":{\"streamId\":%u", s->id);
     if (n < 0) { fail(s, "internal error"); return; }
     u = (size_t)n;
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < NKEYS; i++) {
         if (!vals[i][0]) continue;
         char k[24]; int kn = snprintf(k, sizeof k, ",\"%s\":", keys[i]);
         if (json_emit_raw(buf, sizeof buf, &u, k, (size_t)kn) < 0 || json_emit_str(buf, sizeof buf, &u, vals[i], -1) < 0) { fail(s, "header too large"); return; }
     }
-    if (!s->live) {
+    if (!s->live && !s->fetch) {
         char k[48]; int kn = snprintf(k, sizeof k, ",\"size\":%ld", size);
         if (json_emit_raw(buf, sizeof buf, &u, k, (size_t)kn) < 0) { fail(s, "header too large"); return; }
     }
+    if (s->fetch && tty && json_emit_raw(buf, sizeof buf, &u, ",\"tty\":true", 11) < 0) { fail(s, "header too large"); return; }
     if (json_emit_raw(buf, sizeof buf, &u, "}}", 2) < 0 || r->send(r->ctx, buf, u) != 0) { fail(s, "bridge is not connected to the backend"); return; }
+    if (s->fetch) { s->state = ST_FETCH; s->deadline_ms = ws_monotonic_ms() + SHELL_REPLY_MS; return; }
     s->state = ST_STREAM;
     s->deadline_ms = ws_monotonic_ms() + (s->live ? SHELL_LIVE_IDLE_MS : SHELL_IDLE_MS);
 }
@@ -295,6 +368,13 @@ static void on_readable(shell_relay_t *r, shell_stream_t *s) {
 #else
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
 #endif
+    }
+    if (s->fetch && s->state != ST_HDR) {
+        // A fetch client only reads; EOF/RST from it = it gave up (killed, ^C).
+        if (n > 0) return;
+        if (s->state == ST_FETCH) (void)send_abort(r, s->id);
+        stream_free(s);
+        return;
     }
     if (n < 0) {    // client aborted (RST: over the cap, read error, killed)
         if (s->state == ST_STREAM && !s->live) (void)send_abort(r, s->id);
@@ -328,7 +408,7 @@ static void on_readable(shell_relay_t *r, shell_stream_t *s) {
         s->hdr_len += take;
         if (!nl) return;
         open_stream(r, s, s->hdr, s->hdr_len);
-        if (s->state != ST_STREAM) return;
+        if (s->state != ST_STREAM) return;   // fetch: nothing more to read
         off = take + 1;
     }
     if (s->live) {
@@ -353,6 +433,7 @@ void shell_relay_service(shell_relay_t *r, const struct pollfd *pfds, size_t fir
         for (int i = 0; i < SHELL_MAX_STREAMS; i++) {
             shell_stream_t *s = &r->streams[i];
             if (s->fd != p->fd || s->fd == WS_INVALID_FD) continue;
+            if (p->revents & POLLOUT) { fetch_flush(s); if (s->fd == WS_INVALID_FD) break; }
             if (p->revents & (POLLIN | POLLHUP | POLLERR)) {
                 // Waiting for the backend: only a full hang-up matters (client gone).
                 if (s->state == ST_WAIT) { if (p->revents & (POLLHUP | POLLERR)) stream_free(s); }
@@ -369,7 +450,9 @@ void shell_relay_tick(shell_relay_t *r) {
         shell_stream_t *s = &r->streams[i];
         if (s->fd == WS_INVALID_FD) continue;
         if (s->deadline_ms && now_ms >= s->deadline_ms) {
-            if (s->state == ST_WAIT) reply(s, "no answer from the backend");
+            if (s->state == ST_FETCH) { (void)send_abort(r, s->id); fetch_finish(s, "no answer from the backend"); }
+            else if (s->state == ST_FLUSH) stream_free(s);   // client stopped reading
+            else if (s->state == ST_WAIT) reply(s, "no answer from the backend");
             else if (s->state == ST_DRAIN) reply(s, s->err);
             else if (s->live) { live_flush(r, s, 1); (void)send_simple(r, "shell:end", s->id); stream_free(s); }
             else { if (s->state == ST_STREAM) (void)send_abort(r, s->id); reply(s, "timed out"); }
@@ -386,10 +469,50 @@ void shell_relay_on_close(shell_relay_t *r, const char *payload, size_t len) {
         if (s->fd == WS_INVALID_FD || s->id != (uint32_t)id) continue;
         char err[200]; size_t el = 0;
         int has_err = json_get_str_decoded(payload, len, "error", err, sizeof err, &el);
-        if (s->state == ST_WAIT) reply(s, has_err ? err : NULL);
-        else if (s->state != ST_DRAIN) fail(s, has_err ? err : "closed by the backend");
+        if (s->state == ST_FETCH) fetch_finish(s, has_err ? err : (s->ready && s->got != s->size ? "short body" : NULL));
+        else if (s->state == ST_WAIT) reply(s, has_err ? err : NULL);
+        else if (s->state != ST_DRAIN && s->state != ST_FLUSH) fail(s, has_err ? err : "closed by the backend");
         return;
     }
+}
+
+static shell_stream_t *fetch_stream(shell_relay_t *r, const char *payload, size_t len) {
+    long id = 0;
+    if (!json_get_long(payload, len, "streamId", &id) || id <= 0) return NULL;
+    for (int i = 0; i < SHELL_MAX_STREAMS; i++) {
+        shell_stream_t *s = &r->streams[i];
+        if (s->fd != WS_INVALID_FD && s->id == (uint32_t)id && s->fetch && s->state == ST_FETCH) return s;
+    }
+    return NULL;
+}
+
+void shell_relay_on_ready(shell_relay_t *r, const char *payload, size_t len) {
+    shell_stream_t *s = fetch_stream(r, payload, len);
+    if (!s || s->ready) return;
+    long size = -1;
+    char mime[128]; size_t ml = 0;
+    if (!json_get_long(payload, len, "size", &size) || size < 0 || size > SHELL_FETCH_MAX - 256) { (void)send_abort(r, s->id); fetch_finish(s, "bad answer from the backend"); return; }
+    if (!json_get_str_decoded(payload, len, "mime", mime, sizeof mime, &ml)) snprintf(mime, sizeof mime, "application/octet-stream");
+    for (char *c = mime; *c; c++) if (*c == ' ' || *c == '\n' || *c == '\r') *c = '_';
+    char line[192];
+    int n = snprintf(line, sizeof line, "data %ld %s\n", size, mime);
+    s->ready = 1;
+    s->size = size;
+    s->deadline_ms = ws_monotonic_ms() + SHELL_IDLE_MS;
+    if (n <= 0 || fetch_push(s, line, (size_t)n) != 0) { (void)send_abort(r, s->id); stream_free(s); }
+}
+
+void shell_relay_on_data(shell_relay_t *r, const char *payload, size_t len) {
+    shell_stream_t *s = fetch_stream(r, payload, len);
+    if (!s || !s->ready) return;
+    const char *b64 = NULL; size_t bl = 0;
+    if (!json_get_str(payload, len, "b64", &b64, &bl)) return;
+    static uint8_t raw[SHELL_DATA_CHUNK + 64];
+    size_t n = b64_decode(b64, bl, raw, sizeof raw);
+    if (!n) return;
+    if (s->got + (long)n > s->size || fetch_push(s, raw, n) != 0) { (void)send_abort(r, s->id); stream_free(s); return; }
+    s->got += (long)n;
+    s->deadline_ms = ws_monotonic_ms() + SHELL_IDLE_MS;
 }
 
 // ── Client side ──────────────────────────────────────────────────────────────
@@ -417,7 +540,8 @@ int shell_client_send_lossy(ws_fd_t fd, const void *p, size_t n) {
 #endif
 }
 
-ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, long size, char *err, size_t err_cap) {
+ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, long size,
+                          const char *ref, int tty, char *err, size_t err_cap) {
     const char *port_s = getenv("TODOFORAI_BRIDGE_PORT");
     const char *tok = getenv("TODOFORAI_API_TOKEN"), *todo = getenv("TODOFORAI_TODO_ID");
     const char *blk = getenv("TODOFORAI_BLOCK_ID"), *msg = getenv("TODOFORAI_MESSAGE_ID");
@@ -425,10 +549,10 @@ ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, 
     if (port <= 0 || port > 65535) { snprintf(err, err_cap, "no TODOFORAI_BRIDGE_PORT (not a bridge shell, or the bridge needs a restart)"); return WS_INVALID_FD; }
     if (!tok || !*tok || !todo || !*todo || !blk || !*blk) { snprintf(err, err_cap, "no TODOFORAI_API_TOKEN/TODO_ID/BLOCK_ID in this shell"); return WS_INVALID_FD; }
     char hdr[SHELL_HDR_CAP]; size_t u = 0;
-    const char *keys[] = { "kind", "token", "todoId", "blockId", "messageId", "name", "mime" };
-    const char *vals[] = { kind, tok, todo, blk, msg, name, mime };
+    const char *keys[] = { "kind", "token", "todoId", "blockId", "messageId", "name", "mime", "ref" };
+    const char *vals[] = { kind, tok, todo, blk, msg, name, mime, ref };
     int bad = json_emit_raw(hdr, sizeof hdr, &u, "{", 1) < 0;
-    for (int i = 0, first = 1; i < 7 && !bad; i++) {
+    for (int i = 0, first = 1; i < 8 && !bad; i++) {
         if (!vals[i] || !*vals[i]) continue;
         char k[24]; int kn = snprintf(k, sizeof k, "%s\"%s\":", first ? "" : ",", keys[i]);
         bad = json_emit_raw(hdr, sizeof hdr, &u, k, (size_t)kn) < 0 || json_emit_str(hdr, sizeof hdr, &u, vals[i], -1) < 0;
@@ -438,6 +562,7 @@ ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, 
         char k[40]; int kn = snprintf(k, sizeof k, ",\"size\":%ld", size);
         bad = json_emit_raw(hdr, sizeof hdr, &u, k, (size_t)kn) < 0;
     }
+    if (!bad && tty) bad = json_emit_raw(hdr, sizeof hdr, &u, ",\"tty\":true", 11) < 0;
     if (bad || json_emit_raw(hdr, sizeof hdr, &u, "}\n", 2) < 0) { snprintf(err, err_cap, "header too large"); return WS_INVALID_FD; }
     ws_fd_t fd = ws_tcp_connect("127.0.0.1", (uint16_t)port, 1000, err, err_cap);
     if (fd == WS_INVALID_FD) { snprintf(err, err_cap, "bridge daemon not reachable on port %ld", port); return WS_INVALID_FD; }
@@ -471,4 +596,33 @@ const char *shell_client_finish(ws_fd_t fd, int timeout_ms, char *err, size_t er
     if (strcmp(line, "ok") == 0) return NULL;
     snprintf(err, err_cap, "%s", strncmp(line, "error: ", 7) == 0 ? line + 7 : (n ? line : "no answer from the bridge daemon"));
     return err;
+}
+
+long shell_client_recv(ws_fd_t fd, void *p, size_t n) {
+    struct pollfd pf = { .fd = fd, .events = POLLIN };
+    if (poll(&pf, 1, SHELL_IDLE_MS) <= 0) return -1;
+    sr_ssize r = sr_recv(fd, p, n);
+    return r < 0 ? -1 : (long)r;
+}
+
+int shell_client_fetch_head(ws_fd_t fd, long *size, char *mime, size_t mime_cap, char *err, size_t err_cap) {
+    // Byte by byte: the body follows the line on the same socket.
+    char line[256]; size_t n = 0;
+    struct pollfd pf = { .fd = fd, .events = POLLIN };
+    while (n + 1 < sizeof line) {
+        if (poll(&pf, 1, SHELL_REPLY_MS + 5000) <= 0) break;
+        sr_ssize r = sr_recv(fd, line + n, 1);
+        if (r <= 0) break;
+        if (line[n] == '\n') break;
+        n++;
+    }
+    line[n] = '\0';
+    if (strcmp(line, "ok") == 0) return 0;
+    if (strncmp(line, "data ", 5) == 0) {
+        char *end = NULL;
+        *size = strtol(line + 5, &end, 10);
+        if (end && *end == ' ' && *size >= 0) { snprintf(mime, mime_cap, "%s", end + 1); return 1; }
+    }
+    snprintf(err, err_cap, "%s", strncmp(line, "error: ", 7) == 0 ? line + 7 : (n ? line : "no answer from the bridge daemon"));
+    return -1;
 }

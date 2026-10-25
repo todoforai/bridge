@@ -148,8 +148,7 @@ No new protocol messages, no in-binary HTTP client, no extra dependencies.
 ## Shell helpers (`tfa-cat`, `tail`, `adb`)
 
 Small tools the agent uses inside its bash, built into the bridge binary — no
-npm/pip install, always the bridge's version. Linux, macOS and Windows
-(`adb` interception: Linux/macOS only).
+npm/pip install, always the bridge's version. Linux, macOS and Windows.
 
 They don't call the API themselves: they hand bytes to the running bridge
 daemon over loopback (`127.0.0.1:$TODOFORAI_BRIDGE_PORT`, an ephemeral port
@@ -172,9 +171,22 @@ curl -s "$URL" | tfa-cat        # stdin works (type sniffed by magic bytes)
 ssh host cat /tmp/x.png | tfa-cat   # remote file: run tfa-cat locally
 tfa-cat notes.md                # text prints exactly like cat
 tfa-cat shot.png > copy.png     # stdout redirected/piped → raw bytes, like cat
+tfa-cat skill:pdf               # a skill on this machine (…/skills/pdf/SKILL.md)
+tfa-cat skill:pdf/forms.md      # another file of that skill
+tfa-cat todoforai:todos/<todoId>/plan.md        # a TODOforAI file
+tfa-cat todoforai:todos/<todoId>/photo.jpg > photo.jpg   # …downloaded
+tfa-cat todoforai:todos/<todoId>              # a folder → its listing
 ```
 
-- Formats: PNG, JPEG, GIF, WebP, PDF (≤ 20 MB per command).
+- Formats: PNG, JPEG, GIF, WebP, PDF (≤ 20 MB per command; an image ≤ 3.5 MB,
+  the model APIs' limit — downscale bigger ones).
+- `skill:<name>` looks in `.agents/skills` and `.claude/skills` of the cwd,
+  its parents, then `$HOME` — local only, no network.
+- `todoforai:<path>` is resolved by the backend with the RUN's user and the
+  todo's project (what the agent's `read` sees). On the agent's terminal an
+  image/PDF is attached by the backend directly (no bytes travel to the
+  device); anything else — or anything piped/redirected — is streamed down
+  (`shell:open {kind:"fetch"}` → `shell:ready` + `shell:data` → `shell:close`).
 - Media goes only to a terminal stdout inside an agent RUN
   (`TODOFORAI_BLOCK_ID` set): it's attached to the running bash block, and
   the backend hands it to the agent with that command's result. Prints

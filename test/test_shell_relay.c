@@ -29,6 +29,12 @@ static int connected = 1, busy = 0;
 static long reply_after_end = -1;  // streamId to auto-CLOSE on END
 static const char *reply_err;
 static shell_relay_t R;
+// Fake backend for `fetch`: answers the next fetch OPEN with this body
+// (fetch_attach: CLOSE ok without a body; fetch_err: CLOSE with error).
+static long fetch_id = -1;
+static const char *fetch_body, *fetch_err;
+static size_t fetch_len;
+static int fetch_attach;
 
 static int fake_send(void *ctx, const char *json, size_t len) {
     (void)ctx;
@@ -37,6 +43,11 @@ static int fake_send(void *ctx, const char *json, size_t len) {
     memcpy(frames + frames_len, json, len); frames_len += len;
     frames[frames_len++] = '\n';
     frames[frames_len] = 0;
+    if (strstr(json, "\"shell:open\"") && strstr(json, "\"kind\":\"fetch\"")) {
+        const char *p = NULL; size_t pl = 0;
+        json_get_obj(json, len, "payload", &p, &pl);
+        json_get_long(p, pl, "streamId", &fetch_id);
+    }
     if (strstr(json, "\"shell:end\"") && !strstr(json, "\"abort\"")) {
         long id = 0; const char *p = NULL; size_t pl = 0;
         json_get_obj(json, len, "payload", &p, &pl);
@@ -59,6 +70,26 @@ static void pump(int ms) {
             ? snprintf(c, sizeof c, "{\"streamId\":%ld,\"error\":\"%s\"}", reply_after_end, reply_err)
             : snprintf(c, sizeof c, "{\"streamId\":%ld}", reply_after_end);
         reply_after_end = -1;
+        shell_relay_on_close(&R, c, (size_t)cn);
+    }
+    if (fetch_id > 0) {
+        long id = fetch_id; fetch_id = -1;
+        static char c[SHELL_DATA_CHUNK * 2 + 128];
+        int cn;
+        if (fetch_err) cn = snprintf(c, sizeof c, "{\"streamId\":%ld,\"error\":\"%s\"}", id, fetch_err);
+        else if (fetch_attach) cn = snprintf(c, sizeof c, "{\"streamId\":%ld}", id);
+        else {
+            cn = snprintf(c, sizeof c, "{\"streamId\":%ld,\"size\":%zu,\"mime\":\"text/plain\"}", id, fetch_len);
+            shell_relay_on_ready(&R, c, (size_t)cn);
+            for (size_t off = 0; off < fetch_len; off += SHELL_DATA_CHUNK) {
+                size_t n = fetch_len - off < SHELL_DATA_CHUNK ? fetch_len - off : SHELL_DATA_CHUNK;
+                int h = snprintf(c, sizeof c, "{\"streamId\":%ld,\"b64\":\"", id);
+                size_t bl = b64_encode((const uint8_t *)fetch_body + off, n, c + h, sizeof c - (size_t)h - 4);
+                memcpy(c + h + bl, "\"}", 3);
+                shell_relay_on_data(&R, c, (size_t)h + bl + 2);
+            }
+            cn = snprintf(c, sizeof c, "{\"streamId\":%ld}", id);
+        }
         shell_relay_on_close(&R, c, (size_t)cn);
     }
     shell_relay_tick(&R);
@@ -114,7 +145,10 @@ static size_t decoded(char *dst, size_t cap) {
     return o;
 }
 
-static void reset(void) { frames_len = 0; frames[0] = 0; reply_err = NULL; connected = 1; busy = 0; }
+static void reset(void) {
+    frames_len = 0; frames[0] = 0; reply_err = NULL; connected = 1; busy = 0;
+    fetch_body = fetch_err = NULL; fetch_len = 0; fetch_attach = 0;
+}
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
@@ -127,7 +161,10 @@ int main(void) {
     assert(system("mkdir -p build/sr && cd build/sr && ln -sf ../todoforai-bridge tfa-cat"
                   " && printf '\\211PNG\\r\\n\\032\\n0123456789' > a.png && printf 'hello\\n' > t.txt"
                   " && head -c 3000000 /dev/urandom > big.bin && (printf '%%PDF-1.4\\n'; cat big.bin) > big.pdf"
-                  " && (printf '%%PDF-1.4\\n'; head -c 21000000 /dev/zero) > huge.pdf") == 0);
+                  " && (printf '%%PDF-1.4\\n'; head -c 21000000 /dev/zero) > huge.pdf"
+                  " && (printf '\\211PNG\\r\\n\\032\\n'; head -c 3600000 /dev/zero) > big.png"
+                  " && mkdir -p repo/sub .claude/skills/demo && printf 'skill body\\n' > .claude/skills/demo/SKILL.md"
+                  " && printf 'ref\\n' > .claude/skills/demo/ref.md") == 0);
 
     // 1. PNG on a TTY → open/data/end, ok, silent, rc 0.
     reset();
@@ -239,6 +276,42 @@ int main(void) {
       assert(shell_relay_stream_count(&R) == 0);
       close(c); }
     printf("ok 11 header deadline\n");
+
+    // 12. Image over the model's cap → refused locally, nothing sent.
+    reset();
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat build/sr/big.png; echo rc=$?", env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "downscale") && strstr(out, "rc=1") && frames_len == 0);
+    printf("ok 12 image cap\n");
+
+    // 13. skill:<name>[/file] from cwd's parents; unknown skill explains.
+    reset();
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-cat skill:demo skill:demo/ref.md; %s ../../tfa-cat skill:nope; echo rc=$?", env, env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "skill body\nref\n") && strstr(out, "no such skill") && strstr(out, "rc=1") && frames_len == 0);
+    printf("ok 13 skill refs\n");
+
+    // 14. fetch: body streamed (3MB, backpressure through a pipe), exact bytes.
+    reset();
+    { static char body[3 << 20]; for (size_t i = 0; i < sizeof body; i++) body[i] = (char)('a' + i % 26);
+      fetch_body = body; fetch_len = sizeof body;
+      FILE *w = fopen("build/sr/want.txt", "wb"); fwrite(body, 1, sizeof body, w); fclose(w); }
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/x.txt | (sleep 0.3; cat) > build/sr/got.txt; cmp build/sr/want.txt build/sr/got.txt && echo same", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "same"));
+    assert(strstr(frames, "\"kind\":\"fetch\"") && strstr(frames, "\"ref\":\"todoforai:todos/T1/x.txt\"") && !strstr(frames, "\"tty\""));
+    printf("ok 14 fetch streamed\n");
+
+    // 15. fetch on a TTY: attached by the backend (silent, rc 0); error surfaced.
+    reset(); fetch_attach = 1;
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/p.png; echo rc=$?", env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "rc=0") && strstr(frames, "\"tty\":true"));
+    reset(); fetch_err = "No such resource";
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "No such resource") && strstr(out, "rc=1"));
+    printf("ok 15 fetch attach/error\n");
+    assert(shell_relay_stream_count(&R) == 0);
 
     shell_relay_close_all(&R);
     printf("all ok\n");

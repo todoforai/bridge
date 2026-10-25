@@ -17,6 +17,8 @@
 
 #ifdef _WIN32
 #  include <io.h>
+#  include <direct.h>   // _getcwd
+#  include <sys/stat.h>
 #  include <windows.h>
 #  define sh_read(fd, b, n)  _read(fd, b, (unsigned)(n))
 #  define sh_write(fd, b, n) _write(fd, b, (unsigned)(n))
@@ -74,7 +76,7 @@ int cmd_live(int argc, char **argv) {
     (void)argc; (void)argv;
     stdio_binary();
     char err[256];
-    ws_fd_t s = getenv("TODOFORAI_MESSAGE_ID") ? shell_client_open("live", NULL, NULL, -1, err, sizeof err) : WS_INVALID_FD;
+    ws_fd_t s = getenv("TODOFORAI_MESSAGE_ID") ? shell_client_open("live", NULL, NULL, -1, NULL, 0, err, sizeof err) : WS_INVALID_FD;
     static char in[16 * 1024];
     int out_ok = 1;
     for (;;) {
@@ -96,6 +98,7 @@ int cmd_live(int argc, char **argv) {
 // with this bash call's result. Text, and redirected/piped stdout, is plain cat.
 
 #define CAT_MAX_BYTES (20L * 1024 * 1024)   // backend per-command cap
+#define CAT_MAX_IMAGE 3500000L              // agent MAX_MEDIA_IMAGE_BYTES (LLM API limit)
 
 static const char *cat_sniff(const unsigned char *b, size_t n, const char **ext) {
     if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) { *ext = "png"; return "image/png"; }
@@ -163,8 +166,12 @@ static const char *cat_upload(int fd, const unsigned char *head, size_t hn,
             fail = err; break;
         }
     }
+    if (!fail && !strncmp(mime, "image/", 6) && (long)total > CAT_MAX_IMAGE) {
+        snprintf(err, errcap, "image over %ld bytes — downscale it first (e.g. `convert in.png -resize 1568x1568\\> out.png`)", CAT_MAX_IMAGE);
+        fail = err;
+    }
     if (!fail) {
-        ws_fd_t s = shell_client_open("attach", name, mime, (long)total, err, errcap);
+        ws_fd_t s = shell_client_open("attach", name, mime, (long)total, NULL, 0, err, errcap);
         if (s == WS_INVALID_FD) fail = err;
         else if (shell_client_send(s, buf, total)) { shell_client_close(s); fail = "bridge daemon hung up"; }
         else fail = shell_client_finish(s, SHELL_REPLY_MS + 5000, err, errcap);
@@ -173,9 +180,92 @@ static const char *cat_upload(int fd, const unsigned char *head, size_t hn,
     return fail;
 }
 
+// ── refs: `skill:<name>[/file]` (this machine), `todoforai:…` (the backend) ──
+
+// A regular file (stat, not open: a FIFO must not block the lookup).
+static int file_exists(const char *p) {
+#ifdef _WIN32
+    struct _stat st;
+    return _stat(p, &st) == 0 && (st.st_mode & _S_IFREG);
+#else
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+// skill:<name>[/<file>] → <root>/{.agents,.claude}/skills/<name>/<file|SKILL.md>,
+// roots = cwd and its parents, then $HOME — the agent's discovery order
+// (repo first). 0 found, -1 not found / bad name.
+static int skill_path(const char *spec, char *out, size_t cap) {
+    if (!*spec || strstr(spec, "..") || spec[0] == '/' || spec[0] == '\\') return -1;
+    char rel[512];
+    const char *slash = strchr(spec, '/');
+    if (snprintf(rel, sizeof rel, slash ? "%s" : "%s/SKILL.md", spec) >= (int)sizeof rel) return -1;
+    static const char *const dirs[] = { ".agents", ".claude" };
+    char dir[4096];
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (!_getcwd(dir, sizeof dir)) dir[0] = '\0';
+    if (!home || !*home) home = getenv("USERPROFILE");
+#else
+    if (!getcwd(dir, sizeof dir)) dir[0] = '\0';
+#endif
+    while (dir[0]) {   // cwd, its parents, then the root itself ("" + "/…")
+        for (int i = 0; i < 2; i++)
+            if (snprintf(out, cap, "%s/%s/skills/%s", dir, dirs[i], rel) < (int)cap && file_exists(out)) return 0;
+        char *cut = NULL;
+        for (char *c = dir; *c; c++) if (*c == '/' || *c == '\\') cut = c;
+        if (!cut) break;
+        if (cut[1] == '\0') break;   // was "/" or "C:\" — done
+        cut[cut == dir || (cut == dir + 2 && dir[1] == ':') ? 1 : 0] = '\0';   // keep the root's slash
+    }
+    for (int i = 0; i < 2 && home && *home; i++)
+        if (snprintf(out, cap, "%s/%s/skills/%s", home, dirs[i], rel) < (int)cap && file_exists(out)) return 0;
+    return -1;
+}
+
+// A backend resource, as the agent's `read` sees it. On the agent's terminal
+// an image/PDF is attached by the backend directly (no bytes come here);
+// anything else — and everything when piped — is printed like a file.
+static int cat_ref(const char *ref, int attach, int tty) {
+    if (!attach) { fprintf(stderr, "tfa-cat: %s: refs need an agent shell (TODOFORAI_BLOCK_ID unset)\n", ref); return 1; }
+    char err[512], mime[128];
+    ws_fd_t s = shell_client_open("fetch", NULL, NULL, -1, ref, tty, err, sizeof err);
+    if (s == WS_INVALID_FD) { fprintf(stderr, "tfa-cat: %s: %s\n", ref, err); return 1; }
+    long size = 0;
+    int r = shell_client_fetch_head(s, &size, mime, sizeof mime, err, sizeof err);
+    if (r <= 0) {
+        shell_client_close(s);
+        if (r < 0) { fprintf(stderr, "tfa-cat: %s: %s\n", ref, err); return 1; }
+        return 0;   // attached
+    }
+    static char buf[64 * 1024];
+    long got = 0;
+    int rc = 0;
+    while (got < size) {
+        long n = shell_client_recv(s, buf, sizeof buf);
+        if (n <= 0) break;
+        got += n;
+        if (write_all(1, buf, (size_t)n) < 0) { rc = 141; break; }
+    }
+    shell_client_close(s);
+    if (!rc && got != size) { fprintf(stderr, "tfa-cat: %s: transfer broke (%ld of %ld bytes)\n", ref, got, size); rc = 1; }
+    return rc;
+}
+
 // One input. 0 ok, 1 error (already reported), 141 stdout gone.
 static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
     int is_stdin = strcmp(arg, "-") == 0;
+    char skill[4096];
+    if (!is_stdin && strncmp(arg, "skill:", 6) == 0) {
+        if (skill_path(arg + 6, skill, sizeof skill) != 0) {
+            fprintf(stderr, "tfa-cat: %s: no such skill on this machine (looked in .agents/skills and .claude/skills of the cwd, its parents and home)\n", arg);
+            return 1;
+        }
+        arg = skill;
+    } else if (!is_stdin && strncmp(arg, "todoforai:", 10) == 0 && !file_exists(arg)) {
+        return cat_ref(arg, attach, tty);
+    }
     int fd = is_stdin ? 0 : sh_open(arg);
     if (fd < 0) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); return 1; }
     unsigned char head[16];
@@ -212,9 +302,12 @@ int cmd_cat(int argc, char **argv) {
         printf("tfa-cat %s\n", BRIDGE_VERSION); return 0;
     }
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
-        printf("Usage: tfa-cat [FILE]...   (no FILE or - = stdin)\n"
+        printf("Usage: tfa-cat [FILE|REF]...   (no FILE or - = stdin)\n"
                "cat, but images/PDFs printed to an agent's terminal are attached to the bash call,\n"
-               "so the model sees them. Redirected/piped output is raw bytes, exactly like cat.\n");
+               "so the model sees them. Redirected/piped output is raw bytes, exactly like cat.\n"
+               "  skill:<name>[/<file>]   a skill on this machine (SKILL.md by default)\n"
+               "  todoforai:<path>        a TODOforAI file, e.g. todoforai:todos/<todoId>/<name>\n"
+               "                          (a folder prints its listing)\n");
         return 0;
     }
     stdio_binary();
