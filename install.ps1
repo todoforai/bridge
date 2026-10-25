@@ -209,7 +209,7 @@ if ($Service) {
         $action   = New-ScheduledTaskAction   -Execute $Bridge
         $trigger  = New-ScheduledTaskTrigger  -AtLogOn
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                        -StartWhenAvailable -RestartInterval (New-TimeSpan -Seconds 5) -RestartCount 9999 `
+                        -StartWhenAvailable -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 9999 `
                         -ExecutionTimeLimit ([TimeSpan]::Zero)
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
             -Settings $settings -Force | Out-Null
