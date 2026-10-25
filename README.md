@@ -219,9 +219,9 @@ locations and reading `SKILL.md` files. Both `.agents/skills` and
 Discovery rules (`agent/src/agents/skills_info.jl`):
 
 - Priority order: repo `.agents` → repo `.claude` → user; skills are deduped by
-  `name`, first match wins. Built-in skills (`agent/builtin-skills/`) are served by the
-  agent itself as `todoforai:skills/<name>/SKILL.md`; nothing is installed on the device,
-  and a device skill with the same name wins.
+  `name`, first match wins. Built-in skills (`packages/shared-fbe/builtin-skills/`) are
+  `todoforai:skills/<name>/SKILL.md` (agent `read` and the backend, so `tfa-cat` too);
+  nothing is installed on the device, and a device skill with the same name wins.
 - Walk depth: `find -maxdepth 6`; hidden entries (`.*`) are pruned.
 - Only files literally named `SKILL.md` are accepted.
 - Only the first 8 KiB of each file is read for metadata.
