@@ -134,13 +134,18 @@ static sh_ssize cat_head(int fd, unsigned char *p, size_t cap) {
     return (sh_ssize)got;
 }
 
-// Rest of `fd` after `head` → out. 0 ok, -1 read error, -2 write error.
-static int cat_copy(int fd, int out, const unsigned char *head, size_t hn) {
-    if (hn && write_all(out, head, hn) < 0) return -2;
+// Rest of `fd` after `head` → out. 0 ok, -1 read error, -2 write error,
+// -3 binary (`check_bin` and a NUL in the first block; nothing written).
+static int cat_copy(int fd, int out, const unsigned char *head, size_t hn, int check_bin) {
+    if (check_bin && hn && memchr(head, 0, hn)) return -3;
     static char buf[64 * 1024];
-    for (;;) {
+    for (int first = 1;; first = 0) {
         sh_ssize r = sh_read(fd, buf, sizeof buf);
         if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (first) {
+            if (check_bin && r > 0 && memchr(buf, 0, (size_t)r)) return -3;
+            if (hn && write_all(out, head, hn) < 0) return -2;
+        }
         if (r == 0) return 0;
         if (write_all(out, buf, (size_t)r) < 0) return -2;
     }
@@ -299,9 +304,14 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
             : cat_upload(fd, head, (size_t)hn, name, mime, err, sizeof err);
         if (e) { fprintf(stderr, "tfa-cat: %s: not attached: %s\n", arg, e); rc = 1; }
     } else {
-        int r = cat_copy(fd, 1, head, hn > 0 ? (size_t)hn : 0);
+        // Binary on the agent's terminal is noise (see cat_ref); piped → bytes.
+        int r = cat_copy(fd, 1, head, hn > 0 ? (size_t)hn : 0, tty);
         if (r == -1) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); rc = 1; }
         else if (r == -2) rc = 141;
+        else if (r == -3) {
+            fprintf(stderr, "tfa-cat: %s: binary, not printed (use a tool that reads it, or pipe/redirect for the raw bytes)\n", arg);
+            rc = 1;
+        }
     }
     if (!is_stdin) sh_close(fd);
     return rc;
