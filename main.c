@@ -4215,7 +4215,7 @@ int bridge_main(int argc, char **argv) {
         long holder = device_lock_owner_pid(saved_creds.device_id);
         fprintf(stderr,
             "error: another todoforai-bridge is already running for device %.8s… (%s, profile %s).\n",
-            saved_creds.device_id, saved_creds.device_name, profile ? profile : "default");
+            saved_creds.device_id, saved_creds.device_name, login_get_profile());
         if (holder > 1) {
 #ifdef _WIN32
             fprintf(stderr, "       It is pid %ld — stop it (Task Manager, or\n"
@@ -4419,14 +4419,16 @@ int bridge_main(int argc, char **argv) {
             }
             if (!relogin_hint_shown) {
                 relogin_hint_shown = 1;
-                // Name the active profile: a bare `logout` would clear the
-                // prod default even when this daemon runs on "dev".
+                // Name the active profile + resolved host on both commands: a
+                // bare `logout` clears the prod default, and a bare `login`
+                // re-derives the profile from the host.
                 const char *pf = login_get_profile();
                 fprintf(stderr,
                     "Device credentials rejected by server — keeping local credentials and retrying.\n"
-                    "If this persists, run `todoforai-bridge logout --profile %s && todoforai-bridge login%s%s`\n"
-                    "in another terminal; this daemon will pick up the new credentials automatically.\n",
-                    pf, login_is_local_host(host) ? " --host " : "", login_is_local_host(host) ? host : "");
+                    "If this persists, run in another terminal:\n"
+                    "  todoforai-bridge logout --profile %s && todoforai-bridge login --profile %s --host %s\n"
+                    "this daemon will pick up the new credentials automatically.\n",
+                    pf, pf, host);
             }
         }
 
