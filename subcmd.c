@@ -473,6 +473,22 @@ static int probe_refused(uint16_t port) {
     return refused;
 }
 
+#ifndef _WIN32
+#  include <sys/stat.h>
+#  ifdef __APPLE__
+#    include <mach-o/dyld.h>
+#  endif
+// stat() of the running executable (follows to the inode, so hard links match).
+static int self_exe_stat(struct stat *st) {
+#  ifdef __APPLE__
+    char buf[4096]; uint32_t sz = sizeof buf;
+    return _NSGetExecutablePath(buf, &sz) == 0 ? stat(buf, st) : -1;
+#  else
+    return stat("/proc/self/exe", st);
+#  endif
+}
+#endif
+
 // Hand off to the real adb. POSIX: exec (inherits stdio, exit code is adb's).
 // Windows has no exec: spawn with quoted args, wait, forward the exit code.
 static int run_adb(char **av) {
@@ -506,22 +522,21 @@ static int run_adb(char **av) {
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return (int)code;
 #else
-    // PATH lookup that skips links to this binary (~/.todoforai/tools/bin/adb):
-    // a real adb resolves to a file still named `adb`.
-    const char *path = getenv("PATH"), *home = getenv("HOME");
-    char ours[1024] = "", dir[1024], cand[1100], real[4096];
-    if (home) snprintf(ours, sizeof ours, "%s/.todoforai/tools/bin", home);
-    for (const char *p = path ? path : ""; *p; ) {
-        const char *e = strchr(p, ':'); size_t n = e ? (size_t)(e - p) : strlen(p);
-        if (n && n < sizeof dir) {
-            memcpy(dir, p, n); dir[n] = '\0';
-            while (n > 1 && dir[n - 1] == '/') dir[--n] = '\0';
-            snprintf(cand, sizeof cand, "%s/adb", dir);
-            const char *b;
-            if (strcmp(dir, ours) != 0 && access(cand, X_OK) == 0 && realpath(cand, real)
-                && (b = strrchr(real, '/')) && strcmp(b + 1, "adb") == 0) { execv(cand, av); break; }
-        }
-        p += n; if (*p == ':') p++;
+    // PATH lookup (empty entry = cwd) that skips this very file — our
+    // ~/.todoforai/tools/bin/adb link, or any other link/hard link to it.
+    struct stat self, st;
+    int have_self = self_exe_stat(&self) == 0;
+    const char *path = getenv("PATH");
+    char cand[4200];
+    for (const char *p = path ? path : ""; ; ) {
+        const char *e = strchr(p, ':');
+        int n = e ? (int)(e - p) : (int)strlen(p);
+        if (snprintf(cand, sizeof cand, "%.*s/adb", n ? n : 1, n ? p : ".") < (int)sizeof cand
+            && stat(cand, &st) == 0 && S_ISREG(st.st_mode) && access(cand, X_OK) == 0
+            && !(have_self && st.st_dev == self.st_dev && st.st_ino == self.st_ino))
+            execv(cand, av);   // returns only on failure → try the next entry
+        if (!e) break;
+        p = e + 1;
     }
     fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
     return 127;
@@ -533,11 +548,8 @@ int cmd_adb(int argc, char **argv) {
     // a phone; everything else is the real adb, untouched.
     const char *verb = argc >= 2 ? argv[1] : "";
     if (strcmp(verb, "connect") && strcmp(verb, "pair") && strcmp(verb, "disconnect")) {
-        char *pass[64]; int pn = 0;
-        pass[pn++] = "adb";
-        for (int i = 1; i < argc && pn < 63; i++) pass[pn++] = argv[i];
-        pass[pn] = NULL;
-        return run_adb(pass);
+        argv[0] = "adb";   // argv is NULL-terminated (main's, or main's + 1)
+        return run_adb(argv);
     }
     char *target = argc >= 3 ? argv[2] : NULL;
     char *exec_argv[64];

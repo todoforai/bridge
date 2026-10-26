@@ -4274,8 +4274,8 @@ int bridge_main(int argc, char **argv) {
     fprintf(stderr, "Connecting to %s:%u (device: %.8s…, bridge %s) ...\n",
             host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
 #ifndef _WIN32
-    bridge_link_tool(bridge_jobs_self_path(), "tfa-cat");   // on PATH for every RUN
-    bridge_link_tool(bridge_jobs_self_path(), "adb");       // phones by name; else the real adb
+    bridge_link_tool(bridge_jobs_self_path(), "tfa-cat", 1);   // on PATH for every RUN
+    bridge_link_tool(bridge_jobs_self_path(), "adb", 0);       // phones by name; else the real adb
 #endif
     bridge_policy_load();
     if (g_policy.active && g_policy.broken)

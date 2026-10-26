@@ -343,7 +343,7 @@ int cmd_cat(int argc, char **argv) {
 }
 
 #ifndef _WIN32
-void bridge_link_tool(const char *self, const char *name) {
+void bridge_link_tool(const char *self, const char *name, int replace_foreign) {
     char real[1024];
     if (!self || !*self) return;
     if (strcmp(self, "/proc/self/exe") == 0) {
@@ -366,6 +366,9 @@ void bridge_link_tool(const char *self, const char *name) {
     snprintf(link, sizeof link, "%s/%s", dir, name);
     ssize_t cn = readlink(link, cur, sizeof cur - 1);
     if (cn > 0) { cur[cn] = '\0'; if (strcmp(cur, self) == 0) return; }
+    // Replace only our own link (a bridge binary) or nothing — never a real
+    // tool someone put here (e.g. platform-tools' adb).
+    if (!replace_foreign && (cn > 0 ? !strstr(cur, "bridge") : access(link, F_OK) == 0)) return;
     char p1[1024]; snprintf(p1, sizeof p1, "%s/.todoforai", home); mkdir(p1, 0755);
     snprintf(p1, sizeof p1, "%s/.todoforai/tools", home); mkdir(p1, 0755);
     mkdir(dir, 0755);

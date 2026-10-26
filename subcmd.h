@@ -27,8 +27,9 @@ int  cmd_live(int argc, char **argv);
 // the tfa-cat() shell function → `<bridge> __cat`.
 int  cmd_cat(int argc, char **argv);
 #ifndef _WIN32
-// (Re)point ~/.todoforai/tools/bin/<name> at this binary. Idempotent, best effort.
-void bridge_link_tool(const char *self, const char *name);
+// (Re)point ~/.todoforai/tools/bin/<name> at this binary. Idempotent, best
+// effort. replace_foreign=0 leaves a file or non-bridge link there alone.
+void bridge_link_tool(const char *self, const char *name, int replace_foreign);
 #endif
 void print_help(void);
 
