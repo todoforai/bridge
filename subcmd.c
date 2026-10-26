@@ -506,20 +506,20 @@ static int run_adb(char **av) {
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return (int)code;
 #else
-    // PATH lookup that skips ~/.todoforai/tools/bin/adb (→ this binary): a
-    // real adb is a file whose resolved name is still `adb`.
-    const char *path = getenv("PATH");
-    char dir[1024], cand[1100], real[4096];
+    // PATH lookup that skips links to this binary (~/.todoforai/tools/bin/adb):
+    // a real adb resolves to a file still named `adb`.
+    const char *path = getenv("PATH"), *home = getenv("HOME");
+    char ours[1024] = "", dir[1024], cand[1100], real[4096];
+    if (home) snprintf(ours, sizeof ours, "%s/.todoforai/tools/bin", home);
     for (const char *p = path ? path : ""; *p; ) {
         const char *e = strchr(p, ':'); size_t n = e ? (size_t)(e - p) : strlen(p);
         if (n && n < sizeof dir) {
             memcpy(dir, p, n); dir[n] = '\0';
+            while (n > 1 && dir[n - 1] == '/') dir[--n] = '\0';
             snprintf(cand, sizeof cand, "%s/adb", dir);
             const char *b;
-            if (access(cand, X_OK) == 0 && realpath(cand, real) && (b = strrchr(real, '/')) && strcmp(b + 1, "adb") == 0) {
-                execv(cand, av);
-                break;
-            }
+            if (strcmp(dir, ours) != 0 && access(cand, X_OK) == 0 && realpath(cand, real)
+                && (b = strrchr(real, '/')) && strcmp(b + 1, "adb") == 0) { execv(cand, av); break; }
         }
         p += n; if (*p == ':') p++;
     }
