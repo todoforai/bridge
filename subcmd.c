@@ -367,8 +367,10 @@ void print_help(void) {
 }
 
 // ---------------------------------------------------------------------------
-// `__adb connect|pair|disconnect <phone>[:port] [args…]` — target of the
-// adb() shell shim the daemon prepends to every RUN (ADB_SHIM_FMT, main.c).
+// `adb connect|pair|disconnect <phone>[:port] [args…]` — POSIX: argv[0]
+// dispatch via the ~/.todoforai/tools/bin/adb symlink (on every RUN's PATH, so
+// it works under timeout, scripts, subprocesses); Windows: the adb() shell
+// function → `<bridge> __adb`.
 // Asks the daemon's loopback server (GET /adb?phone=&port=) for the relay
 // port and execs the real adb against 127.0.0.1:<port>. Anything that
 // already looks like host:port (digits/dots/colons only) is passed through
@@ -504,16 +506,39 @@ static int run_adb(char **av) {
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return (int)code;
 #else
-    execvp("adb", av);
+    // PATH lookup that skips ~/.todoforai/tools/bin/adb (→ this binary): a
+    // real adb is a file whose resolved name is still `adb`.
+    const char *path = getenv("PATH");
+    char dir[1024], cand[1100], real[4096];
+    for (const char *p = path ? path : ""; *p; ) {
+        const char *e = strchr(p, ':'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && n < sizeof dir) {
+            memcpy(dir, p, n); dir[n] = '\0';
+            snprintf(cand, sizeof cand, "%s/adb", dir);
+            const char *b;
+            if (access(cand, X_OK) == 0 && realpath(cand, real) && (b = strrchr(real, '/')) && strcmp(b + 1, "adb") == 0) {
+                execv(cand, av);
+                break;
+            }
+        }
+        p += n; if (*p == ':') p++;
+    }
     fprintf(stderr, "adb: not found in PATH (install Android platform-tools)\n");
     return 127;
 #endif
 }
 
 int cmd_adb(int argc, char **argv) {
-    // argv: [__adb, verb, target, rest…]
-    if (argc < 2) { fprintf(stderr, "usage: adb connect|pair|disconnect <phone>\n"); return 2; }
-    const char *verb = argv[1];
+    // argv: [adb|__adb, verb, target, rest…]. Only the addressing verbs can name
+    // a phone; everything else is the real adb, untouched.
+    const char *verb = argc >= 2 ? argv[1] : "";
+    if (strcmp(verb, "connect") && strcmp(verb, "pair") && strcmp(verb, "disconnect")) {
+        char *pass[64]; int pn = 0;
+        pass[pn++] = "adb";
+        for (int i = 1; i < argc && pn < 63; i++) pass[pn++] = argv[i];
+        pass[pn] = NULL;
+        return run_adb(pass);
+    }
     char *target = argc >= 3 ? argv[2] : NULL;
     char *exec_argv[64];
     int ea = 0;

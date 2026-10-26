@@ -546,12 +546,12 @@ static int output_tail_is_prompt(const session_t *s) {
     "if [ \"$__n\" = arg ]; then case $__a in [0-9]*) __n=1 ;; *) __n=; break ;; esac; continue; fi; " \
     "case $__a in -n|-c) __n=arg ;; -[0-9]*|-n[0-9]*|-c[0-9]*|--lines=[0-9]*|--bytes=[0-9]*|-q|-v) ;; *) __n=; break ;; esac; done; fi; " \
     "if [ \"$__n\" = 1 ]; then '%s' __live | command tail \"$@\"; else command tail \"$@\"; fi; }; "
-// `adb connect "<phone>"` → the daemon's ADB relay (adb_relay.h). Only the
-// addressing verbs are intercepted; everything else is the real adb.
+// Windows only (POSIX: the adb symlink): `adb connect "<phone>"` → the
+// daemon's ADB relay (adb_relay.h); other verbs go to the real adb.
 #define ADB_SHIM_FMT "adb() { case \"$1\" in connect|pair|disconnect) '%s' __adb \"$@\" ;; *) command adb \"$@\" ;; esac; }; " \
     TAIL_SHIM_FMT
 #ifdef _WIN32
-// tfa-cat: POSIX gets a PATH symlink (bridge_link_tfa_cat); Windows has no
+// tfa-cat, adb: POSIX gets PATH symlinks (bridge_link_tool); Windows has no
 // symlinks for us, so a function (bash/busybox accept the hyphen).
 #  define DETACH_SHIM_FMT "nohup() { '%s' __detach \"$@\"; }; setsid() { nohup \"$@\"; }; " \
     "tfa-cat() { '%s' __cat \"$@\"; }; " ADB_SHIM_FMT
@@ -2698,7 +2698,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
 #ifdef _WIN32
                 int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q);
 #else
-                int dn = snprintf(dshim, sizeof dshim, ADB_SHIM_FMT, q, q);
+                int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif
                 if (dn < 0 || (size_t)dn >= sizeof dshim) dshim[0] = '\0';
             }
@@ -4042,6 +4042,7 @@ int bridge_main(int argc, char **argv) {
         const char *a0 = argc ? strrchr(argv[0], '/') : NULL;
         a0 = a0 ? a0 + 1 : (argc ? argv[0] : "");
         if (strcmp(a0, "tfa-cat") == 0) return cmd_cat(argc, argv);
+        if (strcmp(a0, "adb") == 0) return cmd_adb(argc, argv);
     }
 #endif
     // Resolve our own path while argv0 and the cwd are still trustworthy.
@@ -4273,7 +4274,8 @@ int bridge_main(int argc, char **argv) {
     fprintf(stderr, "Connecting to %s:%u (device: %.8s…, bridge %s) ...\n",
             host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
 #ifndef _WIN32
-    bridge_link_tfa_cat(bridge_jobs_self_path());   // on PATH for every RUN
+    bridge_link_tool(bridge_jobs_self_path(), "tfa-cat");   // on PATH for every RUN
+    bridge_link_tool(bridge_jobs_self_path(), "adb");       // phones by name; else the real adb
 #endif
     bridge_policy_load();
     if (g_policy.active && g_policy.broken)

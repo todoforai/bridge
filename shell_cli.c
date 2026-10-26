@@ -343,7 +343,7 @@ int cmd_cat(int argc, char **argv) {
 }
 
 #ifndef _WIN32
-void bridge_link_tfa_cat(const char *self) {
+void bridge_link_tool(const char *self, const char *name) {
     char real[1024];
     if (!self || !*self) return;
     if (strcmp(self, "/proc/self/exe") == 0) {
@@ -363,14 +363,14 @@ void bridge_link_tfa_cat(const char *self) {
     if (!home || !*home) return;
     char dir[1024], link[1100], tmp[1120], cur[1024];
     if (snprintf(dir, sizeof dir, "%s/.todoforai/tools/bin", home) >= (int)sizeof dir) return;
-    snprintf(link, sizeof link, "%s/tfa-cat", dir);
+    snprintf(link, sizeof link, "%s/%s", dir, name);
     ssize_t cn = readlink(link, cur, sizeof cur - 1);
     if (cn > 0) { cur[cn] = '\0'; if (strcmp(cur, self) == 0) return; }
     char p1[1024]; snprintf(p1, sizeof p1, "%s/.todoforai", home); mkdir(p1, 0755);
     snprintf(p1, sizeof p1, "%s/.todoforai/tools", home); mkdir(p1, 0755);
     mkdir(dir, 0755);
     // Replace atomically (an old link or a stale npm shim alike).
-    snprintf(tmp, sizeof tmp, "%s/.tfa-cat.%ld", dir, (long)getpid());
+    snprintf(tmp, sizeof tmp, "%s/.%s.%ld", dir, name, (long)getpid());
     unlink(tmp);
     if (symlink(self, tmp) == 0 && rename(tmp, link) != 0) unlink(tmp);
 }

@@ -202,8 +202,13 @@ tfa-cat todoforai:todos/<todoId>              # a folder → its listing
   wrapper tees the pipe through `<bridge> __live`, so the chat block shows
   lines as they come (display only — the tool result is still tail's). The
   daemon batches and rate-limits them; the pipe itself never waits.
-- `adb connect|pair|disconnect <phone>` → `<bridge> __adb` resolves a paired
-  phone through the device's ADB relay; other `adb` commands pass through.
+- `adb connect|pair|disconnect "<phone name>"` reaches one of the user's
+  phones through the backend's ADB relay (any network; adb's TLS end-to-end).
+  Linux/macOS: a symlink `~/.todoforai/tools/bin/adb` → the bridge (on PATH in
+  every RUN, so it also works under `timeout`, scripts and subprocesses);
+  every other `adb` command execs the real adb found later on PATH, and
+  `host:port` targets pass through. Windows: an `adb` shell function →
+  `<bridge> __adb`.
 
 ## Skills (`SKILL.md`)
 
