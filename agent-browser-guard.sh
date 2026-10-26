@@ -17,12 +17,28 @@ real=
 IFS=:
 for d in $PATH; do
   [ -n "$d" ] && [ "$d" != "$me" ] && [ -f "$d/agent-browser" ] && [ -x "$d/agent-browser" ] || continue
-  head -c 256 "$d/agent-browser" 2>/dev/null | grep -q TODOFORAI_AGENT_BROWSER_GUARD && continue
+  head -c 256 "$d/agent-browser" 2>/dev/null | grep -q TODOFORAI_AGENT_BROWSER_ && continue
   real=$d/agent-browser; break
 done
 unset IFS
 [ -n "$real" ] || { echo "agent-browser: not installed" >&2; exit 127; }
 die() { echo "agent-browser: $*" >&2; exit 2; }
+
+# Label TODOforAI CDP URLs (connect <url> / --cdp <url>) with the todo this shell runs for,
+# so the extension can show which todo drives a tab. The agent only ever sees the bare
+# `?token=` URL; the todo comes from the shell env, never from the prompt.
+# Only the `--cdp` value and args after `connect` are touched (never eval/fill payloads).
+case ${TODOFORAI_TODO_ID:-} in ''|*[!A-Za-z0-9._-]*) ;; *)
+  n=$#; i=0; prev=; conn=
+  while [ $i -lt $n ]; do
+    a=$1; shift; i=$((i + 1))
+    [ "$a" = connect ] && conn=1
+    if [ "$prev" = --cdp ] || [ -n "$conn" ]; then
+      case $a in *"/ws/v2/cdp?token="*) case $a in *todoId=*) ;; *) a="$a&todoId=$TODOFORAI_TODO_ID";; esac;; esac
+    fi
+    prev=$a; set -- "$@" "$a"
+  done;;
+esac
 
 # Global flags (agent-browser flags.rs); value flags consume the next word.
 sess=${AGENT_BROWSER_SESSION:-default}; cmd=; arg1=; flag_cdp=; other=; info=; all=; skip=
