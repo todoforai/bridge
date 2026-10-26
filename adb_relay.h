@@ -90,4 +90,15 @@ int adb_relay_stream_count(const adb_relay_t *r);
 // keeps `adb connect` working.
 void adb_relay_drop_streams(adb_relay_t *r);
 
+// The user's adb key (`adb:key` from the backend; one per user, shared by all
+// their computers, so a phone paired once trusts each of them). POSIX only.
+// Agent-shell adb runs its own server with HOME=adb_key_home() — its
+// .android/adbkey is this key — on ADB_KEY_SERVER_PORT (the machine's own adb
+// server and key stay untouched; that key is still offered as a vendor key).
+#define ADB_KEY_SERVER_PORT "5038"
+// "<home>/.todoforai/adb"; 0 on failure.
+int adb_key_home(char *buf, size_t cap);
+// Store `payload.pem` (PKCS#1 PEM) as adb_key_home()/.android/adbkey, 0600.
+void adb_key_store(const char *payload, size_t len);
+
 #endif

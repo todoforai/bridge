@@ -27,6 +27,8 @@ typedef int ar_ssize;
 #  include <netinet/tcp.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
+#  include <sys/stat.h>
+#  include <sys/wait.h>
 static int ar_close(int s) { return close(s); }
 static void ar_cloexec(int s) { fcntl(s, F_SETFD, FD_CLOEXEC); }
 static void ar_nonblock(int s) { int f = fcntl(s, F_GETFL, 0); if (f >= 0) fcntl(s, F_SETFL, f | O_NONBLOCK); }
@@ -308,3 +310,46 @@ void adb_relay_on_close(adb_relay_t *r, const char *payload, size_t len) {
     if (s->outq_len) { s->remote_closed = 1; return; }   // EOF after the queue drains
     stream_free(s);   // peer closed → local adb sees EOF
 }
+
+#ifndef _WIN32
+int adb_key_home(char *buf, size_t cap) {
+    const char *home = getenv("HOME");
+    return home && *home && snprintf(buf, cap, "%s/.todoforai/adb", home) < (int)cap;
+}
+
+void adb_key_store(const char *payload, size_t len) {
+    static char pem[4096], cur[4096];
+    size_t n = 0;
+    if (!json_get_str_decoded(payload, len, "pem", pem, sizeof pem, &n) || strncmp(pem, "-----BEGIN RSA PRIVATE KEY-----", 31) != 0) return;
+    char dir[1024], path[1100], tmp[1120];
+    if (!adb_key_home(dir, sizeof dir - 16)) return;
+    char *slash = strrchr(dir, '/'); *slash = '\0'; mkdir(dir, 0755); *slash = '/';   // ~/.todoforai
+    mkdir(dir, 0700); chmod(dir, 0700);
+    strcat(dir, "/.android"); mkdir(dir, 0700); chmod(dir, 0700);
+    snprintf(path, sizeof path, "%s/adbkey", dir);
+    FILE *f = fopen(path, "rb");
+    if (f) { size_t cn = fread(cur, 1, sizeof cur, f); fclose(f); if (cn == n && memcmp(cur, pem, n) == 0) return; }
+    snprintf(tmp, sizeof tmp, "%s/.adbkey.%ld", dir, (long)getpid());
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    int ok = write(fd, pem, n) == (ssize_t)n;
+    close(fd);
+    if (!ok || rename(tmp, path) != 0) { unlink(tmp); return; }
+    snprintf(path, sizeof path, "%s/adbkey.pub", dir); unlink(path);   // adb rewrites it from the key
+    // A running server keeps the key it started with: stop ours (port
+    // ADB_KEY_SERVER_PORT, never the machine's); the next adb call restarts it.
+    *strrchr(dir, '/') = '\0';
+    pid_t pid = fork();   // double fork: the grandchild is reaped by init, no zombie, no wait on adb
+    if (pid == 0 && fork() != 0) _exit(0);
+    if (pid == 0) {
+        setenv("HOME", dir, 1);
+        setenv("ANDROID_ADB_SERVER_PORT", ADB_KEY_SERVER_PORT, 1);
+        int nul = open("/dev/null", O_RDWR); if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+        execlp("adb", "adb", "kill-server", (char *)NULL);   // bridge PATH: the real adb (no tools/bin)
+        _exit(127);
+    }
+    if (pid > 0) waitpid(pid, NULL, 0);
+    fprintf(stderr, "adb: user key installed (%s)\n", dir);
+}
+#endif

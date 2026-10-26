@@ -876,7 +876,7 @@ static session_t *evict_lru_idle(edge_t *e) {
 static void debug_wire(const char *dir, long n, const char *s) {
     static const char *secret_keys[] = {
         "\"secret\"", "\"token\"", "\"apiToken\"", "\"apiKey\"", "\"sessionToken\"",
-        "\"authorization\"", "\"cookie\"", "\"set-cookie\"", "\"setCookie\"", "\"x-api-key\"",
+        "\"authorization\"", "\"cookie\"", "\"pem\"", "\"set-cookie\"", "\"setCookie\"", "\"x-api-key\"",
     };
     if (!getenv("BRIDGE_DEBUG_WIRE")) return;
     for (size_t i = 0; i < sizeof secret_keys / sizeof *secret_keys; i++)
@@ -3365,6 +3365,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         return 0;
     } else if (IS("cloud_ssh_offer") || IS("cloud_ssh_config")) {
         return handle_cloud_ssh(e, IS("cloud_ssh_offer"), msg, msg_len);
+    } else if (IS("adb:key")) {
+#ifndef _WIN32
+        const char *payload = NULL; size_t payload_len = 0;
+        if (json_get_obj(msg, msg_len, "payload", &payload, &payload_len)) adb_key_store(payload, payload_len);
+#endif   // Windows: not yet (its adb keeps the machine's own key)
+        return 0;
     } else if (IS("adb:data") || IS("adb:close")) {
         const char *payload = NULL; size_t payload_len = 0;
         if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len)) return 0;

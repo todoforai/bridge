@@ -379,6 +379,7 @@ void print_help(void) {
 #include "identity_server.h"  // IDENTITY_SERVER_PORT*
 #include "json.h"
 #include "ws.h"               // ws_tcp_connect (also WSAStartup on Windows)
+#include "adb_relay.h"        // adb_key_home, ADB_KEY_SERVER_PORT
 #ifdef _WIN32
 #  include <windows.h>
 #  include "tools.h"          // bridge_win_quote_arg
@@ -522,6 +523,22 @@ static int run_adb(char **av) {
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return (int)code;
 #else
+    // With the user's key stored: our own adb server whose HOME holds it (see
+    // adb_relay.h). The machine's key, if any, is offered too (old pairings).
+    // No USB there: the machine's own server keeps its USB devices. A caller
+    // that picks a server itself (ANDROID_ADB_SERVER_PORT=5037 adb …) gets it.
+    char khome[1024], kfile[1100], vend[1100];
+    if (!getenv("ANDROID_ADB_SERVER_PORT") && !getenv("ADB_SERVER_SOCKET")
+        && adb_key_home(khome, sizeof khome) && snprintf(kfile, sizeof kfile, "%s/.android/adbkey", khome) < (int)sizeof kfile
+        && access(kfile, R_OK) == 0) {
+        const char *h = getenv("HOME");
+        const char *uv = getenv("ADB_VENDOR_KEYS");
+        if (h && snprintf(vend, sizeof vend, "%s/.android/adbkey%s%s", h, uv && *uv ? ":" : "", uv && *uv ? uv : "") < (int)sizeof vend)
+            setenv("ADB_VENDOR_KEYS", vend, 1);   // a missing file is skipped by adb
+        setenv("HOME", khome, 1);
+        setenv("ANDROID_ADB_SERVER_PORT", ADB_KEY_SERVER_PORT, 1);
+        setenv("ADB_USB", "0", 1);
+    }
     // PATH lookup (empty entry = cwd) that skips this very file — our
     // ~/.todoforai/tools/bin/adb link, or any other link/hard link to it.
     struct stat self, st;
