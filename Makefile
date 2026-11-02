@@ -196,6 +196,12 @@ test-cdp-local: | build
 	    identity_server.c cdp_local.c file_server.c json.c ws.c policy.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
 	./build/test-cdp-local
 
+# E2E harness for browser-extension/test/local-cdp.e2e.ts (not run here).
+.PHONY: cdp-local-harness
+cdp-local-harness: | build
+	$(CC) -O1 -g -Wall -Wextra -iquote . -I$(CORE)/noise -o build/cdp-local-harness test/cdp_local_harness.c \
+	    identity_server.c cdp_local.c file_server.c json.c ws.c policy.c $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lpthread
+
 # Off-loop jobs: the loop keeps ticking while a slow worker runs; frame
 # reassembly, deadlines, slot cap and teardown reaping.
 .PHONY: test-jobs

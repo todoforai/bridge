@@ -67,6 +67,9 @@ void cdp_local_accept(ws_fd_t fd, int ext, const char *ws_key, const char *token
 void cdp_local_fill_pfds(struct pollfd *pfds, size_t *n, size_t cap);
 void cdp_local_service(const struct pollfd *pfds, size_t first, size_t n);
 void cdp_local_tick(void);   // deadlines; call every loop
+// One poll() of the identity listener + mux for `ms` while the main loop is
+// not running (backend reconnect backoff): local clients keep working.
+void cdp_local_idle_serve(ws_fd_t listen_fd, const char *device_id, int ms);
 void cdp_local_close_all(void);
 int  cdp_local_count(int ext);  // live extensions (ext=1) / clients (ext=0)
 

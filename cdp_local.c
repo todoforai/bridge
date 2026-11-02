@@ -3,15 +3,17 @@
 #define _DEFAULT_SOURCE
 
 #include "cdp_local.h"
+#include "identity_server.h"
 #include "json.h"
 #include "noise.h"   // noise_random
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #ifdef _WIN32
 #  include <ws2tcpip.h>
+#  define poll WSAPoll
+typedef ULONG cl_nfds;
 static int cl_close_fd(SOCKET s) { return closesocket(s); }
 typedef int cl_ssize;
 #  define cl_recv(fd, b, n) recv(fd, (char *)(b), (int)(n), 0)
@@ -20,8 +22,11 @@ static int cl_would_block(void) { return WSAGetLastError() == WSAEWOULDBLOCK; }
 static void cl_shut_wr(SOCKET s) { shutdown(s, SD_SEND); }
 #else
 #  include <errno.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
+typedef nfds_t cl_nfds;
 #  ifndef MSG_NOSIGNAL
 #    define MSG_NOSIGNAL 0
 #  endif
@@ -246,6 +251,19 @@ static void conn_drop(int i) {
     c->res = -1;
 }
 
+void cdp_local_idle_serve(ws_fd_t listen_fd, const char *device_id, int ms) {
+    struct pollfd pfds[CDPL_MAX_CONNS + 1];
+    size_t n = 0;
+    if (listen_fd != WS_INVALID_FD) { pfds[0].fd = listen_fd; pfds[0].events = POLLIN; pfds[0].revents = 0; n = 1; }
+    size_t first = n;
+    cdp_local_fill_pfds(pfds, &n, CDPL_MAX_CONNS + 1);
+    if (poll(pfds, (cl_nfds)n, ms) > 0) {
+        if (first && (pfds[0].revents & POLLIN)) bridge_identity_server_serve(listen_fd, device_id);
+        cdp_local_service(pfds, first, n - first);
+    }
+    cdp_local_tick();
+}
+
 void cdp_local_close_all(void) {
     init_once();
     for (int i = 0; i < CDPL_MAX_CONNS; i++) conn_drop(i);
@@ -326,6 +344,9 @@ void cdp_local_accept(ws_fd_t fd, int ext, const char *ws_key, const char *token
     if (!ext && r < 0) { http_close(fd, "404 Not Found"); return; }
     int i = slot();
     if (i < 0) { http_close(fd, "503 Service Unavailable"); return; }
+    // Request/response ping-pong of small frames: Nagle + delayed ACK would add ~40 ms to each.
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const void *)&one, sizeof one);
 
     char key[128]; uint8_t d[20]; char acc[32];
     snprintf(key, sizeof key, "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", ws_key);
@@ -461,7 +482,8 @@ static int parse(int i) {
         if (len == 126) { if (avail < 4) break; len = (uint64_t)p[2] << 8 | p[3]; hl = 4; }
         else if (len == 127) { if (avail < 10) break; len = 0; for (int k = 0; k < 8; k++) len = len << 8 | p[2 + k]; hl = 10; }
         if (!masked) { conn_close(i, 1002, "unmasked client frame"); return -1; }
-        if (len > CDPL_MAX_MSG) { conn_close(i, 1009, "message too big"); return -1; }
+        // Before auth only the ~200-byte `auth` line is legitimate: no 64 MB buffers for a squatter.
+        if (len > (c->state == S_AUTH ? 1024 : CDPL_MAX_MSG)) { conn_close(i, 1009, "message too big"); return -1; }
         if (avail < hl + 4 + len) break;
         uint8_t *mask = p + hl, *pl = p + hl + 4;
         for (uint64_t k = 0; k < len; k++) pl[k] ^= mask[k & 3];

@@ -4624,9 +4624,11 @@ int bridge_main(int argc, char **argv) {
         // process during sleep(), which is the desired behavior for Ctrl+C.
         // A mayfly keeps watching its CLI across the wait (up to 8s) so an
         // orphan doesn't sit out a backend outage before noticing.
+        // The loopback CDP mux (cdp_local.h) keeps serving meanwhile: local
+        // agents must not hang on a backend outage — that is what it is for.
         for (int slept = 0; slept < delay_ms; slept += 100) {
             if (e->mayfly_parent_pid && (long)getppid() != e->mayfly_parent_pid) { rc = 0; goto done; }
-            usleep(100 * 1000);
+            cdp_local_idle_serve(e->identity_fd, e->mayfly ? NULL : e->device_id, 100);
         }
 #endif
         reset_connection_state(e);
