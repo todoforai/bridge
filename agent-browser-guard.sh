@@ -9,6 +9,12 @@
 # `--session <s> --cdp <target>` on every call, so a lost browser is an error
 # (or a reconnect to the SAME browser), never a local fallback.
 # `agent-browser whoami` reports which browser the session is driving.
+#
+# Fast path: when this shell's bridge (TODOFORAI_CDP_LOCAL_PORT) serves the
+# TODOforAI browser of a connect URL on this machine, the session talks to it
+# over loopback (bridge cdp_local.h) instead of through the backend; the pin
+# stays the cloud URL, and any doubt (no bridge, probe fails, link drops)
+# means the cloud URL. `whoami` shows transport=local|cloud.
 set -f
 unset AGENT_BROWSER_JSON   # internal probes parse plain text; --json still works per call
 
@@ -73,12 +79,31 @@ case $cmd in ''|session|install|upgrade|doctor|skills|help|dashboard) exec "$rea
 case $sess in *[!A-Za-z0-9._-]*|.*) die "session name '$sess' must match [A-Za-z0-9._-]+";; esac
 pin_dir=${XDG_CACHE_HOME:-$HOME/.cache}/todoforai/agent-browser
 pin=$pin_dir/$sess.cdp
-target=$(cat "$pin" 2>/dev/null)
+via_f=$pin_dir/$sess.via   # the URL actually dialled for $target, when it differs (loopback)
+load() { target=$(cat "$pin" 2>/dev/null); via=; [ -n "$target" ] && via=$(cat "$via_f" 2>/dev/null); via=${via:-$target}; }
+load
 save() {
   mkdir -p "$pin_dir" && (umask 077 && printf '%s\n' "$1" >"$pin.$$" && mv -f "$pin.$$" "$pin") \
     || die "cannot record the connected browser in $pin; refusing to run unguarded"
-  target=$1
+  rm -f "$via_f"; target=$1; via=$1
 }
+# Loopback twin of a TODOforAI extension URL, if this machine's bridge serves that browser now.
+probe() { [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http${1#ws}" 2>/dev/null)" = 200 ]; }
+local_of() {
+  case ${TODOFORAI_CDP_LOCAL_PORT:-} in ''|*[!0-9]*) return 1;; esac
+  case $1 in *"/ws/v2/cdp?token=e."*) return 1;; *"/ws/v2/cdp?token="*) ;; *) return 1;; esac
+  command -v curl >/dev/null || return 1
+  l="ws://127.0.0.1:$TODOFORAI_CDP_LOCAL_PORT/cdp-local/cdp?${1#*\?}"
+  probe "$l" && echo "$l"
+}
+set_via() {
+  if [ "$1" = "$target" ]; then rm -f "$via_f"
+  else (umask 077 && printf '%s\n' "$1" >"$via_f.$$" && mv -f "$via_f.$$" "$via_f") || { rm -f "$via_f"; via=$target; return; }
+  fi
+  via=$1
+}
+pick_via() { l=$(local_of "$target") && set_via "$l" || set_via "$target"; }
+is_local() { [ "$via" != "$target" ]; }
 kind() {
   case $1 in
     *"/ws/v2/cdp?token=e."*) echo embedded;;
@@ -104,7 +129,7 @@ stop_daemon() {
   [ "$(daemon_pid)" = "$p" ] && kill -9 "$p" 2>/dev/null; return 0
 }
 # A pinned agent-browser call; "$@" = its subcommand and args.
-ab() { "$real" --session "$sess" ${target:+--cdp "$target"} "$@" 9>&-; }   # 9 = lock; a spawned daemon must not hold it
+ab() { "$real" --session "$sess" ${via:+--cdp "$via"} "$@" 9>&-; }   # 9 = lock; a spawned daemon must not hold it
 # bounded SECS ab ARGS...: after SECS (0 = no limit) kill the CLI and the session daemon
 # (a hung daemon hangs every later call too) and return 124. Runs the real binary
 # directly (not the ab function) so the kill reaches it.
@@ -112,7 +137,7 @@ bounded() {
   t=$1; shift 2
   [ "$t" -gt 0 ] 2>/dev/null || { ab "$@"; return; }
   m=$(mktemp "${TMPDIR:-/tmp}/ab-guard.XXXXXX") && rm -f "$m" || die "mktemp failed"
-  "$real" --session "$sess" ${target:+--cdp "$target"} "$@" 9>&- & cp=$!
+  "$real" --session "$sess" ${via:+--cdp "$via"} "$@" 9>&- & cp=$!
   ( sleep "$t"; : >"$m"; kill -9 "$cp" ) >/dev/null 2>&1 9>&- & wp=$!
   wait "$cp"; rc=$?
   kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
@@ -124,13 +149,24 @@ bounded() {
 fresh_daemon() { daemon_pid >/dev/null || return 0; bounded 15 ab close >/dev/null 2>&1; stop_daemon; }
 
 # Run agent-browser (output redacted); when a pinned session fails on its connection, say so loudly.
+# The pinned URL in the caller's args (connect <url>, --cdp <url>) is swapped for the dialled one.
 run() {
+  if is_local; then
+    n=$#; i=0
+    while [ $i -lt $n ]; do a=$1; shift; i=$((i + 1)); [ "$a" = "$target" ] && a=$via; set -- "$@" "$a"; done
+  fi
   out=$(mktemp "${TMPDIR:-/tmp}/ab-guard.XXXXXX") && err=$(mktemp "${TMPDIR:-/tmp}/ab-guard.XXXXXX") || die "mktemp failed"
   bounded "${limit:-0}" ab "$@" >"$out" 2>"$err"; rc=$?
   redact <"$out"; redact <"$err" >&2
   [ $rc -eq 124 ] && echo "agent-browser: no answer from the browser within ${limit}s; stopped this session's daemon." | tee "$err" >&2
   if [ $rc -ne 0 ] && [ -n "$target" ] && grep -qiE 'cdp|websocket|connect|closed|timed out|no answer' "$err"; then
-    echo "agent-browser: lost the $(kind "$target") browser this session is connected to. NOT falling back to a local browser. Re-run your \`agent-browser connect '...'\` command, then \`agent-browser whoami\`." >&2
+    if is_local; then
+      # The loopback link dropped (extension or bridge restarted): the next call goes through the cloud.
+      fresh_daemon; set_via "$target"
+      echo "agent-browser: the local link to the browser dropped; this session now uses the cloud path. Re-run the command." >&2
+    else
+      echo "agent-browser: lost the $(kind "$target") browser this session is connected to. NOT falling back to a local browser. Re-run your \`agent-browser connect '...'\` command, then \`agent-browser whoami\`." >&2
+    fi
   fi
   rm -f "$out" "$err"
   return $rc
@@ -157,12 +193,13 @@ whoami_() {
   match=yes
   case $target in
     '') ;;
-    ws://*|wss://*) [ "$live" = "$target" ] || match=no;;
+    ws://*|wss://*) [ "$live" = "$via" ] || match=no;;
     *[!0-9]*) hp=${target#*://}; hp=${hp%%/*}; case $live in *"//$hp"[:/]*) ;; *) match=no;; esac;;
     *) case $live in *":$target/"*) ;; *) match=no;; esac;;
   esac
   k=$(kind "$target")
-  echo "session=$sess browser=$k match=$match headless=$headless webdriver=$wd viewport=$vp"
+  tr=; case $target in *"/ws/v2/cdp?token="*) if is_local; then tr=" transport=local"; else tr=" transport=cloud"; fi;; esac
+  echo "session=$sess browser=$k$tr match=$match headless=$headless webdriver=$wd viewport=$vp"
   echo "ua=$ua"
   printf 'url=%s\ncdp=%s\n' "$url" "$live" | redact
   if [ $match = no ]; then echo "ERROR: driving a different browser than this session connected to. Re-run connect."; return 1; fi
@@ -173,13 +210,13 @@ whoami_() {
 }
 
 # Switch the pin to $1 (from none, too: an unpinned daemon may be driving a local Chrome).
-retarget() { [ "$target" = "$1" ] && return; fresh_daemon; save "$1"; }
+retarget() { [ "$target" = "$1" ] && return; fresh_daemon; save "$1"; pick_via; }
 
 # One session command at a time (flock where available): a reconnect or close must never
 # interleave with another call's read of the pin. Spawned agent-browser processes close fd 9.
 if command -v flock >/dev/null; then
   mkdir -p "$pin_dir" && exec 9>"$pin_dir/$sess.lock" && flock -w 180 9 || die "session '$sess' is busy; retry"
-  target=$(cat "$pin" 2>/dev/null)
+  load
 fi
 
 [ -n "$flag_cdp" ] && [ -n "$other" ] && exec "$real" "$@" 9>&-   # agent-browser rejects --cdp with --auto-connect/-p itself
@@ -190,15 +227,23 @@ case $cmd in
     [ -z "$flag_cdp" ] || [ "$flag_cdp" = "$arg1" ] || die "--cdp '$(printf %s "$flag_cdp" | redact)' and connect '$(printf %s "$arg1" | redact)' name different browsers"
     fresh_daemon
     save "$arg1"   # pinned BEFORE connecting: a failed connect must not leave the session free to launch locally
-    limit=${AGENT_BROWSER_CONNECT_TIMEOUT:-60} run "$@" || exit
+    pick_via
+    if is_local; then
+      # connect is idempotent: a failed loopback attempt retries once through the cloud.
+      limit=${AGENT_BROWSER_CONNECT_TIMEOUT:-60} run "$@" 2>/dev/null || { fresh_daemon; set_via "$target"; limit=${AGENT_BROWSER_CONNECT_TIMEOUT:-60} run "$@" || exit; }
+    else
+      limit=${AGENT_BROWSER_CONNECT_TIMEOUT:-60} run "$@" || exit
+    fi
     whoami_; exit;;
   close|quit|exit)
     [ -n "$other$all" ] && exec "$real" "$@" 9>&-
     [ -n "$flag_cdp" ] && retarget "$flag_cdp"
-    run "$@" && rm -f "$pin"
+    run "$@" && rm -f "$pin" "$via_f"
     exit;;
 esac
 [ -n "$other" ] && exec "$real" "$@" 9>&-   # explicit --auto-connect / provider: caller chose another browser
 [ -n "$flag_cdp" ] && retarget "$flag_cdp"
+# A restarted daemon dials $via afresh: drop a loopback link that is gone before it does.
+if [ -n "$target" ] && is_local && ! daemon_pid >/dev/null && ! probe "$via"; then set_via "$target"; fi
 if [ -n "$target" ]; then run "$@"; exit; fi
 exec "$real" "$@" 9>&-
