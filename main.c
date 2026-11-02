@@ -100,6 +100,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "login.h"
 #include "adb_relay.h"
 #include "shell_relay.h"
+#include "cdp_local.h"
 #include "keep_awake.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
@@ -944,6 +945,24 @@ static int send_json(edge_t *e, const char *s, size_t n) {
 // adb_relay.h glue: frames go out on the Noise channel; the loopback
 // `GET /adb` hook (identity_server.c) asks for a relay listener.
 static int adb_send_cb(void *ctx, const char *json, size_t len) { return send_json((edge_t *)ctx, json, len); }
+
+// cdp_local `grant`: the extension on this machine asks for a loopback file
+// token itself (DOM.setFileInputFiles on the local path). Same mint and device
+// policy as the backend's `file_grant` call; the extension already proved the
+// backend-issued secret, so it is the backend's own browser.
+static uint16_t g_cdpl_port;
+static int cdpl_grant_cb(const char *path, char *out, size_t cap, char *err, size_t err_cap) {
+    char *expanded = bridge_expand_tilde(path);
+    char token[FILE_GRANT_TOKEN_LEN + 1];
+    long long size = 0;
+    int rc = bridge_file_grant(expanded ? expanded : path, token, sizeof token, &size, err, err_cap);
+    const char *mime = bridge_file_mime(expanded ? expanded : path);
+    free(expanded);
+    if (rc != 0) return -1;
+    int n = snprintf(out, cap, "{\"token\":\"%s\",\"port\":%u,\"totalSize\":%lld,\"type\":\"%s\"}",
+                     token, (unsigned)g_cdpl_port, size, mime);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
 // Hold adb input while ≥1 MB is queued: the loop drains on POLLOUT and resumes.
 static int adb_busy_cb(void *ctx) { return ((edge_t *)ctx)->ws.tx_len >= (1u << 20); }
 static uint16_t adb_hook_cb(void *ctx, const char *phone, const char *pspec, char *err, size_t err_cap) {
@@ -2683,6 +2702,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         char idenv[4 * (BLOCK_ID_CAP + 48) + MODEL_ID_CAP + 96];
         char bridge_port[8] = "";
         if (e->shell.port) snprintf(bridge_port, sizeof bridge_port, "%u", (unsigned)e->shell.port);
+        char cdpl_port[8] = "";
+        if (e->identity_fd != WS_INVALID_FD) snprintf(cdpl_port, sizeof cdpl_port, "%u", (unsigned)e->identity_port);
         {
             size_t n = 0;
             #define ID_APPEND(key, val) do { \
@@ -2701,6 +2722,8 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             ID_APPEND("AGENT_BROWSER_SESSION", s->todo_id);
             // tfa-cat / __live reach THIS daemon's shell relay (shell_relay.h).
             ID_APPEND("TODOFORAI_BRIDGE_PORT", bridge_port);
+            // agent-browser guard: try the loopback CDP path here (cdp_local.h).
+            ID_APPEND("TODOFORAI_CDP_LOCAL_PORT", cdpl_port);
             #undef ID_APPEND
         }
 
@@ -3390,6 +3413,28 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             int rn = snprintf(result, sizeof result, "{\"token\":\"%s\",\"port\":%d,\"totalSize\":%lld}",
                               token, e->identity_port, size);
             send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)rn);
+        } else if (fn_len == 9 && memcmp(fn, "cdp_local", 9) == 0) {
+            // args: {resourceId, secret, tokenHash}. The backend vouches that
+            // this machine's browser extension (RESOURCE_HOST) may meet us on
+            // the loopback port (cdp_local.h). Result: {port}.
+            char rid[129], sec[129], th[41]; size_t l1 = 0, l2 = 0, l3 = 0;
+            if (e->identity_fd == WS_INVALID_FD) {
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len,
+                                         "cdp_local: loopback port not held by this bridge");
+                return 0;
+            }
+            if (!args || !json_get_str_decoded(args, args_len, "resourceId", rid, sizeof rid, &l1)
+                || !json_get_str_decoded(args, args_len, "secret", sec, sizeof sec, &l2)
+                || !json_get_str_decoded(args, args_len, "tokenHash", th, sizeof th, &l3)
+                || cdp_local_grant(rid, sec, th) != 0) {
+                noise_wipe(sec, sizeof sec);
+                send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, "cdp_local requires args.resourceId, secret, tokenHash");
+                return 0;
+            }
+            noise_wipe(sec, sizeof sec);
+            char result[48];
+            int rn = snprintf(result, sizeof result, "{\"port\":%u}", (unsigned)e->identity_port);
+            send_function_call_result(e, req, req_len, aid, aid_len, eid, eid_len, result, (size_t)rn);
         } else if (fn_len == 21 && memcmp(fn, "preview_register_port", 21) == 0) {
             // live_preview: allow the relay to serve this local port (see
             // preview.c). Probes first so the agent gets an immediate
@@ -3415,7 +3460,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         } else {
             char errmsg[160];
             snprintf(errmsg, sizeof errmsg,
-                     "Unknown function: %.*s. Available: scan_tools, write_file_b64, read_file_b64, file_grant, preview_register_port",
+                     "Unknown function: %.*s. Available: scan_tools, write_file_b64, read_file_b64, file_grant, cdp_local, preview_register_port",
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
@@ -3702,6 +3747,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     adb_relay_drop_streams(&e->adb);   // backend streams died with the last connection
     shell_relay_drop_streams(&e->shell, "bridge reconnected to the backend");
     e->identity_port = login_is_local_host(host) ? IDENTITY_SERVER_PORT_LOCAL : IDENTITY_SERVER_PORT;
+    g_cdpl_port = e->identity_port;
     if (e->identity_fd == WS_INVALID_FD && !e->mayfly) e->identity_fd = bridge_identity_server_open(e->identity_port);
     // Derive the public HTTP API URL from the Noise host. In prod a TLS
     // terminator (nginx/Cloudflare) fronts the backend on 443 while the Noise
@@ -3738,7 +3784,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     // pfds[0] is always the WS fd; remaining slots are active sessions' PTY
     // master fds so output wakes the loop immediately instead of waiting out
     // the timeout. +1 for the WS slot.
-    const size_t pfds_cap = (size_t)g_max_sessions + 2 + ADB_MAX_LISTENERS + ADB_MAX_STREAMS + 1 + SHELL_MAX_STREAMS;
+    const size_t pfds_cap = (size_t)g_max_sessions + 2 + ADB_MAX_LISTENERS + ADB_MAX_STREAMS + 1 + SHELL_MAX_STREAMS + CDPL_MAX_CONNS;
     struct pollfd *pfds = calloc(pfds_cap, sizeof *pfds);
     if (!pfds) { fail(e, "out of memory allocating pollfds"); ws_close(&e->ws); noise_ws_wipe(&e->noise); return -1; }
 
@@ -3770,11 +3816,14 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         size_t shell_first = adb_n, shell_n = adb_n;
         adb_n -= adb_first;
         shell_relay_fill_pfds(&e->shell, pfds, &shell_n, pfds_cap);
+        size_t cdpl_first = shell_n, cdpl_n = shell_n;
         shell_n -= shell_first;
+        cdp_local_fill_pfds(pfds, &cdpl_n, pfds_cap);
+        cdpl_n -= cdpl_first;
 #ifdef _WIN32
-        nfds = (ULONG)(shell_first + shell_n);
+        nfds = (ULONG)(cdpl_first + cdpl_n);
 #else
-        nfds = (nfds_t)(shell_first + shell_n);
+        nfds = (nfds_t)(cdpl_first + cdpl_n);
 #endif
         struct pollfd *pfd = &pfds[0];
         // Keep a 50ms ceiling so the awaiting-input probe and deadline checks in
@@ -3828,8 +3877,10 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
                 bridge_identity_server_serve(e->identity_fd, e->mayfly ? NULL : e->device_id);
             if (adb_n && e->noise.handshake_done && e->identity_sent) adb_relay_service(&e->adb, pfds, adb_first, adb_n);
             if (shell_n) shell_relay_service(&e->shell, pfds, shell_first, shell_n);
+            if (cdpl_n) cdp_local_service(pfds, cdpl_first, cdpl_n);
         }
         shell_relay_tick(&e->shell);
+        cdp_local_tick();
         // Deferred identity send — gives the backend's async validateDevice()
         // time to settle before the second frame lands on the post-auth handler.
         if (e->noise.handshake_done && !e->identity_sent &&
@@ -4378,6 +4429,8 @@ int bridge_main(int argc, char **argv) {
     adb_relay_init(&e->adb, adb_send_cb, adb_busy_cb, e);
     shell_relay_init(&e->shell, adb_send_cb, adb_busy_cb, shell_ready_cb, e);
     bridge_identity_server_set_adb_hook(adb_hook_cb, adb_last_error_cb, adb_forget_cb, e);
+    cdp_local_init(cdpl_grant_cb);
+    bridge_identity_server_set_cdp_hook(cdp_local_accept);
     e->session_token = session_token;        // login-less mayfly auth (NULL otherwise)
     if (mayfly_todo_id) {
         // Todo ids are CLI-minted uuids (enforced server-side too); reject

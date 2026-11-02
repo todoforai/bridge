@@ -41,6 +41,9 @@ void bridge_identity_server_set_adb_hook(bridge_adb_hook_fn fn, bridge_adb_last_
     g_adb_hook = fn; g_adb_last_error = last_err; g_adb_forget = forget; g_adb_hook_ctx = ctx;
 }
 
+static bridge_cdp_hook_fn g_cdp_hook = NULL;
+void bridge_identity_server_set_cdp_hook(bridge_cdp_hook_fn fn) { g_cdp_hook = fn; }
+
 // 1 if the request carries header `name` at all (value ignored, any length).
 static int has_header(const char *req, const char *name) {
     size_t nl = strlen(name);
@@ -193,6 +196,31 @@ void bridge_identity_server_serve(ws_fd_t listen_fd, const char *device_id) {
     // /file streams on its own thread (file_server.c), which owns fd from here.
     if (strncmp(req, "GET /file?", 10) == 0 || strncmp(req, "HEAD /file?", 11) == 0) {
         bridge_file_serve(fd, req, cors);
+        return;
+    }
+
+    // Loopback CDP (cdp_local.h): the extension's socket (an extension origin
+    // only; it authenticates in-band) and agent-browser's (no Origin/Referer =
+    // no web page, Host 127.0.0.1 = no DNS rebinding). The hook owns fd.
+    int cdp_ext = strncmp(req, "GET /cdp-local/ext ", 19) == 0;
+    if (g_cdp_hook && (cdp_ext || strncmp(req, "GET /cdp-local/cdp?", 19) == 0)) {
+        char key[64], up[32], host[64], tok[256] = "", todo[96] = "";
+        int upgrade = header_value(req, "Upgrade", up, sizeof up) && strcasecmp(up, "websocket") == 0
+                   && header_value(req, "Sec-WebSocket-Key", key, sizeof key) && key[0];
+        int ok = cdp_ext
+            ? upgrade && header_value(req, "Origin", origin, sizeof origin)
+              && (strncmp(origin, "chrome-extension://", 19) == 0 || strncmp(origin, "moz-extension://", 16) == 0)
+            : !has_header(req, "Origin") && !has_header(req, "Referer")
+              && header_value(req, "Host", host, sizeof host) && strncmp(host, "127.0.0.1", 9) == 0
+              && query_param(req, "token", tok, sizeof tok);
+        if (ok) {
+            if (!cdp_ext) query_param(req, "todoId", todo, sizeof todo);
+            g_cdp_hook(fd, cdp_ext, upgrade ? key : NULL, tok, todo);
+            return;
+        }
+        static const char forbidden[] = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send_all(fd, forbidden, sizeof forbidden - 1, deadline);
+        is_close_fd(fd);
         return;
     }
 

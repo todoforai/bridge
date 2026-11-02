@@ -48,6 +48,10 @@ typedef uint16_t (*bridge_adb_hook_fn)(void *ctx, const char *phone, const char 
 typedef const char *(*bridge_adb_last_error_fn)(void *ctx, const char *phone, const char *port_spec);
 // `&forget=1`: drop the relay (adb disconnect); returns the port it had, 0 = none.
 typedef uint16_t (*bridge_adb_forget_fn)(void *ctx, const char *phone, const char *port_spec);
+// `/cdp-local/…` (cdp_local.h): `ext` = /cdp-local/ext, `ws_key` NULL when the
+// request is no WebSocket upgrade. Takes ownership of `fd`. Unset ⇒ 404.
+typedef void (*bridge_cdp_hook_fn)(ws_fd_t fd, int ext, const char *ws_key, const char *token, const char *todo_id);
+void bridge_identity_server_set_cdp_hook(bridge_cdp_hook_fn fn);
 void bridge_identity_server_set_adb_hook(bridge_adb_hook_fn fn, bridge_adb_last_error_fn last_err,
                                          bridge_adb_forget_fn forget, void *ctx);
 

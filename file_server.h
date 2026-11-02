@@ -33,6 +33,9 @@
 int bridge_file_grant(const char *path, char *token_out, size_t token_cap,
                       long long *size_out, char *err, size_t err_cap);
 
+// Content-Type the stream is served with (by extension; octet-stream else).
+const char *bridge_file_mime(const char *path);
+
 // Called by the identity server for a request line starting with
 // "GET /file?" or "HEAD /file?". Takes ownership of `fd` (always closes it,
 // possibly later on a worker thread). `cors` = response CORS header lines

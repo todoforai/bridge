@@ -149,7 +149,7 @@ static char *grant_lookup(const char *token) {
     return out;
 }
 
-static const char *mime_of(const char *path) {
+const char *bridge_file_mime(const char *path) {
     static const char *map[][2] = {
         {"mp4", "video/mp4"}, {"m4v", "video/mp4"}, {"webm", "video/webm"}, {"mov", "video/quicktime"},
         {"mp3", "audio/mpeg"}, {"wav", "audio/wav"}, {"ogg", "audio/ogg"}, {"m4a", "audio/mp4"},
@@ -249,7 +249,7 @@ static void serve_job(job_t *j) {
                       "HTTP/1.1 %s\r\n%sContent-Type: %s\r\nAccept-Ranges: bytes\r\n%s"
                       "Content-Length: %lld\r\nCache-Control: private, no-store\r\n"
                       "Cross-Origin-Resource-Policy: cross-origin\r\nConnection: close\r\n\r\n",
-                      r > 0 ? "206 Partial Content" : "200 OK", j->cors, mime_of(j->path), cr, len);
+                      r > 0 ? "206 Partial Content" : "200 OK", j->cors, bridge_file_mime(j->path), cr, len);
     if (hn <= 0 || (size_t)hn >= sizeof head || send_all(fd, head, (size_t)hn) != 0 || strncmp(j->req, "HEAD ", 5) == 0) { fs_close(ffd); return; }
 
     char *buf = malloc(IO_CHUNK);
