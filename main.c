@@ -688,6 +688,54 @@ static void hex_encode(char *out, const uint8_t *in, size_t n) {
     out[n*2] = '\0';
 }
 
+// POSIX RUN delivery: the command travels as a printf octal literal and the
+// wrapper runs `eval " $(printf '<lit>')"` instead of `( <cmd> )`, so the PTY
+// line discipline only ever sees plain ASCII. Typed raw (before this), the
+// command's bytes went through the tty's input processing (ICRNL and ISIG
+// always, VEOF/VKILL/VERASE once the wrapper's `stty icanon` ran): a
+// heredoc's CRLF arrived as LF LF, a `\x03` killed the step and wedged the
+// session, `\x04` vanished — and the shell reads the wrapper from the tty, so
+// there was no way to keep them out. Measured on dash/bash/busybox/zsh:
+// every byte 0x01-0xff round-trips; NUL cannot exist in a shell word anyway.
+//
+// Only [A-Za-z0-9] and punctuation that is inert inside '…' inside "$(…)"
+// stay literal; everything else, including ' \ % " ( ) ` ! # (old bash 3.2,
+// macOS /bin/sh, mis-scans quotes/parens inside "$(…)"), is \NNN. A leading
+// `-` is escaped too (printf would take it as an option). A digit after an
+// escape is safe: printf octal is at most 3 digits and we always emit 3. The
+// space before $(…) keeps a command starting with `-` from being an eval
+// option (bash).
+//
+// Same semantics as the subshell it replaces: eval runs inside `( … )`, so
+// `exit N`, `cd`, `set -e`, heredocs and functions behave as before. Trailing
+// newlines are dropped by $(…) — harmless for shell text. A syntax error now
+// fails the step (rc 2) instead of leaving the shell at PS2 until timeout.
+// Cost: up to 4x the bytes, ~0.5 ms per step (one $(printf) + eval).
+static int sh_octal_plain(unsigned char b, size_t i) {
+    if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')) return 1;
+    if (b == '-') return i > 0;
+    return b && strchr(" $&*+,./:;<=>?@[]^_{|}~", b) != NULL;
+}
+
+static size_t sh_octal_lit_len(const char *c, size_t n) {
+    size_t out = 0;
+    for (size_t i = 0; i < n; i++) out += sh_octal_plain((unsigned char)c[i], i) ? 1 : 4;
+    return out;
+}
+
+static size_t sh_octal_lit(const char *c, size_t n, char *out) {
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char b = (unsigned char)c[i];
+        if (sh_octal_plain(b, i)) { out[o++] = (char)b; continue; }
+        out[o++] = '\\';
+        out[o++] = (char)('0' + (b >> 6));
+        out[o++] = (char)('0' + ((b >> 3) & 7));
+        out[o++] = (char)('0' + (b & 7));
+    }
+    return o;
+}
+
 // Build a UUID v4 string into out[37].
 static void gen_uuid_v4(char out[37]) {
     uint8_t b[16];
@@ -2707,12 +2755,27 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             free(cmd); RUN_FAIL_CLEANUP();
             return send_error(e, NULL, 0, bid, bid_len, "INTERNAL", "cwd too long");
         }
-        size_t wrapped_cap = (size_t)cmd_len + s->sentinel_len + s->begin_len
+#ifdef _WIN32
+        // The wrapper is staged to a file below (no tty in the way), and a
+        // $(…) costs an MSYS fork (~16 ms): keep the command raw.
+        char *body = cmd; size_t body_len = cmd_len;
+#else
+        size_t body_len = s->cmd_mode ? cmd_len : sh_octal_lit_len(cmd, cmd_len);
+        char *body = s->cmd_mode ? cmd : malloc(body_len + 1);
+        if (!body) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
+        if (!s->cmd_mode) sh_octal_lit(cmd, cmd_len, body);
+#endif
+#ifdef _WIN32
+#  define RUN_BODY_FMT "( %.*s\n)"
+#else
+#  define RUN_BODY_FMT "( eval \" $(printf '%.*s')\"\n)"
+#endif
+        size_t wrapped_cap = body_len + s->sentinel_len + s->begin_len
                              + sizeof(e->subagent_token) + sizeof(s->agent_settings_id)
                              + sizeof(idenv) + sizeof(e->api_url)
                              + sizeof(fenv) + sizeof(cenv) + sizeof(tz_env) + strlen(cdpre) + strlen(dshim) + 384;
         char *wrapped = malloc(wrapped_cap);
-        if (!wrapped) { free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
+        if (!wrapped) { if (body != cmd) free(body); free(cmd); RUN_FAIL_CLEANUP(); return send_error(e, NULL, 0, bid, bid_len, "OOM", "out of memory"); }
         int wn;
         if (s->cmd_mode) {
             // cmd.exe dialect. Two separate lines: %ERRORLEVEL% expands at
@@ -2728,7 +2791,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'; "
-                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; " SUDO_ASKPASS_FN "%strap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; " SUDO_ASKPASS_FN "%strap : INT; " RUN_BODY_FMT "; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
@@ -2736,20 +2799,21 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 s->agent_settings_id[0] ? s->agent_settings_id : "",
                 idenv,
                 fenv, cenv, tz_env, dshim,
-                (int)cmd_len, cmd, s->sentinel);
+                (int)body_len, body, s->sentinel);
         } else {
             wn = snprintf(wrapped, wrapped_cap,
                 // idenv is ` KEY=val` fragments and may be empty, so `export`
                 // is emitted only when there is something to export; fenv/cenv
                 // are full `; export …` / `; unset …` statements.
                 CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'%s%s%s%s%s; "
-                SUDO_ASKPASS_FN "%strap : INT; ( %.*s\n); __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                SUDO_ASKPASS_FN "%strap : INT; " RUN_BODY_FMT "; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv[0] ? "; export" : "", idenv,
                 fenv, cenv, tz_env, dshim,
-                (int)cmd_len, cmd, s->sentinel);
+                (int)body_len, body, s->sentinel);
         }
+        if (body != cmd) free(body);
         free(cmd);
         if (wn <= 0 || (size_t)wn >= wrapped_cap) {
             free(wrapped);

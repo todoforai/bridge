@@ -244,6 +244,15 @@ test-runenv: | build
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
+# RUN command bytes reach the shell exactly as sent (octal-literal delivery):
+# heredoc CRLF / control bytes / unterminated quotes, on dash and bash.
+.PHONY: test-run-bytes
+test-run-bytes: | build
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-run-bytes \
+	    test/test_run_bytes.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-run-bytes
 # Spawn-time init drain: with PTY echo ON (simulating ConPTY, which has no
 # host-side ECHO toggle), the echoed init/wrapper and the shell prompt must be
 # drained up to the ready sentinel and step output must stay byte-exact.
