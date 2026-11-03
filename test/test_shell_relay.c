@@ -316,11 +316,14 @@ int main(void) {
     reset(); fetch_body = "PK\003\004\0\0xyz"; fetch_len = 9;
     snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/a.docx; echo rc=$?", env);
     run(cmd, 1, out, sizeof out);
-    assert(strstr(out, "binary (text/plain, 9 bytes)") && strstr(out, "> 'a.docx'") && strstr(out, "rc=1") && !strstr(out, "xyz"));
+    assert(strstr(out, "binary (text/plain, 9 bytes)") && strstr(out, "> 'a.docx' && anydoc 'a.docx'") && strstr(out, "rc=1") && !strstr(out, "xyz"));
     reset(); fetch_body = "PK\003\004\0\0xyz"; fetch_len = 9;
     snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/a.docx > build/sr/a.docx; wc -c < build/sr/a.docx", env);
     run(cmd, 1, out, sizeof out);
     assert(strstr(out, "9"));
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat build/sr/a.docx; echo rc=$?", env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "As text: anydoc 'build/sr/a.docx'") && strstr(out, "rc=1") && !strstr(out, "xyz"));
     printf("ok 16 binary hint\n");
 
     // 17. FILE:FROM:TO / FILE:FROM line ranges (file, pipe, ref); a real file named `x:3` wins;

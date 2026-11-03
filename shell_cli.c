@@ -136,6 +136,20 @@ static sh_ssize cat_head(int fd, unsigned char *p, size_t cap) {
 
 static int file_exists(const char *p);
 
+// Office/rich documents anydoc (catalog tool) turns into text: the binary hint names it.
+static int cat_is_office(const char *name) {
+    static const char *const ext[] = { ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".rtf", ".epub" };
+    size_t n = strlen(name);
+    for (size_t i = 0; i < sizeof ext / sizeof *ext; i++) {
+        size_t m = strlen(ext[i]), j = 0;
+        if (n < m) continue;
+        while (j < m && (name[n - m + j] | 0x20) == ext[i][j]) j++;
+        if (j == m) return 1;
+    }
+    return 0;
+}
+
+
 // `FILE:FROM[:TO]` → lines FROM..TO (1-based, inclusive; no TO = to EOF), as
 // the agent's `read` tool takes them. Lines are filtered on the way out, so a
 // range of a huge file or ref costs only what it prints.
@@ -330,8 +344,9 @@ static int cat_ref(const char *ref, int attach, int tty, cat_range_t *rng) {
         if (tty && got == 0 && memchr(buf, 0, (size_t)n)) {
             const char *b = ref;
             for (const char *c = ref; *c; c++) if (*c == '/' || *c == ':') b = c + 1;
-            fprintf(stderr, "tfa-cat: %s: binary (%s, %ld bytes), not printed. Save it: tfa-cat '%s' > '%s'\n",
-                    ref, mime, size, ref, *b ? b : "file");
+            if (!*b) b = "file";
+            fprintf(stderr, "tfa-cat: %s: binary (%s, %ld bytes), not printed. Save it: tfa-cat '%s' > '%s'%s%s%s\n",
+                    ref, mime, size, ref, b, cat_is_office(b) ? " && anydoc '" : "", cat_is_office(b) ? b : "", cat_is_office(b) ? "' (as text)" : "");
             shell_client_close(s);
             return 1;
         }
@@ -396,7 +411,8 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
         if (r == -1) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); rc = 1; }
         else if (r == -2) rc = 141;
         else if (r == -3) {
-            fprintf(stderr, "tfa-cat: %s: binary, not printed (use a tool that reads it, or pipe/redirect for the raw bytes)\n", arg);
+            if (cat_is_office(arg)) fprintf(stderr, "tfa-cat: %s: binary, not printed. As text: anydoc '%s'\n", arg, arg);
+            else fprintf(stderr, "tfa-cat: %s: binary, not printed (use a tool that reads it, or pipe/redirect for the raw bytes)\n", arg);
             rc = 1;
         } else if (tty && !is_stdin)
             cat_big_note(arg, &rng);   // the bash output cap keeps head+tail: say what the middle was
