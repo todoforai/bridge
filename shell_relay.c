@@ -315,7 +315,8 @@ static void open_stream(shell_relay_t *r, shell_stream_t *s, const char *hdr, si
         if (!json_get_str_decoded(hdr, len, keys[i], vals[i], sizeof vals[i], &vl)) vals[i][0] = '\0';
     }
     s->fetch = strcmp(vals[0], "fetch") == 0;
-    if (!vals[0][0] || !vals[1][0] || !vals[2][0] || !vals[3][0] || (s->fetch && !vals[7][0])) { fail(s, "bad request"); return; }
+    int needs_ref = s->fetch || strcmp(vals[0], "put") == 0;   // put: stdin replaces `ref`
+    if (!vals[0][0] || !vals[1][0] || !vals[2][0] || !vals[3][0] || (needs_ref && !vals[7][0])) { fail(s, "bad request"); return; }
     if (!r->ready || !r->ready(r->ctx)) { fail(s, "bridge is not connected to the backend"); return; }
     s->live = strcmp(vals[0], "live") == 0;
     // An attach declares its size up front: EOF alone can't tell a finished

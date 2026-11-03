@@ -225,14 +225,15 @@ static int cat_copy(int fd, int out, const unsigned char *head, size_t hn, int c
     }
 }
 
-// head + rest of fd → one attach stream. NULL on success, else the reason.
+// head + rest of fd → one attach stream (or, with `ref`, a put: the bytes
+// replace that `todoforai:` resource). NULL on success, else the reason.
 // Read whole first (≤ the cap): the stream declares its exact size, so a
 // killed or failing tfa-cat can never leave a truncated file behind.
-static const char *cat_upload(int fd, const unsigned char *head, size_t hn,
-                              const char *name, const char *mime, char *err, size_t errcap) {
+static const char *cat_upload(int fd, const unsigned char *head, size_t hn, const char *name,
+                              const char *mime, const char *ref, char *err, size_t errcap) {
     char *buf = malloc(CAT_MAX_BYTES + 1);
     if (!buf) return "out of memory";
-    memcpy(buf, head, hn);
+    if (hn) memcpy(buf, head, hn);
     size_t total = hn;
     const char *fail = NULL;
     for (;;) {
@@ -245,12 +246,12 @@ static const char *cat_upload(int fd, const unsigned char *head, size_t hn,
             fail = err; break;
         }
     }
-    if (!fail && !strncmp(mime, "image/", 6) && (long)total > CAT_MAX_IMAGE) {
+    if (!fail && mime && !strncmp(mime, "image/", 6) && (long)total > CAT_MAX_IMAGE) {
         snprintf(err, errcap, "image over %ld bytes — downscale it first (e.g. `convert in.png -resize 1568x1568\\> out.png`)", CAT_MAX_IMAGE);
         fail = err;
     }
     if (!fail) {
-        ws_fd_t s = shell_client_open("attach", name, mime, (long)total, NULL, 0, err, errcap);
+        ws_fd_t s = shell_client_open(ref ? "put" : "attach", name, mime, (long)total, ref, 0, err, errcap);
         if (s == WS_INVALID_FD) fail = err;
         else if (shell_client_send(s, buf, total)) { shell_client_close(s); fail = "bridge daemon hung up"; }
         else fail = shell_client_finish(s, SHELL_REPLY_MS + 5000, err, errcap);
@@ -387,7 +388,7 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
         }
         const char *e = !attach
             ? "not in an agent shell (remote/ssh? pipe it: `ssh host cat f | tfa-cat`)"
-            : cat_upload(fd, head, (size_t)hn, name, mime, err, sizeof err);
+            : cat_upload(fd, head, (size_t)hn, name, mime, NULL, err, sizeof err);
         if (e) { fprintf(stderr, "tfa-cat: %s: not attached: %s\n", arg, e); rc = 1; }
     } else {
         // Binary on the agent's terminal is noise (see cat_ref); piped → bytes.
@@ -404,6 +405,17 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
     return rc;
 }
 
+// `tfa-cat -w todoforai:<path> < data`: stdin replaces (or creates) the resource.
+static int cat_put(const char *ref) {
+    if (strncmp(ref, "todoforai:", 10) != 0) { fprintf(stderr, "tfa-cat: -w %s: only todoforai: refs (local files: write them with the shell)\n", ref); return 1; }
+    const char *blk = getenv("TODOFORAI_BLOCK_ID");
+    if (!blk || !*blk) { fprintf(stderr, "tfa-cat: -w %s: refs need an agent shell (TODOFORAI_BLOCK_ID unset)\n", ref); return 1; }
+    char err[512];
+    const char *e = cat_upload(0, NULL, 0, NULL, NULL, ref, err, sizeof err);
+    if (e) { fprintf(stderr, "tfa-cat: -w %s: %s\n", ref, e); return 1; }
+    return 0;
+}
+
 int cmd_cat(int argc, char **argv) {
     if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) {
         printf("tfa-cat %s\n", BRIDGE_VERSION); return 0;
@@ -415,10 +427,15 @@ int cmd_cat(int argc, char **argv) {
                "  FILE:FROM:TO            lines FROM..TO only (FILE:FROM = to the end)\n"
                "  skill:<name>[/<file>]   a skill on this machine (SKILL.md by default)\n"
                "  todoforai:<path>        a TODOforAI file, e.g. todoforai:todos/<todoId>/<name>\n"
-               "                          (a folder prints its listing)\n");
+               "                          (a folder prints its listing)\n"
+               "tfa-cat -w todoforai:<path> < data   stdin replaces (or creates) that file\n");
         return 0;
     }
     stdio_binary();
+    if (argc >= 2 && !strcmp(argv[1], "-w")) {
+        if (argc != 3) { fprintf(stderr, "usage: tfa-cat -w todoforai:<path> < data\n"); return 2; }
+        return cat_put(argv[2]);
+    }
     const char *blk = getenv("TODOFORAI_BLOCK_ID");
     int attach = blk && *blk, tty = stdout_is_tty(), seq = 0, rc = 0;
     if (argc < 2) return cat_one("-", attach, tty, &seq);

@@ -16,6 +16,8 @@
 //   "ok\n"     — the backend attached it to the block (image/PDF on a tty)
 //   "error: <reason>\n"
 // A body shorter than <size> means the transfer broke.
+// A `put` (`tfa-cat -w todoforai:…`) is an attach with a "ref": the backend
+// replaces that resource with the bytes instead of attaching them.
 // An attach declares `size`; anything but exactly that many bytes before EOF
 // (a killed client, a shrinking file) is aborted and stored nowhere. Every
 // state has a deadline, so a stuck or hostile local client can't pin a slot.

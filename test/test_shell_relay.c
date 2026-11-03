@@ -339,6 +339,15 @@ int main(void) {
     run(cmd, 0, out, sizeof out);
     assert(strstr(frames, "\"ref\":\"todoforai:todos/T1/bash:1\""));
     printf("ok 17 line ranges\n");
+
+    // 18. -w: stdin replaces a todoforai: resource (an attach with a ref, kind put); local paths refused.
+    reset();
+    snprintf(cmd, sizeof cmd, "printf 'hi\\n' | %s build/sr/tfa-cat -w todoforai:projects/P/memory/x.md; echo rc=$?; %s build/sr/tfa-cat -w x.md </dev/null; echo rc=$?", env, env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "rc=0") && strstr(out, "only todoforai: refs") && strstr(out, "rc=1"));
+    assert(count(frames, "\"shell:open\"") == 1 && strstr(frames, "\"kind\":\"put\"") && strstr(frames, "\"ref\":\"todoforai:projects/P/memory/x.md\"")
+        && strstr(frames, "\"size\":3") && decoded(dec, sizeof dec) == 3 && !memcmp(dec, "hi\n", 3));
+    printf("ok 18 put\n");
     assert(shell_relay_stream_count(&R) == 0);
 
     shell_relay_close_all(&R);
