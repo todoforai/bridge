@@ -322,6 +322,23 @@ int main(void) {
     run(cmd, 1, out, sizeof out);
     assert(strstr(out, "9"));
     printf("ok 16 binary hint\n");
+
+    // 17. FILE:FROM:TO / FILE:FROM line ranges (file, pipe, ref); a real file named `x:3` wins;
+    //     todoforai:todos/ ranges only after an attachment UUID; no file before the range explains.
+    reset();
+    assert(system("cd build/sr && printf 'a\\nb\\nc\\nd\\n' > l.txt && printf 'name\\n' > 'n:3'") == 0);
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat build/sr/l.txt:2:3 build/sr/l.txt:4 build/sr/n:3; %s build/sr/tfa-cat build/sr/l.txt:3:3 | od -c | head -1; %s build/sr/tfa-cat 5:9; echo rc=$?", env, env, env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "b\r\nc\r\nd\r\nname") && strstr(out, "c  \\n") && strstr(out, "no file before the range") && strstr(out, "rc=1"));
+    reset(); fetch_body = "l1\nl2\nl3\nl4\n"; fetch_len = 12;
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/0123abcd-0123-0123-0123-0123456789ab:2:3 | cat; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "l2\nl3\nrc=0") && !strstr(out, "l4") && strstr(frames, "\"ref\":\"todoforai:todos/T1/0123abcd-0123-0123-0123-0123456789ab\""));
+    reset(); fetch_body = "x\n"; fetch_len = 2;
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-cat todoforai:todos/T1/bash:1 | cat", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(frames, "\"ref\":\"todoforai:todos/T1/bash:1\""));
+    printf("ok 17 line ranges\n");
     assert(shell_relay_stream_count(&R) == 0);
 
     shell_relay_close_all(&R);

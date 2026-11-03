@@ -134,9 +134,77 @@ static sh_ssize cat_head(int fd, unsigned char *p, size_t cap) {
     return (sh_ssize)got;
 }
 
+static int file_exists(const char *p);
+
+// `FILE:FROM[:TO]` → lines FROM..TO (1-based, inclusive; no TO = to EOF), as
+// the agent's `read` tool takes them. Lines are filtered on the way out, so a
+// range of a huge file or ref costs only what it prints.
+typedef struct { long from, to, line, bytes; char last; } cat_range_t;   // from 0 = whole input; bytes/last: what was read
+
+// Split a trailing `:N[:M]` off `arg` into `path` (an existing file named so
+// wins). Refs under todoforai:todos/ take a range only after an attachment id
+// (a UUID), so names like `…/bash:1` stay names — the agent's ReadTool rule.
+static int cat_split_range(const char *arg, char *path, size_t cap, cat_range_t *r) {
+    *r = (cat_range_t){ .line = 1, .last = '\n' };
+    size_t n = strlen(arg);
+    if (n >= cap) return -1;
+    memcpy(path, arg, n + 1);
+    if (file_exists(arg)) return 0;
+    long num[2]; int k = 0;
+    char *end = path + n;
+    while (k < 2) {
+        char *p = end;
+        while (p > path && p[-1] >= '0' && p[-1] <= '9') p--;
+        if (p == end || p <= path + 1 || p[-1] != ':') break;
+        if (end - p > 9) { k = 0; break; }   // no line number is that long: a name
+        num[k++] = strtol(p, NULL, 10);
+        end = p - 1;
+    }
+    if (!k) return 0;
+    *end = '\0';
+    if (!strncmp(path, "todoforai:todos/", sizeof "todoforai:todos/" - 1)) {
+        const char *id = strrchr(path, '/') + 1;
+        int ok = strlen(id) == 36;
+        for (const char *c = id; ok && *c; c++)
+            ok = (*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'f') || (*c >= 'A' && *c <= 'F') || *c == '-';
+        if (!ok) { memcpy(path, arg, n + 1); return 0; }
+    }
+    r->from = num[k - 1] < 1 ? 1 : num[k - 1];
+    r->to = k == 2 ? (num[0] < r->from ? r->from : num[0]) : 0;
+    return 1;
+}
+
+// Write the part of buf[0..n) inside the range. 0 go on, 1 past the range, -1 write error.
+static int cat_write(int out, const char *buf, size_t n, cat_range_t *r) {
+    if (!r->from) {
+        if (n) { r->bytes += (long)n; r->last = buf[n - 1]; }
+        for (const char *p = buf; (p = memchr(p, '\n', n - (size_t)(p - buf))); p++) r->line++;
+        return write_all(out, buf, n) < 0 ? -1 : 0;
+    }
+    size_t i = 0;
+    while (i < n) {
+        if (r->to && r->line > r->to) return 1;
+        const char *nl = memchr(buf + i, '\n', n - i);
+        size_t e = nl ? (size_t)(nl - buf) + 1 : n;
+        if (r->line >= r->from && write_all(out, buf + i, e - i) < 0) return -1;
+        if (nl) r->line++;
+        i = e;
+    }
+    return r->to && r->line > r->to;
+}
+
+// Over this, the bash tool's default output cap (first+last 10k chars) cuts the
+// middle — say how big the file is so the agent can read the rest by range.
+#define CAT_BIG_TEXT 20000L
+static void cat_big_note(const char *name, const cat_range_t *r) {
+    if (r->from || r->bytes <= CAT_BIG_TEXT) return;
+    fprintf(stderr, "\ntfa-cat: %s: %ld lines, %ld bytes — if the output above was cut, print a part: tfa-cat '%s:FROM:TO'\n",
+            name, r->line - (r->last == '\n'), r->bytes, name);
+}
+
 // Rest of `fd` after `head` → out. 0 ok, -1 read error, -2 write error,
 // -3 binary (`check_bin` and a NUL in the first block; nothing written).
-static int cat_copy(int fd, int out, const unsigned char *head, size_t hn, int check_bin) {
+static int cat_copy(int fd, int out, const unsigned char *head, size_t hn, int check_bin, cat_range_t *rng) {
     if (check_bin && hn && memchr(head, 0, hn)) return -3;
     static char buf[64 * 1024];
     for (int first = 1;; first = 0) {
@@ -144,10 +212,16 @@ static int cat_copy(int fd, int out, const unsigned char *head, size_t hn, int c
         if (r < 0) { if (errno == EINTR) continue; return -1; }
         if (first) {
             if (check_bin && r > 0 && memchr(buf, 0, (size_t)r)) return -3;
-            if (hn && write_all(out, head, hn) < 0) return -2;
+            if (hn) {
+                int w = cat_write(out, (const char *)head, hn, rng);
+                if (w < 0) return -2;
+                if (w > 0) return 0;
+            }
         }
         if (r == 0) return 0;
-        if (write_all(out, buf, (size_t)r) < 0) return -2;
+        int w = cat_write(out, buf, (size_t)r, rng);
+        if (w < 0) return -2;
+        if (w > 0) return 0;
     }
 }
 
@@ -232,7 +306,7 @@ static int skill_path(const char *spec, char *out, size_t cap) {
 // A backend resource, as the agent's `read` sees it. On the agent's terminal
 // an image/PDF is attached by the backend directly (no bytes come here);
 // anything else — and everything when piped — is printed like a file.
-static int cat_ref(const char *ref, int attach, int tty) {
+static int cat_ref(const char *ref, int attach, int tty, cat_range_t *rng) {
     if (!attach) { fprintf(stderr, "tfa-cat: %s: refs need an agent shell (TODOFORAI_BLOCK_ID unset)\n", ref); return 1; }
     char err[512], mime[128];
     ws_fd_t s = shell_client_open("fetch", NULL, NULL, -1, ref, tty, err, sizeof err);
@@ -246,7 +320,7 @@ static int cat_ref(const char *ref, int attach, int tty) {
     }
     static char buf[64 * 1024];
     long got = 0;
-    int rc = 0;
+    int rc = 0, done = 0;
     while (got < size) {
         long n = shell_client_recv(s, buf, sizeof buf);
         if (n <= 0) break;
@@ -261,17 +335,29 @@ static int cat_ref(const char *ref, int attach, int tty) {
             return 1;
         }
         got += n;
-        if (write_all(1, buf, (size_t)n) < 0) { rc = 141; break; }
+        int w = cat_write(1, buf, (size_t)n, rng);
+        if (w < 0) { rc = 141; break; }
+        if (w > 0) { done = 1; break; }   // range done: closing cancels the rest
     }
     shell_client_close(s);
-    if (!rc && got != size) { fprintf(stderr, "tfa-cat: %s: transfer broke (%ld of %ld bytes)\n", ref, got, size); rc = 1; }
+    if (!rc && !done && got != size) { fprintf(stderr, "tfa-cat: %s: transfer broke (%ld of %ld bytes)\n", ref, got, size); rc = 1; }
+    if (!rc && tty) cat_big_note(ref, rng);
     return rc;
 }
 
 // One input. 0 ok, 1 error (already reported), 141 stdout gone.
 static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
     int is_stdin = strcmp(arg, "-") == 0;
-    char skill[4096];
+    char skill[4096], spec[4096];
+    cat_range_t rng = { .line = 1, .last = '\n' };
+    if (!is_stdin) {
+        if (cat_split_range(arg, spec, sizeof spec, &rng) < 0) { fprintf(stderr, "tfa-cat: %s: name too long\n", arg); return 1; }
+        if (rng.from && spec[strspn(spec, "0123456789")] == '\0' && !file_exists(spec)) {
+            fprintf(stderr, "tfa-cat: %s: no file before the range — use FILE:FROM:TO (e.g. src/main.c:%s)\n", arg, arg);
+            return 1;
+        }
+        arg = spec;
+    }
     if (!is_stdin && strncmp(arg, "skill:", 6) == 0) {
         if (skill_path(arg + 6, skill, sizeof skill) != 0) {
             fprintf(stderr, "tfa-cat: %s: no such skill on this machine (looked in .agents/skills and .claude/skills of the cwd, its parents and home)\n", arg);
@@ -279,7 +365,7 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
         }
         arg = skill;
     } else if (!is_stdin && strncmp(arg, "todoforai:", 10) == 0 && !file_exists(arg)) {
-        return cat_ref(arg, attach, tty);
+        return cat_ref(arg, attach, tty, &rng);
     }
     int fd = is_stdin ? 0 : sh_open(arg);
     if (fd < 0) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); return 1; }
@@ -296,7 +382,7 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
         else {
             const char *b = arg;
             for (const char *c = arg; *c; c++) if (*c == '/' || *c == '\\') b = c + 1;
-            snprintf(name, sizeof name, "%s", b);
+            snprintf(name, sizeof name, "%.127s", b);
             for (char *p = name; *p; p++) if (*p == '"' || *p == ';' || *p == '\\' || (unsigned char)*p < 32) *p = '_';
         }
         const char *e = !attach
@@ -305,13 +391,14 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
         if (e) { fprintf(stderr, "tfa-cat: %s: not attached: %s\n", arg, e); rc = 1; }
     } else {
         // Binary on the agent's terminal is noise (see cat_ref); piped → bytes.
-        int r = cat_copy(fd, 1, head, hn > 0 ? (size_t)hn : 0, tty);
+        int r = cat_copy(fd, 1, head, hn > 0 ? (size_t)hn : 0, tty, &rng);
         if (r == -1) { fprintf(stderr, "tfa-cat: %s: %s\n", arg, strerror(errno)); rc = 1; }
         else if (r == -2) rc = 141;
         else if (r == -3) {
             fprintf(stderr, "tfa-cat: %s: binary, not printed (use a tool that reads it, or pipe/redirect for the raw bytes)\n", arg);
             rc = 1;
-        }
+        } else if (tty && !is_stdin)
+            cat_big_note(arg, &rng);   // the bash output cap keeps head+tail: say what the middle was
     }
     if (!is_stdin) sh_close(fd);
     return rc;
@@ -322,9 +409,10 @@ int cmd_cat(int argc, char **argv) {
         printf("tfa-cat %s\n", BRIDGE_VERSION); return 0;
     }
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
-        printf("Usage: tfa-cat [FILE|REF]...   (no FILE or - = stdin)\n"
+        printf("Usage: tfa-cat [FILE|REF][:FROM[:TO]]...   (no FILE or - = stdin)\n"
                "cat, but images/PDFs printed to an agent's terminal are attached to the bash call,\n"
                "so the model sees them. Redirected/piped output is raw bytes, exactly like cat.\n"
+               "  FILE:FROM:TO            lines FROM..TO only (FILE:FROM = to the end)\n"
                "  skill:<name>[/<file>]   a skill on this machine (SKILL.md by default)\n"
                "  todoforai:<path>        a TODOforAI file, e.g. todoforai:todos/<todoId>/<name>\n"
                "                          (a folder prints its listing)\n");
