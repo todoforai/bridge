@@ -52,24 +52,31 @@ static int is_release_version(const char *s) {
     return parse_semver(s, v) == 0 && !strpbrk(s, "-+");
 }
 
-int bridge_update_wanted(const char *latest) {
+// Applying an update ends in exit(); without something to start us again
+// that's just a bridge that stopped.
+static int supervised(void) {
+    // The desktop app restarts the bridge it spawned whenever it exits, on
+    // every OS, and swapping the exe doesn't touch the app.
+    if (getenv("TODOFORAI_SUPERVISOR")) return 1;
 #ifdef _WIN32
-    // Windows can't replace a running .exe, so applying an update means
-    // stopping the scheduled task — i.e. killing the very process doing the
-    // update. `todoforai-bridge update`, run from a shell, has no such problem.
-    (void)latest;
+    // The scheduled task: install.ps1 stops it to swap the exe, i.e. kills the
+    // very process doing the update. `todoforai-bridge update`, run from a
+    // shell, has no such problem.
     return 0;
 #else
+    // systemd sets INVOCATION_ID for every unit it runs, launchd reparents its
+    // jobs to PID 1. Any other supervisor (pm2, a wrapper script) is
+    // unrecognised and simply doesn't auto-update — the conservative direction.
+    return getenv("INVOCATION_ID") || getppid() == 1;
+#endif
+}
+
+int bridge_update_wanted(const char *latest) {
     if (!latest || !*latest) return 0;
     if (getenv("TODOFORAI_NO_AUTO_UPDATE")) return 0;
     if (!is_release_version(BRIDGE_VERSION)) return 0;
     if (!is_release_version(latest)) return 0;
-    // Applying an update ends in exit(); without something to start us again
-    // that's just a bridge that stopped. systemd sets INVOCATION_ID for every
-    // unit it runs, launchd reparents its jobs to PID 1. Any other supervisor
-    // (pm2, a wrapper script) is unrecognised and simply doesn't auto-update —
-    // the conservative direction.
-    if (!getenv("INVOCATION_ID") && getppid() != 1) return 0;
+    if (!supervised()) return 0;
 
     long cur[3], want[3];
     if (parse_semver(BRIDGE_VERSION, cur) != 0) return 0;
@@ -79,7 +86,6 @@ int bridge_update_wanted(const char *latest) {
         if (want[i] < cur[i]) return 0;   // never downgrade
     }
     return 0;
-#endif
 }
 
 // ── install dir ────────────────────────────────────────────────────────────

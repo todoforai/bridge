@@ -61,6 +61,10 @@ int main(void) {
     // anything when the harness has a normal parent (make, a shell).
     if (getppid() != 1) check("v9.9.9", 0, "unsupervised — nothing restarts us");
 
+    setenv("TODOFORAI_SUPERVISOR", "app", 1);
+    check("v9.9.9", !dev, "desktop app restarts us");
+    unsetenv("TODOFORAI_SUPERVISOR");
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nall passed\n", fails);
     return fails != 0;
 }
