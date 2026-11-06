@@ -102,7 +102,7 @@ static void run_wrapped(edge_t *e, session_t *s, const char *wrapped, size_t wn)
 }
 
 static void reset_capture(void) {
-    g_frames = 0; g_bytes = 0; g_out_len = 0; g_step_done_after = -1;
+    g_frames = 0; g_bytes = 0; g_out_len = 0; g_step_done_after = -1; g_exit_code = -999;
     g_first_frame_ms = -1; g_t0 = test_now_ms();
 }
 
@@ -257,6 +257,50 @@ int main(void) {
         }
     }
     printf("[no-newline] OK (':'-terminated result line settles the step, rc=130)\n");
+
+    // ── Result line split across reads: "…__:" | "13" | "0:" — a read ending
+    // right after the ':' (no digit yet) used to reject the candidate, so
+    // the step never settled. sleep forces the split into separate reads. ──
+    {
+        const char *splits[] = { "printf '%s:'; sleep 0.3; printf '130:\\n'\n",
+                                 "printf '%s:13'; sleep 0.3; printf '0:\\n'\n",
+                                 "printf '%s:-'; sleep 0.3; printf '1:\\n'\n" };
+        const long want[] = { 130, 130, -1 };
+        for (int k = 0; k < 3; k++) {
+            reset_capture();
+            char w[256];
+            int wn = snprintf(w, sizeof w, splits[k], s->sentinel);
+            ob_resolve(&s->ob, "raw", 3);
+            s->sentinel_len = strlen(s->sentinel);
+            s->state = SESS_RUNNING; s->tail_len = 0;
+            run_wrapped(e, s, w, (size_t)wn);
+            if (g_exit_code != want[k] || memmem(g_out, g_out_len, "__BRIDGE_STEP", 13)) {
+                fprintf(stderr, "[split %d] exitCode %ld want %ld, out: %.*s\n", k, g_exit_code, want[k], (int)g_out_len, g_out);
+                return 1;
+            }
+        }
+    }
+    printf("[split] OK (result line split after ':' / inside the code still settles)\n");
+
+    // ── Park while the result candidate is half-read: park_step must keep
+    // "<sentinel>:13" (not just a name prefix), or the step can never end. ──
+    reset_capture();
+    {
+        ob_resolve(&s->ob, "raw", 3);
+        s->sentinel_len = strlen(s->sentinel);
+        s->state = SESS_RUNNING; s->parked = 0;
+        s->tail_len = 0;
+        int n = snprintf((char *)s->tail_buf, 256, "out\n%s:13", s->sentinel);
+        s->tail_len = (size_t)n;
+        park_step(e, s, 0, "timeout");
+        if (s->tail_len != (size_t)n - 4 || memcmp(s->tail_buf, s->sentinel, s->sentinel_len) != 0) {
+            fprintf(stderr, "[park-candidate] candidate not kept (tail_len=%zu)\n", s->tail_len); return 1;
+        }
+        const char *w = "printf '0:\\n'\n";
+        run_wrapped(e, s, w, strlen(w));
+        if (g_exit_code != 130) { fprintf(stderr, "[park-candidate] exitCode %ld, want 130\n", g_exit_code); return 1; }
+    }
+    printf("[park-candidate] OK (half-read result survives a park)\n");
 
     bridge_pty_close(&s->pty);
     free(e->sessions);

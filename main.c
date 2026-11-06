@@ -1378,6 +1378,7 @@ static int stage_wrapper_file(session_t *s, const char *wrapped, size_t wn,
 // explicit `detach` frame from the user. The deadline is dropped so the
 // timeout no longer fires; the agent drives the step by pid until STEP_DONE,
 // after which normal (one-shot or persistent) teardown rules apply.
+static ssize_t find_sentinel(const session_t *s);
 static void park_step(edge_t *e, session_t *s, int password_prompt, const char *reason) {
     if (s->parked) return;
     s->parked = 1;
@@ -1385,7 +1386,11 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
     // command may be completing right now and a sentinel prefix could already
     // sit in tail_buf (see forward_pty_output). Emitting it would make the
     // sentinel unmatchable and leave the session RUNNING forever.
+    // Same for a whole result candidate whose code/terminator is still in
+    // flight ("<sentinel>:13"): flushing it would lose the step's end.
     size_t keep = sentinel_holdback(s);
+    ssize_t cand = find_sentinel(s);
+    if (cand >= 0) keep = s->tail_len - (size_t)cand;
     if (s->tail_len > keep) {
         size_t emit = s->tail_len - keep;
         ob_append(e, s, s->tail_buf, emit);
@@ -2057,13 +2062,13 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         return n_read;
     }
 
-    // Strict result-line parse: require "<sentinel>:<int>\r?\n". Anything
-    // else (e.g. a sentinel-shaped string in user output without the suffix)
-    // is treated as ordinary output and we keep scanning past it.
+    // Strict result-line parse: require "<sentinel>:<int>:" (current
+    // wrappers) or "<sentinel>:<int> *\r?\n" (legacy). Anything else (e.g. a
+    // sentinel-shaped string in user output without the suffix) is treated
+    // as ordinary output and we keep scanning past it.
     size_t after = (size_t)found + s->sentinel_len;
     int reject = 0;
     int has_code = 0, exit_code = 0;
-    size_t line_end = 0;  // byte index of the terminating \n
 
     if (after >= s->tail_len) {
         // Could still be ours — wait for more bytes.
@@ -2086,7 +2091,6 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         if (any && p < s->tail_len && s->tail_buf[p] == ':') {
             has_code = 1;
             exit_code = (int)(sign * v);
-            line_end = p;
         }
         // ConPTY repaints the line and pads it with spaces to the width it
         // last drew ("__:0        \r\n"); rejecting that left the step running
@@ -2094,16 +2098,16 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         while (any && p < s->tail_len && s->tail_buf[p] == ' ') p++;
         if (has_code) {
             // ':'-terminated — done; the line ending (if any yet) is dropped below.
+        } else if (p >= s->tail_len) {
+            // Read ended inside the code ("…__:", "…__:-", "…__:13") — the
+            // rest is in flight; rejecting here lost the sentinel → hang.
         } else if (!any) {
             reject = 1;
-        } else if (p >= s->tail_len) {
-            // Need more bytes for the terminator — fall through to hold.
         } else if (s->tail_buf[p] == '\r' && p + 1 >= s->tail_len) {
             // Saw \r, need \n — hold.
         } else if (s->tail_buf[p] == '\n' || (s->tail_buf[p] == '\r' && s->tail_buf[p + 1] == '\n')) {
             has_code = 1;
             exit_code = (int)(sign * v);
-            line_end = (s->tail_buf[p] == '\r') ? p + 1 : p;
         } else {
             reject = 1;  // garbage after digits — not our line
         }
@@ -2142,7 +2146,9 @@ static long forward_pty_output(edge_t *e, session_t *s) {
     size_t pre = (size_t)found - trim_back;
     if (pre > 0) ob_append(e, s, s->tail_buf, pre);
 
-    (void)line_end;  // bytes after the sentinel line are silently dropped (they shouldn't exist).
+    // Bytes after the result line in this read (its '\n') are dropped by
+    // run_finish; in a persistent session a '\n' split into the next read
+    // reaches the idle path as stray OUTPUT (no blockId) — harmless.
     ob_finish(e, s);  // emit truncation notice + tail (no-op if nothing dropped)
     if (s->cmd_mode) {
         // Make the degraded mode unmissable for the agent on every step.
@@ -2820,7 +2826,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
             // scan. Env exports (TODOFORAI_*, PAGER) are skipped: cmd `set`
             // semantics differ and the tfa-* tools don't work here anyway.
             wn = snprintf(wrapped, wrapped_cap,
-                "echo __BRIDGE_^%s\r\n%.*s\r\necho __BRIDGE_^%s:%%ERRORLEVEL%%\r\n",
+                "echo __BRIDGE_^%s\r\n%.*s\r\necho __BRIDGE_^%s:%%ERRORLEVEL%%:\r\n",
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 (int)cmd_len, cmd, s->sentinel + 9);
         } else if (e->subagent_token[0]) {
