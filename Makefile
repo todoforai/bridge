@@ -33,11 +33,11 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c \
+COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c bg_task.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = agent_browser_guard.h noise_ws.h pty.h pty_win.c identity.h identity_server.h cdp_local.h adb_relay.h shell_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
+HDRS = bg_task.h agent_browser_guard.h noise_ws.h pty.h pty_win.c identity.h identity_server.h cdp_local.h adb_relay.h shell_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -134,7 +134,7 @@ release-windows-x64: agent_browser_guard.h | build
 # PTY helpers used by the test harnesses (pty_posix.c calls into env_path.c).
 TEST_DEPS = pty_posix.c env_path.c policy.c json.c
 # Full-daemon tests list json.c themselves; policy.c needs it too.
-DAEMON_TEST_DEPS = pty_posix.c pty_pool.c env_path.c policy.c
+DAEMON_TEST_DEPS = pty_posix.c pty_pool.c env_path.c policy.c bg_task.c
 
 # Windows ConPTY smoke test. Cross-compiles from Linux/macOS with `zig`, but
 # the produced .exe must be RUN on a real Windows host (windows-latest in CI)
@@ -148,6 +148,17 @@ test-pty-win: | build
 	    -Wno-macro-redefined \
 	    $(CFLAGS) -iquote . \
 	    -o build/test-pty-win.exe test/test_pty_win.c pty_win.c env_path.c tools.c json.c policy.c \
+	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
+
+# test/test_bg.c for Windows (ConPTY + Git Bash); run the .exe on a Windows host.
+.PHONY: test-bg-win
+test-bg-win: agent_browser_guard.h | build
+	zig cc -target x86_64-windows-gnu \
+	    -U_WIN32_WINNT -UNTDDI_VERSION -UWINVER \
+	    -D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006 -DWINVER=0x0A00 \
+	    -Wno-macro-redefined \
+	    $(CFLAGS) -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -o build/test-bg-win.exe test/test_bg.c $(filter-out entry_main.c main.c,$(WIN_SRCS)) \
 	    -lws2_32 -ladvapi32 -luserenv -lshell32 -lole32
 
 # Sentinel-scanner smoke test: spawns a real PTY with echo off, runs a few
@@ -351,9 +362,18 @@ test-park: | build
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-park
 
+# Background tasks: STEP_BACKGROUND, .output/.input files, TASK_STATE/EXIT/KILL/LIST.
+.PHONY: test-bg
+test-bg: | build
+	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
+	    -DBRIDGE_VERSION='"test"' -o build/test-bg \
+	    test/test_bg.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
+	./build/test-bg
+
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c shell_relay.c shell_cli.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c
+BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c shell_relay.c shell_cli.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c bg_task.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 

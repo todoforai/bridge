@@ -396,7 +396,7 @@ static const char *RO_ROOTS[] = { "/usr", "/bin", "/sbin", "/lib", "/lib64", "/l
                                   "/nix", "/snap", "/var/lib", "/proc", "/sys", "/run", NULL };
 static const char *RW_ROOTS[] = { "/tmp", "/var/tmp", "/dev", NULL };
 static const char *RW_HOME[]  = { ".cache", ".local", ".npm", ".bun", ".cargo", ".rustup", ".nvm", ".deno", "go",
-                                  ".todoforai/bin", ".todoforai/tools", ".gitconfig", ".npmrc", NULL };
+                                  ".todoforai/bin", ".todoforai/tools", ".todoforai/tasks", ".gitconfig", ".npmrc", NULL };
 static const char *RO_HOME[]  = { ".bashrc", ".zshrc", ".profile", ".bash_profile", ".zshenv", NULL };
 
 #define LL_RO_FILE (LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE)

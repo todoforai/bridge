@@ -102,6 +102,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "shell_relay.h"
 #include "cdp_local.h"
 #include "keep_awake.h"
+#include "bg_task.h"
 
 // Expand a leading `~` / `~/rest` / `~user/rest` to an absolute path, matching
 // what /bin/sh would do for shell commands (write_file_b64 bypasses the shell,
@@ -411,6 +412,20 @@ typedef struct {
     uint8_t obuf[OUT_BUF_CAP];
     size_t  obuf_len;
     int64_t obuf_since_ms;  // 0 = empty; else when the oldest byte was queued
+
+    // Background task (bg_task.h). `bg` = the step was handed off: the
+    // backend's RUN is settled (STEP_BACKGROUND), the session stays
+    // SESS_RUNNING, output goes to the .output file instead of OUTPUT frames,
+    // .input is polled into the PTY, and the sentinel yields TASK_EXIT.
+    int       bg;
+    int       bg_on_park;       // RUN asked: park ⇒ become a task, not STEP_AWAITING_INPUT
+    int       bg_awaiting;      // last awaitingInput reported (TASK_STATE)
+    int       bg_killed;        // TASK_KILL received
+    int64_t   bg_kill_at_ms;    // SIGKILL deadline after the ^C of a TASK_KILL; 0 = none
+    int64_t   bg_started_wall;  // epoch ms, startedAt
+    int64_t   bg_started_mono;
+    int64_t   bg_in_poll_ms;
+    bg_task_t bgt;
 } session_t;
 
 // Does the emitted output end on an unanswered question? A program that wants
@@ -1379,9 +1394,7 @@ static int stage_wrapper_file(session_t *s, const char *wrapped, size_t wn,
 // timeout no longer fires; the agent drives the step by pid until STEP_DONE,
 // after which normal (one-shot or persistent) teardown rules apply.
 static ssize_t find_sentinel(const session_t *s);
-static void park_step(edge_t *e, session_t *s, int password_prompt, const char *reason) {
-    if (s->parked) return;
-    s->parked = 1;
+static void park_flush(edge_t *e, session_t *s) {
     // Flush held-back output, but keep any trailing sentinel prefix: the
     // command may be completing right now and a sentinel prefix could already
     // sit in tail_buf (see forward_pty_output). Emitting it would make the
@@ -1398,6 +1411,17 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
         s->tail_len = keep;
     }
     ob_finish(e, s);
+}
+
+static int bg_handoff(edge_t *e, session_t *s, const char *reason, int password_prompt);
+
+static void park_step(edge_t *e, session_t *s, int password_prompt, const char *reason) {
+    if (s->parked || s->bg) return;
+    // The RUN opted in: a step that would park becomes a background task in
+    // place (same PTY, same pid) instead of STEP_AWAITING_INPUT.
+    if (s->bg_on_park && bg_handoff(e, s, reason, password_prompt) == 0) return;
+    s->parked = 1;
+    park_flush(e, s);
     // one_shot is deliberately NOT cleared: the session only needs to outlive
     // the *step* (agent resumes/kills by pid via the backend's pending run);
     // once STEP_DONE settles it the backend forgets the pid, so run_finish
@@ -1413,6 +1437,8 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
 // One-shot sessions tear down here (parked or not); agent-owned sessions
 // (RUN carried a sessionId) survive.
 static void run_finish(session_t *s) {
+    if (s->bg) bg_task_close(&s->bgt);   // TASK_EXIT (if any) already sent
+    s->bg = 0; s->bg_on_park = 0; s->bg_awaiting = 0; s->bg_killed = 0; s->bg_kill_at_ms = 0;
     s->state = SESS_IDLE;
     s->tail_len = 0;
     s->deadline_ms = 0;
@@ -1436,6 +1462,146 @@ static void run_finish(session_t *s) {
     }
     // After the shell is gone: while it lives it may still hold the file.
     unstage_wrapper_file(s);
+}
+
+// ── Background tasks (bg_task.h) ────────────────────────────────────────────
+// Frames (all carry pid = SHELL_PID, the task id):
+//   STEP_BACKGROUND {blockId, sessionId, pid, reason, outputPath, inputPath,
+//                    startedAt, passwordPrompt, truncated}  — settles the RUN
+//   TASK_STATE      {pid, awaitingInput[, stdinWaiter]}
+//   TASK_EXIT       {pid, exitCode|null, killed, durationMs, startedAt,
+//                    outputPath, tail}
+// TASK_EXIT is lost if the backend is unreachable at that moment; it then
+// reconciles with TASK_LIST after reconnect (absent pid ⇒ exited).
+#define BG_MAX_TASKS 32
+#define BG_KILL_GRACE_MS 3000
+#define BG_TAIL_BYTES 2048
+
+static int bg_count(const edge_t *e) {
+    int n = 0;
+    for (int i = 0; i < g_max_sessions; i++) n += e->sessions[i].active && e->sessions[i].bg;
+    return n;
+}
+
+static int emit_bg_common(char *buf, size_t cap, size_t *u, const char *type, const session_t *s) {
+    char pid_buf[24]; snprintf(pid_buf, sizeof pid_buf, "%ld", SHELL_PID(s));
+    char st_buf[24];  snprintf(st_buf, sizeof st_buf, "%lld", (long long)s->bg_started_wall);
+    return json_emit_raw(buf, cap, u, "{", 1) < 0 ||
+           jfield_str(buf, cap, u, "type", type, -1, 0) < 0 ||
+           jfield_str(buf, cap, u, "sessionId", s->session_id, -1, 1) < 0 ||
+           emit_todo_id(buf, cap, u, s) < 0 ||
+           jfield_raw(buf, cap, u, "pid", pid_buf, 1) < 0 ||
+           jfield_raw(buf, cap, u, "startedAt", st_buf, 1) < 0 ? -1 : 0;
+}
+
+// Hand the in-flight step off as a background task: settle the RUN with
+// STEP_BACKGROUND and keep the PTY. -1 ⇒ not possible (cap, file error); the
+// caller falls back to its foreground path.
+static int bg_handoff(edge_t *e, session_t *s, const char *reason, int password_prompt) {
+    if (bg_count(e) >= BG_MAX_TASKS) {
+        fprintf(stderr, "background: %d tasks running — %s stays foreground\n", BG_MAX_TASKS, s->session_id);
+        return -1;
+    }
+    if (bg_task_open(&s->bgt, SHELL_PID(s)) != 0) {
+        fprintf(stderr, "background: cannot create task files for pid %ld: %s\n", SHELL_PID(s), strerror(errno));
+        return -1;
+    }
+    // Still draining the begin marker (handoff right after delivery): those
+    // bytes are wrapper echo, never output — leave them to the drain.
+    if (!s->draining_begin) park_flush(e, s);
+    flush_output(e, s);
+    int awaiting = password_prompt || !strcmp(reason, "probe");
+    char buf[4096]; size_t u = 0;
+    if (emit_bg_common(buf, sizeof buf, &u, "step_background", s) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "blockId", s->run_block_id, (long)s->run_block_id_len, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "reason", reason, -1, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "outputPath", s->bgt.out_path, -1, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "inputPath", s->bgt.in_path, -1, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "awaitingInput", awaiting ? "true" : "false", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "passwordPrompt", password_prompt ? "true" : "false", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "truncated", s->ob.truncated ? "true" : "false", 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) {
+        bg_task_close(&s->bgt);
+        return -1;
+    }
+    send_json(e, buf, u);
+    s->bg = 1;
+    s->parked = 0;
+    s->deadline_ms = 0;          // a task lives until it exits or TASK_KILL
+    s->bg_awaiting = awaiting;
+    s->bg_in_poll_ms = 0;
+    ob_reset(&s->ob);
+    // The step's routing is over: late frames must not carry its blockId.
+    s->run_block_id_len = 0; s->run_block_id[0] = '\0';
+    fprintf(stderr, "RUN → background task pid %ld (%s): %s\n", SHELL_PID(s), reason, s->bgt.out_path);
+    return 0;
+}
+
+static void send_task_state(edge_t *e, session_t *s, int awaiting) {
+    s->bg_awaiting = awaiting;
+    char buf[4096]; size_t u = 0;
+    char waiter[2048]; size_t wl = awaiting ? bridge_pty_stdin_waiter(&s->pty, waiter, sizeof waiter) : 0;
+    if (emit_bg_common(buf, sizeof buf, &u, "task_state", s) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "awaitingInput", awaiting ? "true" : "false", 1) < 0 ||
+        (wl > 0 && jfield_str(buf, sizeof buf, &u, "stdinWaiter", waiter, (long)wl, 1) < 0) ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    send_json(e, buf, u);
+}
+
+// TASK_EXIT; the caller then run_finish()es (closes files, frees one-shots).
+static void send_task_exit(edge_t *e, session_t *s, int has_code, int code) {
+    char tail[BG_TAIL_BYTES];
+    size_t tl = bg_task_tail(&s->bgt, tail, sizeof tail);
+    redact_token(e, (uint8_t *)tail, tl);
+    char buf[BG_TAIL_BYTES * 6 + 2048]; size_t u = 0;
+    char rc[24]; snprintf(rc, sizeof rc, has_code ? "%d" : "null", code);
+    char dur[24]; snprintf(dur, sizeof dur, "%lld", (long long)(monotonic_ms() - s->bg_started_mono));
+    if (emit_bg_common(buf, sizeof buf, &u, "task_exit", s) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "exitCode", rc, 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "killed", s->bg_killed ? "true" : "false", 1) < 0 ||
+        jfield_raw(buf, sizeof buf, &u, "durationMs", dur, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "outputPath", s->bgt.out_path, -1, 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "tail", tail, (long)tl, 1) < 0 ||
+        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    if (send_json(e, buf, u) != 0)
+        fprintf(stderr, "TASK_EXIT pid %ld not delivered (offline) — TASK_LIST reconciles\n", SHELL_PID(s));
+    fprintf(stderr, "background task pid %ld exited (%s)\n", SHELL_PID(s), rc);
+}
+
+static session_t *find_task(edge_t *e, long pid) {
+    for (int i = 0; i < g_max_sessions; i++) {
+        session_t *s = &e->sessions[i];
+        if (s->active && s->bg && SHELL_PID(s) == pid) return s;
+    }
+    return NULL;
+}
+
+// TASK_LIST: every live task (paths are derivable from pid and were sent in
+// STEP_BACKGROUND). Sent after each (re)connect and on request, so the
+// backend can close registry rows whose TASK_EXIT it never got.
+static void send_task_list(edge_t *e, const char *rid, size_t rid_len) {
+    char buf[BUF_SIZE * 8]; size_t u = 0;
+    if (json_emit_raw(buf, sizeof buf, &u, "{", 1) < 0 ||
+        jfield_str(buf, sizeof buf, &u, "type", "task_list", -1, 0) < 0 ||
+        (rid_len && jfield_str(buf, sizeof buf, &u, "requestId", rid, (long)rid_len, 1) < 0) ||
+        json_emit_raw(buf, sizeof buf, &u, ",\"tasks\":[", 10) < 0) return;
+    int first = 1;
+    for (int i = 0; i < g_max_sessions; i++) {
+        session_t *s = &e->sessions[i];
+        if (!s->active || !s->bg) continue;
+        if ((!first && json_emit_raw(buf, sizeof buf, &u, ",", 1) < 0) ||
+            emit_bg_common(buf, sizeof buf, &u, "task", s) < 0 ||
+            jfield_raw(buf, sizeof buf, &u, "awaitingInput", s->bg_awaiting ? "true" : "false", 1) < 0 ||
+            json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) goto overflow;
+        first = 0;
+    }
+    if (json_emit_raw(buf, sizeof buf, &u, "]}", 2) < 0) goto overflow;
+    send_json(e, buf, u);
+    return;
+overflow:
+    // Absent ⇒ "exited" for the receiver, so a partial list would close live
+    // tasks. Entries are ~250 B × BG_MAX_TASKS: unreachable, but never lie.
+    fprintf(stderr, "task_list overflow — not sent\n");
 }
 
 // Search tail_buf for sentinel start (returns offset, or -1 if absent).
@@ -1847,6 +2013,20 @@ static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
     // are only kept for the truncation tail — otherwise a prompt printed after
     // 10k of build log would be invisible to the awaiting-input probe.
     otail_append(s, d, n);
+    // Background task: the file is the whole log; no OUTPUT frames, no caps.
+    // Same token scrub OUTPUT frames get (flush_output), on a copy: `d` may
+    // still be scanned by the caller.
+    if (s->bg) {
+        uint8_t cp[BUF_SIZE];
+        for (size_t off = 0; off < n; ) {
+            size_t k = n - off < sizeof cp ? n - off : sizeof cp;
+            memcpy(cp, d + off, k);
+            redact_token(e, cp, k);
+            bg_task_write(&s->bgt, cp, k);
+            off += k;
+        }
+        return;
+    }
     const uint8_t *p = d; size_t rem = n;
     if (ob->head_limit == OB_NOLIMIT) {
         ob->total_len += ob_emit_capped(e, s, p, rem);
@@ -1875,6 +2055,7 @@ static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
 // frame flag, so call this just before it.
 static void ob_finish(edge_t *e, session_t *s) {
     out_policy_t *ob = &s->ob;
+    if (s->bg) return;   // everything already went to the .output file
     if (ob->tail_lines > 0) {
         // Stripped `| tail -N`: emit the last N lines of what rolled through
         // (≤ last_limit bytes — a huge-line tail yields fewer lines). The
@@ -2150,7 +2331,7 @@ static long forward_pty_output(edge_t *e, session_t *s) {
     // run_finish; in a persistent session a '\n' split into the next read
     // reaches the idle path as stray OUTPUT (no blockId) — harmless.
     ob_finish(e, s);  // emit truncation notice + tail (no-op if nothing dropped)
-    if (s->cmd_mode) {
+    if (s->cmd_mode && !s->bg) {
         // Make the degraded mode unmissable for the agent on every step.
         static const char notice[] =
             "\n[cmd.exe limited mode - POSIX shell missing; bridge is provisioning busybox "
@@ -2158,7 +2339,8 @@ static long forward_pty_output(edge_t *e, session_t *s) {
             "(https://git-scm.com/download/win) or set BRIDGE_SHELL, then restart the bridge]\n";
         send_output_bytes(e, s, (const uint8_t *)notice, sizeof notice - 1);
     }
-    send_step_done(e, s, has_code, exit_code, /*timedOut=*/0);
+    if (s->bg) send_task_exit(e, s, has_code, exit_code);
+    else send_step_done(e, s, has_code, exit_code, /*timedOut=*/0);
     // run_finish drops the run to SESS_IDLE, and for one-shot sessions also
     // closes the PTY + clears s->active — so the caller's drain loop must
     // re-check s->active before reading again.
@@ -2390,6 +2572,29 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (detached && has_sid) {
             free(cmd);
             return send_error(e, NULL, 0, bid, bid_len, "INVALID_DETACHED", "detached run cannot target a sessionId");
+        }
+        // `background`: hand the step off as a task (bg_task.h) right after
+        // delivery. `backgroundOnPark`: do the same where it would otherwise
+        // park (timeout, stdin probe, detach). Either way the RUN settles
+        // with STEP_BACKGROUND and the task reports TASK_EXIT later.
+        int bg_now = 0, bg_park = 0;
+        bg_now  = json_get_bool(msg, msg_len, "background", &bg_now) && bg_now;
+        bg_park = json_get_bool(msg, msg_len, "backgroundOnPark", &bg_park) && bg_park;
+        if (bg_now && detached) {
+            free(cmd);
+            return send_error(e, NULL, 0, bid, bid_len, "INVALID_BACKGROUND", "background and detached are exclusive");
+        }
+        // One-shot only: the pid is the task id and names its files, and a
+        // persistent session would reuse it for the next task.
+        if ((bg_now || bg_park) && has_sid) {
+            free(cmd);
+            return send_error(e, NULL, 0, bid, bid_len, "INVALID_BACKGROUND", "background runs cannot target a sessionId");
+        }
+        if (bg_now && bg_count(e) >= BG_MAX_TASKS) {
+            free(cmd);
+            char em[96];
+            snprintf(em, sizeof em, "%d background tasks already running; stop one first", BG_MAX_TASKS);
+            return send_error(e, NULL, 0, bid, bid_len, "MAX_TASKS", em);
         }
 
         // Resolve / allocate session. Missing sessionId ⇒ spawn one-shot.
@@ -2680,7 +2885,9 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         ob_resolve(&s->ob, omode, omode_len);
         // Trailing `| tail -N` → bridge-side cut (see strip_trailing_tail).
         // cmd.exe has no tail; leave that dialect alone.
-        if (!s->cmd_mode && ob_tail_strip_ok(&s->ob)) {
+        // Background-capable runs keep the pipeline literal: the task file
+        // must hold what the command itself prints.
+        if (!s->cmd_mode && !bg_now && !bg_park && ob_tail_strip_ok(&s->ob)) {
             size_t plen = 0;
             long tl = strip_trailing_tail(cmd, cmd_len, &plen);
             if (tl > 0) { cmd_len = plen; ob_set_tail_lines(&s->ob, tl); }
@@ -2872,6 +3079,13 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->last_pause_poll_ms = s->last_active_ms;
         s->pause_consec_ticks = 0;
         s->parked = 0;
+        s->bg = 0;
+        s->bg_on_park = bg_now || bg_park;
+        s->bg_awaiting = 0;
+        s->bg_killed = 0;
+        s->bg_kill_at_ms = 0;
+        s->bg_started_wall = bg_wall_ms();
+        s->bg_started_mono = s->last_active_ms;
 
         send_run_started(e, s, created);
 
@@ -2932,6 +3146,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // drain (≤4KB) needs the grace window.
         s->last_input_ms = monotonic_ms();
         free(wrapped);
+        if (bg_now && bg_handoff(e, s, "requested", 0) != 0) {
+            static const char note[] = "bridge: could not start a background task (task files not writable); running in the foreground\n";
+            send_output_bytes(e, s, (const uint8_t *)note, sizeof note - 1);
+        }
         #undef RUN_FAIL_CLEANUP
 
     } else if (IS("subagent_token")) {
@@ -3048,7 +3266,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // step the probe can't see (container kernels, see the deadline loop)
         // would go silent forever instead of parking again with its output.
         long resume_raw = 0;
-        if (s->state == SESS_RUNNING && json_get_long(msg, msg_len, "timeoutMs", &resume_raw) && resume_raw > 0)
+        if (s->state == SESS_RUNNING && !s->bg && json_get_long(msg, msg_len, "timeoutMs", &resume_raw) && resume_raw > 0)
             s->deadline_ms = monotonic_ms() + (int64_t)resume_raw;
 
         if (has_rid) send_ack(e, rid, rid_len);
@@ -3482,6 +3700,25 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                      (int)fn_len, fn);
             send_function_call_error(e, req, req_len, aid, aid_len, eid, eid_len, errmsg);
         }
+    } else if (IS("task_kill")) {
+        // {pid[, requestId]}: ^C through the PTY (reaches native Windows exes
+        // too), SIGKILL/TerminateJobObject after BG_KILL_GRACE_MS. TASK_EXIT
+        // follows from the normal exit path with killed:true.
+        const char *rid = NULL; size_t rid_len = 0;
+        int has_rid = json_get_str(msg, msg_len, "requestId", &rid, &rid_len) && rid_len > 0 && is_valid_id(rid, rid_len);
+        long pid = 0;
+        session_t *s = json_get_long(msg, msg_len, "pid", &pid) ? find_task(e, pid) : NULL;
+        if (!s)
+            return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "TASK_NOT_FOUND", "no running background task with that pid")
+                           : send_error(e, NULL, 0, NULL, 0, "TASK_NOT_FOUND", "no running background task with that pid");
+        s->bg_killed = 1;
+        if (!s->bg_kill_at_ms) s->bg_kill_at_ms = monotonic_ms() + BG_KILL_GRACE_MS;
+        (void)bridge_pty_write_input_nb(&s->pty, "\x03", 1);   // full queue: escalation covers it
+        if (has_rid) send_ack(e, rid, rid_len);
+    } else if (IS("task_list")) {
+        const char *rid = NULL; size_t rid_len = 0;
+        if (!(json_get_str(msg, msg_len, "requestId", &rid, &rid_len) && is_valid_id(rid, rid_len))) rid_len = 0;
+        send_task_list(e, rid, rid_len);
     } else if (IS("keep_awake")) {
         // Owner's HostCard toggle. Persisted to config.json (not a security
         // file — see keep_awake.h); the hold follows on the next tick.
@@ -3556,6 +3793,17 @@ static void service_sessions(edge_t *e) {
     for (int i = 0; i < g_max_sessions; i++) {
         session_t *s = &e->sessions[i];
         if (!s->active) continue;
+        // A task's log must be complete: read what the shell left in the PTY
+        // before reaping it (the drain below runs after this loop). A sentinel
+        // found here finishes the task the normal way and frees the slot.
+        // Budgeted like the main drain: a chatty live task must not starve the
+        // loop, and an exited shell's leftovers are far below it.
+        for (size_t got = 0; s->active && s->bg && got < 1u << 20; ) {
+            long r = forward_pty_output(e, s);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        if (!s->active) continue;
         int code;
         if (bridge_pty_reap(&s->pty, &code)) {
             if (s->state == SESS_RUNNING) {
@@ -3577,7 +3825,8 @@ static void service_sessions(edge_t *e) {
                     s->tail_len = 0;
                 }
                 ob_finish(e, s);
-                send_step_done(e, s, /*has_code=*/1, code, /*timedOut=*/0);
+                if (s->bg) send_task_exit(e, s, /*has_code=*/1, code);
+                else send_step_done(e, s, /*has_code=*/1, code, /*timedOut=*/0);
                 // Shell already exited — outer block owns the close. Clear
                 // one_shot so run_finish doesn't try to SIGKILL/close again.
                 s->one_shot = 0;
@@ -3606,9 +3855,10 @@ static void service_sessions(edge_t *e) {
         // typed, so a park would strand the step instead of reporting it.
         // Settle it; one-shot sessions are torn down by run_finish().
         if (!s->no_input) {
-            park_step(e, s, /*password_prompt=*/0, "timeout");
+            park_step(e, s, /*password_prompt=*/0, "timeout");   // converts when bg_on_park
             continue;
         }
+        if (s->bg_on_park && bg_handoff(e, s, "timeout", 0) == 0) continue;
         if (s->tail_len > 0) {
             ob_append(e, s, s->tail_buf, s->tail_len);
             s->tail_len = 0;
@@ -3635,10 +3885,46 @@ static void service_sessions(edge_t *e) {
         // signal can never fire here — the prompt text itself is the tell.
         int tail = output_tail_is_prompt(s);
         if (blocked == 2 && (now - s->last_active_ms < OPAQUE_QUIET_MS || !tail)) blocked = 0;
-        if (!blocked) { s->pause_consec_ticks = 0; continue; }
+        if (!blocked) {
+            s->pause_consec_ticks = 0;
+            if (s->bg && s->bg_awaiting) send_task_state(e, s, 0);
+            continue;
+        }
         if (++s->pause_consec_ticks != PAUSE_CONFIRM_TICKS) continue;
 
+        if (s->bg) { if (!s->bg_awaiting) send_task_state(e, s, 1); continue; }
         park_step(e, s, pwd || tail == 2, "probe");
+    }
+
+    // Background tasks: feed new .input bytes into the PTY; escalate a
+    // TASK_KILL whose ^C was ignored.
+    for (int i = 0; i < g_max_sessions; i++) {
+        session_t *s = &e->sessions[i];
+        if (!s->active || !s->bg) continue;
+        if (s->bg_kill_at_ms && now >= s->bg_kill_at_ms) {
+            s->bg_kill_at_ms = 0;
+            fprintf(stderr, "background task pid %ld ignored ^C — SIGKILL\n", SHELL_PID(s));
+            bridge_pty_kill_tree(&s->pty);   // reap → TASK_EXIT
+            continue;
+        }
+        // Not before the command starts: bytes typed while the shell is still
+        // reading the wrapper line are consumed by its line reader (measured:
+        // lost under Git Bash/ConPTY), and the file keeps them until then.
+        if (s->draining_begin || now - s->bg_in_poll_ms < PAUSE_POLL_MS) continue;
+        s->bg_in_poll_ms = now;
+        // Non-blocking: a task that isn't reading stdin keeps its bytes in
+        // the file (in_off only advances by what the PTY took) instead of
+        // stalling the loop. Peek is bounded so a 4 KB slice per tick.
+        uint8_t in[BUF_SIZE];
+        long n = bg_task_peek_input(&s->bgt, in, sizeof in);
+        if (n <= 0) continue;
+        long took = bridge_pty_write_input_nb(&s->pty, in, (size_t)n);
+        if (took < 0) { fprintf(stderr, "background task pid %ld: PTY input write failed\n", SHELL_PID(s)); continue; }
+        if (took == 0) continue;
+        s->bgt.in_off += took;
+        s->last_input_ms = s->last_active_ms = monotonic_ms();
+        s->pause_consec_ticks = 0;
+        if (s->bg_awaiting) send_task_state(e, s, 0);
     }
 
     // Drain PTY masters (non-blocking; returns 0 on EAGAIN). Drain each session
@@ -3653,7 +3939,8 @@ static void service_sessions(edge_t *e) {
         // Backpressure: leave PTY bytes in the kernel buffer while the WS TX
         // queue is backed up (slow network) instead of ballooning it — the
         // next tick picks them up after ws_io_out drains.
-        while (s->active && drained < 1u << 20 && e->ws.tx_len < 1u << 20) {
+        // A background task writes to its file, not the socket: exempt.
+        while (s->active && drained < 1u << 20 && (s->bg || e->ws.tx_len < 1u << 20)) {
             long n = forward_pty_output(e, s);
             if (n <= 0) break;
             drained += (size_t)n;
@@ -3706,6 +3993,7 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
         // First app frame from the server post-auth (token push, ping, RUN…):
         // the server validated our device credentials.
         e->auth_confirmed = 1;
+        if (!e->mayfly) send_task_list(e, NULL, 0);   // reconcile tasks across reconnects
         if (e->user_email && e->user_email[0])
             fprintf(stderr, "✓ Authenticated as %s\n", e->user_email);
         else
@@ -4417,6 +4705,7 @@ int bridge_main(int argc, char **argv) {
     bridge_link_tool(bridge_jobs_self_path(), "adb", 0);       // phones by name; else the real adb
 #endif
     bridge_policy_load();
+    bg_task_reap_old();   // also creates ~/.todoforai/tasks before the jail grants it
     if (g_policy.active && g_policy.broken)
         fprintf(stderr, "policy: %s is UNUSABLE (%s) — denying all paths and shells until fixed\n",
                 g_policy.path, g_policy.err);
@@ -4656,6 +4945,7 @@ done:
 #endif
     for (int i = 0; i < g_max_sessions; i++) {
         if (e->sessions[i].active) bridge_pty_close(&e->sessions[i].pty);
+        if (e->sessions[i].bg) bg_task_close(&e->sessions[i].bgt);
         unstage_wrapper_file(&e->sessions[i]);
     }
     pty_pool_shutdown();
