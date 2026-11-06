@@ -171,7 +171,7 @@ static char *bridge_expand_tilde(const char *p) {
 // ── Session ─────────────────────────────────────────────────────────────────
 
 // Per-step sentinel envelope (bridge owns this; backend never sees raw bytes).
-//   Wrapper:    trap : INT; ( <user-cmd>\n); __RC=$?; printf '\n<sentinel>:%d\n' "$__RC"\n
+//   Wrapper:    trap : INT; ( <user-cmd>\n); __RC=$?; printf '\n<sentinel>:%d:\n' "$__RC"\n
 //   The user command runs in a subshell so ^C (SIGINT to the fg pgrp) kills it
 //   and the *outer* shell survives (trap) to print the sentinel with rc=130.
 //   A brace group would die with the shell and the step would never settle.
@@ -2078,11 +2078,23 @@ static long forward_pty_output(edge_t *e, session_t *s) {
         while (p < s->tail_len && s->tail_buf[p] >= '0' && s->tail_buf[p] <= '9') {
             v = v * 10 + (s->tail_buf[p] - '0'); p++; any = 1;
         }
+        // The wrapper closes the code with a ':' ("<sentinel>:<rc>:\n"): a
+        // printable terminator survives ConPTY, the '\n' does not always —
+        // after a native app's ^C traceback conhost renders it as a cursor
+        // move ("__:130\e[17;1H", stripped by vt_strip) and the step hung
+        // until its deadline parked it, the sentinel leaked into output.
+        if (any && p < s->tail_len && s->tail_buf[p] == ':') {
+            has_code = 1;
+            exit_code = (int)(sign * v);
+            line_end = p;
+        }
         // ConPTY repaints the line and pads it with spaces to the width it
         // last drew ("__:0        \r\n"); rejecting that left the step running
         // until its deadline parked it, with the sentinel leaked into output.
         while (any && p < s->tail_len && s->tail_buf[p] == ' ') p++;
-        if (!any) {
+        if (has_code) {
+            // ':'-terminated — done; the line ending (if any yet) is dropped below.
+        } else if (!any) {
             reject = 1;
         } else if (p >= s->tail_len) {
             // Need more bytes for the terminator — fall through to hold.
@@ -2814,7 +2826,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         } else if (e->subagent_token[0]) {
             wn = snprintf(wrapped, wrapped_cap,
                 CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'; "
-                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; " SUDO_ASKPASS_FN "%strap : INT; " RUN_BODY_FMT "; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                "export TODOFORAI_API_TOKEN=%s TODOFORAI_API_URL=%s%s%s%s%s%s%s; " SUDO_ASKPASS_FN "%strap : INT; " RUN_BODY_FMT "; __RC=$?; printf '\\n%s:%%d:\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 e->subagent_token, e->api_url,
@@ -2829,7 +2841,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 // is emitted only when there is something to export; fenv/cenv
                 // are full `; export …` / `; unset …` statements.
                 CANON_ON "%sprintf '\\n__BRIDGE_''%s\\n'%s%s%s%s%s; "
-                SUDO_ASKPASS_FN "%strap : INT; " RUN_BODY_FMT "; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n",
+                SUDO_ASKPASS_FN "%strap : INT; " RUN_BODY_FMT "; __RC=$?; printf '\\n%s:%%d:\\n' \"$__RC\"\n",
                 cdpre,
                 s->begin_sentinel + 9 /* skip "__BRIDGE_" */,
                 idenv[0] ? "; export" : "", idenv,

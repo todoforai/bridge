@@ -24,6 +24,7 @@ static size_t g_bytes;           // decoded OUTPUT payload bytes
 static char   g_out[2 * 1024 * 1024];
 static size_t g_out_len;
 static int    g_step_done_after;  // g_frames when step_done arrived (-1 = never)
+static long   g_exit_code = -999;  // exitCode of the last step_done
 static double g_t0;               // run start, for the age-flush bound
 static double g_first_frame_ms;   // when the first OUTPUT frame was emitted
 
@@ -52,7 +53,11 @@ int bridge_test_noise_send(noise_ws_t *n, ws_t *w, const uint8_t *pt, size_t pt_
 static int test_capture(const char *json, size_t len) {
     const char *type = NULL; size_t type_len = 0;
     if (!json_get_str(json, len, "type", &type, &type_len)) return 0;
-    if (type_len == 9 && memcmp(type, "step_done", 9) == 0) { g_step_done_after = g_frames; return 0; }
+    if (type_len == 9 && memcmp(type, "step_done", 9) == 0) {
+        g_step_done_after = g_frames;
+        if (!json_get_long(json, len, "exitCode", &g_exit_code)) g_exit_code = -999;
+        return 0;
+    }
     if (!(type_len == 6 && memcmp(type, "output", 6) == 0)) return 0;
 
     const char *data = NULL; size_t data_len = 0;
@@ -66,6 +71,8 @@ static int test_capture(const char *json, size_t len) {
     return 0;
 }
 
+static void run_wrapped(edge_t *e, session_t *s, const char *wrapped, size_t wn);
+
 // Drive a one-shot RUN to completion the way the main loop does.
 static void run_cmd(edge_t *e, session_t *s, const char *cmd, const char *mode) {
     ob_resolve(&s->ob, mode, strlen(mode));
@@ -77,9 +84,14 @@ static void run_cmd(edge_t *e, session_t *s, const char *cmd, const char *mode) 
 
     char wrapped[4096];
     int wn = snprintf(wrapped, sizeof wrapped,
-        "{ %s\n}; __RC=$?; printf '\\n%s:%%d\\n' \"$__RC\"\n", cmd, s->sentinel);
+        "{ %s\n}; __RC=$?; printf '\\n%s:%%d:\\n' \"$__RC\"\n", cmd, s->sentinel);
     assert(wn > 0 && (size_t)wn < sizeof wrapped);
-    assert(bridge_pty_write_all(&s->pty, wrapped, (size_t)wn) == 0);
+    run_wrapped(e, s, wrapped, (size_t)wn);
+}
+
+// Drive an already-wrapped script (the wrapper itself is the subject).
+static void run_wrapped(edge_t *e, session_t *s, const char *wrapped, size_t wn) {
+    assert(bridge_pty_write_all(&s->pty, wrapped, wn) == 0);
 
     for (int i = 0; i < 2000 && s->state == SESS_RUNNING; i++) {
         struct pollfd pfd = { .fd = bridge_pty_pollfd(&s->pty), .events = POLLIN };
@@ -223,6 +235,28 @@ int main(void) {
     if (!memmem(g_out, g_out_len, "flood-2500\n", 11)) { fprintf(stderr, "[cr-tail] collapsed tail lost pre-spinner lines\n"); return 1; }
     if (!memmem(g_out, g_out_len, "step 3000\ntail-line-1", 20)) { fprintf(stderr, "[cr-tail] spinner not collapsed to final frame; last 300 bytes:\n%.*s\n", 300, g_out + (g_out_len > 300 ? g_out_len - 300 : 0)); return 1; }
     printf("[cr-tail] OK (tail holds collapsed lines)\n");
+
+    // ── Result line without its '\n': after a native app's ^C traceback
+    // ConPTY renders the wrapper's newline as a cursor move (`__:130\e[17;1H`,
+    // stripped), so only the ':' after the code terminates the line. Before
+    // the fix the step hung until its deadline and leaked the sentinel. ──
+    reset_capture();
+    {
+        char w[256];
+        snprintf(s->sentinel, sizeof s->sentinel, "__BRIDGE_STEP_COALESCE_TEST__");
+        int wn = snprintf(w, sizeof w, "echo KeyboardInterrupt; printf '%s:130:'; sleep 2\n", s->sentinel);
+        ob_resolve(&s->ob, "raw", 3);
+        s->sentinel_len = strlen(s->sentinel);  // run_finish zeroed it
+        s->state = SESS_RUNNING; s->tail_len = 0;
+        double t = test_now_ms();
+        run_wrapped(e, s, w, (size_t)wn);
+        if (test_now_ms() - t > 1500) { fprintf(stderr, "[no-newline] settled only after the command exited\n"); return 1; }
+        if (g_exit_code != 130) { fprintf(stderr, "[no-newline] exitCode %ld, want 130\n", g_exit_code); return 1; }
+        if (memmem(g_out, g_out_len, "__BRIDGE_STEP", 13) || !memmem(g_out, g_out_len, "KeyboardInterrupt", 17)) {
+            fprintf(stderr, "[no-newline] output wrong: %.*s\n", (int)g_out_len, g_out); return 1;
+        }
+    }
+    printf("[no-newline] OK (':'-terminated result line settles the step, rc=130)\n");
 
     bridge_pty_close(&s->pty);
     free(e->sessions);
