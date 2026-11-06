@@ -70,6 +70,20 @@ int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len);
 // only take '\r' as Enter, so '\r\n' and a lone '\n' become '\r'.
 int bridge_pty_write_input(bridge_pty_t *p, const void *buf, size_t len);
 
+// write_input that never waits: returns how many of `buf`'s bytes were taken
+// (0 = PTY input queue full, retry later), -1 on error. POSIX: one
+// non-blocking write. Windows: the blocking write_input INPUT frames already
+// use (conhost drains the pipe; a wedged conhost would stall the loop — an
+// accepted, pre-existing risk). A "\r\n" split across two calls types two
+// Enters there.
+long bridge_pty_write_input_nb(bridge_pty_t *p, const void *buf, size_t len);
+
+// SIGKILL the shell and everything it started: POSIX kills the terminal's
+// foreground process group and the shell's own group (job-control jobs
+// started with `&` in other groups are not reached); Windows terminates the
+// job object. Returns 1 if anything was signalled.
+int bridge_pty_kill_tree(bridge_pty_t *p);
+
 // Canonical (line-assembly) mode on/off on the slave. RUN delivers its wrapper
 // raw (ICANON caps a line at MAX_CANON — 1024 on macOS — and drops the rest);
 // a parked step flips it on so user INPUT gets ^D / erase semantics.

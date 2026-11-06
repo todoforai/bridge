@@ -562,6 +562,14 @@ int bridge_pty_write_input(bridge_pty_t *p, const void *buf, size_t len) {
     return o ? bridge_pty_write_all(p, out, o) : 0;
 }
 
+long bridge_pty_write_input_nb(bridge_pty_t *p, const void *buf, size_t len) {
+    return bridge_pty_write_input(p, buf, len) == 0 ? (long)len : -1;
+}
+
+int bridge_pty_kill_tree(bridge_pty_t *p) {
+    return bridge_pty_signal(p, 9);   // TerminateJobObject: shell + every child
+}
+
 long bridge_pty_read(bridge_pty_t *p, void *buf, size_t len) {
     DWORD avail = 0;
     if (!PeekNamedPipe((HANDLE)p->h_out_read, NULL, 0, NULL, &avail, NULL)) {

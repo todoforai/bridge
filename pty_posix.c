@@ -252,6 +252,25 @@ int bridge_pty_write_input(bridge_pty_t *p, const void *buf, size_t len) {
     return bridge_pty_write_all(p, buf, len);
 }
 
+long bridge_pty_write_input_nb(bridge_pty_t *p, const void *buf, size_t len) {
+    for (;;) {
+        ssize_t n = write(p->master_fd, buf, len);
+        if (n >= 0) return (long)n;
+        if (errno == EINTR) continue;
+        return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+    }
+}
+
+int bridge_pty_kill_tree(bridge_pty_t *p) {
+    if (!p->alive) return 0;               // reaped: the pid may be reused
+    int sent = 0;
+    pid_t fg = p->master_fd >= 0 ? tcgetpgrp(p->master_fd) : -1;
+    if (fg > 1 && fg != p->child_pid) sent |= kill(-fg, SIGKILL) == 0;
+    sent |= kill(-p->child_pid, SIGKILL) == 0;   // forkpty: shell leads its group
+    sent |= kill(p->child_pid, SIGKILL) == 0;
+    return sent;
+}
+
 int bridge_pty_write_all(bridge_pty_t *p, const void *buf, size_t len) {
     const uint8_t *b = buf;
     size_t written = 0;
