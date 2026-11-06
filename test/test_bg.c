@@ -23,7 +23,7 @@ static int test_capture(const char *json, size_t len);
 
 static int g_done, g_bg, g_exit, g_state_on, g_state_off, g_list;
 static long g_pid, g_exit_code; static int g_exit_null, g_killed, g_bg_awaiting;
-static char g_out_path[512], g_in_path[512], g_tail[4096], g_reason[32], g_list_json[8192];
+static char g_out_path[512], g_in_path[512], g_tail[4096], g_reason[32], g_list_json[8192], g_exit_json[16384], g_bg_json[4096];
 
 int bridge_test_noise_send(noise_ws_t *n, ws_t *w, const uint8_t *pt, size_t pt_len) {
     (void)n; (void)w;
@@ -38,6 +38,7 @@ static int test_capture(const char *json, size_t len) {
     if (T("step_done")) g_done++;
     if (T("step_background")) {
         g_bg++;
+        snprintf(g_bg_json, sizeof g_bg_json, "%.*s", (int)len, json);
         json_get_long(json, len, "pid", &g_pid);
         json_get_str_decoded(json, len, "outputPath", g_out_path, sizeof g_out_path, &n);
         json_get_str_decoded(json, len, "inputPath", g_in_path, sizeof g_in_path, &n);
@@ -50,6 +51,7 @@ static int test_capture(const char *json, size_t len) {
     }
     if (T("task_exit")) {
         g_exit++;
+        snprintf(g_exit_json, sizeof g_exit_json, "%.*s", (int)len, json);
         g_exit_null = !json_get_long(json, len, "exitCode", &g_exit_code);
         json_get_bool(json, len, "killed", &g_killed);
         json_get_str_decoded(json, len, "tail", g_tail, sizeof g_tail, &n);
@@ -59,6 +61,7 @@ static int test_capture(const char *json, size_t len) {
 }
 
 static void reset(void) {
+    g_exit_json[0] = g_bg_json[0] = '\0';
     g_done = g_bg = g_exit = g_state_on = g_state_off = g_list = 0;
     g_pid = g_exit_code = 0; g_exit_null = g_killed = g_bg_awaiting = 0;
     g_out_path[0] = g_in_path[0] = g_tail[0] = g_reason[0] = '\0';
@@ -193,7 +196,7 @@ int main(void) {
 
     // 5. TASK_LIST + TASK_KILL (^C ends sleep).
     reset();
-    send_run(e, "sleep 30", ",\"background\":true");
+    send_run(e, "sleep 30", ",\"background\":true,\"chatMessageId\":\"m-1\",\"chatBlockId\":\"b-1\"");
     settle(e, 300);
     char f[256]; int n = snprintf(f, sizeof f, "{\"type\":\"task_list\",\"requestId\":\"r1\"}");
     handle_command(e, f, (size_t)n);
@@ -203,6 +206,9 @@ int main(void) {
     handle_command(e, f, (size_t)n);
     CHECK(pump_until(e, exited, BG_KILL_GRACE_MS - 500), "[kill] no task_exit after ^C (escalation would be 3 s)");
     CHECK(g_killed, "[kill] killed flag missing");
+    CHECK(strstr(g_bg_json, "\"chatMessageId\":\"m-1\",\"chatBlockId\":\"b-1\"") &&
+          strstr(g_list_json, "\"chatMessageId\":\"m-1\",\"chatBlockId\":\"b-1\"") &&
+          strstr(g_exit_json, "\"chatBlockId\":\"b-1\""), "[kill] chat pair bg=%s list=%s exit=%s", g_bg_json, g_list_json, g_exit_json);
     pump_until(e, no_active, 3000);
 
     // 6. TASK_KILL escalates when ^C is ignored.
@@ -213,6 +219,7 @@ int main(void) {
     handle_command(e, f, (size_t)n);
     CHECK(pump_until(e, exited, BG_KILL_GRACE_MS + 2000), "[kill9] no task_exit after escalation");
     CHECK(g_killed, "[kill9] killed flag");
+    CHECK(!strstr(g_exit_json, "chatBlockId"), "[kill9] chat pair leaked from previous run: %s", g_exit_json);
     CHECK(pump_until(e, no_active, 3000), "[kill9] session not freed");
 
     // 6b. ^C-immune child under a ^C-immune shell: escalation kills the group,

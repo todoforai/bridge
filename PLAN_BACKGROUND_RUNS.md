@@ -67,6 +67,10 @@ turn, later turn, other todo, other agent) can `tail` the output and
   blockId, reason: requested|timeout|probe|detach, outputPath, inputPath,
   startedAt, passwordPrompt, truncated}`. Output before a park-handoff went
   out as OUTPUT frames; the file starts at the handoff.
+- Every task frame (`step_background`, `task_state`, `task_exit`, `task_list`
+  entries) also carries the RUN's `chatMessageId`/`chatBlockId` pair when it
+  had one: the backend updates the block directly and the UI matches live
+  tasks to blocks — no backend task registry.
 - `task_state {pid, awaitingInput, stdinWaiter?}` (POSIX probe only; ConPTY
   has no stdin signal). `task_exit {pid, exitCode|null, killed, durationMs,
   startedAt, outputPath, tail ≤2 KB}`.

@@ -423,6 +423,10 @@ typedef struct {
     int       bg_killed;        // TASK_KILL received
     int64_t   bg_kill_at_ms;    // SIGKILL deadline after the ^C of a TASK_KILL; 0 = none
     int64_t   bg_started_wall;  // epoch ms, startedAt
+    // Chat message + block of the RUN that became this task: echoed on every
+    // task frame so the backend/UI can address the block without a lookup.
+    char      bg_chat_msg[BLOCK_ID_CAP + 1];
+    char      bg_chat_blk[BLOCK_ID_CAP + 1];
     int64_t   bg_started_mono;
     int64_t   bg_in_poll_ms;
     bg_task_t bgt;
@@ -1465,7 +1469,8 @@ static void run_finish(session_t *s) {
 }
 
 // ── Background tasks (bg_task.h) ────────────────────────────────────────────
-// Frames (all carry pid = SHELL_PID, the task id):
+// Frames (all carry pid = SHELL_PID, the task id, plus the RUN's
+// chatMessageId/chatBlockId pair when it had one):
 //   STEP_BACKGROUND {blockId, sessionId, pid, reason, outputPath, inputPath,
 //                    startedAt, passwordPrompt, truncated}  — settles the RUN
 //   TASK_STATE      {pid, awaitingInput[, stdinWaiter]}
@@ -1491,7 +1496,10 @@ static int emit_bg_common(char *buf, size_t cap, size_t *u, const char *type, co
            jfield_str(buf, cap, u, "sessionId", s->session_id, -1, 1) < 0 ||
            emit_todo_id(buf, cap, u, s) < 0 ||
            jfield_raw(buf, cap, u, "pid", pid_buf, 1) < 0 ||
-           jfield_raw(buf, cap, u, "startedAt", st_buf, 1) < 0 ? -1 : 0;
+           jfield_raw(buf, cap, u, "startedAt", st_buf, 1) < 0 ||
+           (s->bg_chat_blk[0] &&
+            (jfield_str(buf, cap, u, "chatMessageId", s->bg_chat_msg, -1, 1) < 0 ||
+             jfield_str(buf, cap, u, "chatBlockId", s->bg_chat_blk, -1, 1) < 0)) ? -1 : 0;
 }
 
 // Hand the in-flight step off as a background task: settle the RUN with
@@ -1538,14 +1546,17 @@ static int bg_handoff(edge_t *e, session_t *s, const char *reason, int password_
 }
 
 static void send_task_state(edge_t *e, session_t *s, int awaiting) {
-    s->bg_awaiting = awaiting;
-    char buf[4096]; size_t u = 0;
+    // Sized for the worst-case escape of the waiter (6 bytes per control
+    // char) plus the ids: an overflow would drop the frame, and marking the
+    // state as reported would then suppress the retry on the next tick.
+    char buf[16384]; size_t u = 0;
     char waiter[2048]; size_t wl = awaiting ? bridge_pty_stdin_waiter(&s->pty, waiter, sizeof waiter) : 0;
     if (emit_bg_common(buf, sizeof buf, &u, "task_state", s) < 0 ||
         jfield_raw(buf, sizeof buf, &u, "awaitingInput", awaiting ? "true" : "false", 1) < 0 ||
         (wl > 0 && jfield_str(buf, sizeof buf, &u, "stdinWaiter", waiter, (long)wl, 1) < 0) ||
         json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
     send_json(e, buf, u);
+    s->bg_awaiting = awaiting;
 }
 
 // TASK_EXIT; the caller then run_finish()es (closes files, frees one-shots).
@@ -1600,7 +1611,7 @@ static void send_task_list(edge_t *e, const char *rid, size_t rid_len) {
     return;
 overflow:
     // Absent ⇒ "exited" for the receiver, so a partial list would close live
-    // tasks. Entries are ~250 B × BG_MAX_TASKS: unreachable, but never lie.
+    // tasks. Entries are ~400 B × BG_MAX_TASKS: unreachable, but never lie.
     fprintf(stderr, "task_list overflow — not sent\n");
 }
 
@@ -3085,6 +3096,10 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         s->bg_killed = 0;
         s->bg_kill_at_ms = 0;
         s->bg_started_wall = bg_wall_ms();
+        // Validated pair (both or neither), per RUN — a persistent PTY must not
+        // carry a previous step's block into this task's frames.
+        memcpy(s->bg_chat_msg, chat_message_id, sizeof s->bg_chat_msg);
+        memcpy(s->bg_chat_blk, chat_block_id, sizeof s->bg_chat_blk);
         s->bg_started_mono = s->last_active_ms;
 
         send_run_started(e, s, created);
