@@ -59,6 +59,37 @@ turn, later turn, other todo, other agent) can `tail` the output and
 `printf >> ` the input — plain files, so it works on Windows too
 (`cmd`: `echo y>>f`, PowerShell: `Add-Content`).
 
+### As built (bridge, `bg_task.c` + `main.c`) — supersedes the sketch below where they differ
+
+- RUN `background:true` → handoff right after delivery; `backgroundOnPark:true`
+  → handoff where the step would park (deadline, stdin probe, detach; also
+  with `noInput`). Both settle the RUN with `step_background {pid, sessionId,
+  blockId, reason: requested|timeout|probe|detach, outputPath, inputPath,
+  startedAt, passwordPrompt, truncated}`. Output before a park-handoff went
+  out as OUTPUT frames; the file starts at the handoff.
+- `task_state {pid, awaitingInput, stdinWaiter?}` (POSIX probe only; ConPTY
+  has no stdin signal). `task_exit {pid, exitCode|null, killed, durationMs,
+  startedAt, outputPath, tail ≤2 KB}`.
+- `task_kill {pid[, requestId]}` → ^C, `bridge_pty_kill_tree` after 3 s
+  (POSIX: fg pgrp + shell pgrp; Windows: job object). `task_list
+  [requestId]` → `task_list {tasks:[{pid, sessionId, startedAt,
+  awaitingInput}]}`, also sent unprompted after every auth. **No restart
+  scan**: a pid missing from the list means exited — the backend closes
+  the row (covers bridge restart and a TASK_EXIT lost while offline).
+- No lifetime cap (a task lives until exit or kill). Max 32 tasks
+  (`MAX_TASKS` error / foreground fallback for park-handoff).
+- `.input` is delivered non-blocking; `in_off` advances only by what the
+  PTY took, and not before the command started (bytes typed during the
+  wrapper line were lost under Git Bash). Identity gets
+  `backgroundTasks:true` so the backend can refuse `background` to old
+  bridges.
+- Known limits: tasks are not serviced while the bridge is disconnected
+  (the event loop lives in the connected loop; a chatty task stalls on
+  PTY backpressure until reconnect); POSIX `.output` keeps ANSI escapes;
+  token redaction is per 4 KB chunk; a running task defers bridge
+  auto-update (update waits for idle) — a never-ending dev server blocks
+  updates until it is stopped.
+
 ### Protocol (bridge ↔ backend)
 
 - RUN gets `background: true` (+ existing `timeoutMs` = max lifetime,
