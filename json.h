@@ -61,6 +61,9 @@ int json_get_bool(const char *buf, size_t len, const char *key, int *out);
 // Type of `key`'s value, JT_NONE if absent (or the object is malformed up to it).
 json_type_t json_get_type(const char *buf, size_t len, const char *key);
 int json_get_long(const char *buf, size_t len, const char *key, long *out);
+/* 64-bit integer (epoch ms: `long` is 32-bit on Windows), strict: 1 = ok,
+ * 0 = absent, -1 = present but not a plain in-range integer. */
+int json_get_i64(const char *buf, size_t len, const char *key, long long *out);
 
 // Append a quoted, escaped string. `s_len = -1` ⇒ strlen(s). -1 on overflow.
 int json_emit_str(char *out, size_t cap, size_t *used, const char *s, long s_len);

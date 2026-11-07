@@ -3721,8 +3721,11 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // follows from the normal exit path with killed:true.
         const char *rid = NULL; size_t rid_len = 0;
         int has_rid = json_get_str(msg, msg_len, "requestId", &rid, &rid_len) && rid_len > 0 && is_valid_id(rid, rid_len);
-        long pid = 0;
+        long pid = 0; long long started = 0;
         session_t *s = json_get_long(msg, msg_len, "pid", &pid) ? find_task(e, pid) : NULL;
+        // Optional startedAt: the caller's task, not a later one that reused the pid.
+        int has_started = json_get_i64(msg, msg_len, "startedAt", &started);
+        if (s && (has_started < 0 || (has_started && (int64_t)started != s->bg_started_wall))) s = NULL;
         if (!s)
             return has_rid ? send_req_error(e, NULL, 0, rid, rid_len, "TASK_NOT_FOUND", "no running background task with that pid")
                            : send_error(e, NULL, 0, NULL, 0, "TASK_NOT_FOUND", "no running background task with that pid");

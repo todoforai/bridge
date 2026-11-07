@@ -22,6 +22,7 @@ static int test_capture(const char *json, size_t len);
 #undef main
 
 static int g_done, g_bg, g_exit, g_state_on, g_state_off, g_list;
+static char g_err_code[64];
 static long g_pid, g_exit_code; static int g_exit_null, g_killed, g_bg_awaiting;
 static char g_out_path[512], g_in_path[512], g_tail[4096], g_reason[32], g_list_json[8192], g_exit_json[16384], g_bg_json[4096];
 
@@ -56,6 +57,7 @@ static int test_capture(const char *json, size_t len) {
         json_get_bool(json, len, "killed", &g_killed);
         json_get_str_decoded(json, len, "tail", g_tail, sizeof g_tail, &n);
     }
+    if (T("error")) json_get_str_decoded(json, len, "code", g_err_code, sizeof g_err_code, &n);
     if (T("task_list")) { g_list++; snprintf(g_list_json, sizeof g_list_json, "%.*s", (int)len, json); }
     return 0;
 }
@@ -202,7 +204,20 @@ int main(void) {
     handle_command(e, f, (size_t)n);
     char want[48]; snprintf(want, sizeof want, "\"pid\":%ld", g_pid);
     CHECK(g_list == 1 && strstr(g_list_json, want), "[kill] task_list=%s", g_list_json);
-    n = snprintf(f, sizeof f, "{\"type\":\"task_kill\",\"pid\":%ld}", g_pid);
+    // A stale or malformed startedAt (pid reused by a later task) must not kill this one.
+    const char *sa = strstr(g_list_json, "\"startedAt\":");
+    long long started = sa ? strtoll(sa + 12, NULL, 10) : 0;
+    CHECK(started > 0xFFFFFFFFLL, "[kill] startedAt not epoch ms: %lld", started);
+    const char *bad[] = { "1", "\"x\"", "null", "%lld.5", "%llde1", "99999999999999999999999" };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        char v[64]; snprintf(v, sizeof v, bad[i], started);
+        g_err_code[0] = 0;
+        n = snprintf(f, sizeof f, "{\"type\":\"task_kill\",\"pid\":%ld,\"startedAt\":%s,\"requestId\":\"k%zu\"}", g_pid, v, i);
+        handle_command(e, f, (size_t)n);
+        CHECK(!strcmp(g_err_code, "TASK_NOT_FOUND"), "[kill] startedAt=%s: error=%s", v, g_err_code);
+    }
+    CHECK(!pump_until(e, exited, 500), "[kill] stale startedAt killed the task");
+    n = snprintf(f, sizeof f, "{\"type\":\"task_kill\",\"pid\":%ld,\"startedAt\":%lld}", g_pid, started);
     handle_command(e, f, (size_t)n);
     CHECK(pump_until(e, exited, BG_KILL_GRACE_MS - 500), "[kill] no task_exit after ^C (escalation would be 3 s)");
     CHECK(g_killed, "[kill] killed flag missing");

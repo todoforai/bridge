@@ -2,6 +2,7 @@
 #include "json.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -304,6 +305,20 @@ int json_get_long(const char *buf, size_t len, const char *key, long *out) {
     char *endp = NULL;
     long v = strtol(tmp, &endp, 10);
     if (endp == tmp) return 0;
+    *out = v;
+    return 1;
+}
+
+int json_get_i64(const char *buf, size_t len, const char *key, long long *out) {
+    json_type_t t; const char *vp; size_t vl;
+    if (!json_find(buf, len, key, &t, &vp, &vl)) return 0;
+    char tmp[32];
+    if (t != JT_NUM || vl == 0 || vl >= sizeof(tmp)) return -1;
+    memcpy(tmp, vp, vl); tmp[vl] = '\0';
+    char *endp = NULL;
+    errno = 0;
+    long long v = strtoll(tmp, &endp, 10);
+    if (*endp || errno == ERANGE) return -1;   // 1.5, 1e3, overflow
     *out = v;
     return 1;
 }
