@@ -5,6 +5,8 @@
 set -eu
 
 REPO="todoforai/bridge"
+# Fallback for hosts that reach todofor.ai but not github.com (same assets, same sha256).
+MIRROR="https://todofor.ai/bridge-dl"
 PREFIX="${TODOFORAI_PREFIX:-$HOME/.todoforai/bin}"
 TAG="${TODOFORAI_TAG:-}"
 TOKEN=""
@@ -81,9 +83,9 @@ asset="todoforai-bridge-${os}-${arch}"
 
 # ── fetch tool ──────────────────────────────────────────────────────────────
 if command -v curl >/dev/null 2>&1; then
-    fetch() { curl -fsSL "$1" -o "$2"; }
+    fetch() { curl -fsSL --connect-timeout 10 "$1" -o "$2"; }
 elif command -v wget >/dev/null 2>&1; then
-    fetch() { wget -q "$1" -O "$2"; }
+    fetch() { wget -q -T 10 "$1" -O "$2"; }
 else
     die "need curl or wget"
 fi
@@ -96,10 +98,10 @@ if [ -z "$TAG" ]; then
     latest_url="https://github.com/$REPO/releases/latest"
     tag_prefix="https://github.com/$REPO/releases/tag/"
     if command -v curl >/dev/null 2>&1; then
-        resolved=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null)
+        resolved=$(curl -fsSL --connect-timeout 10 -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null) || true
     else
-        resolved=$(wget -qS --max-redirect=0 "$latest_url" -O /dev/null 2>&1 \
-            | sed -n 's#^[[:space:]]*[Ll]ocation:[[:space:]]*##p' | tr -d '\r' | head -n1)
+        resolved=$(wget -qS -T 10 --max-redirect=0 "$latest_url" -O /dev/null 2>&1 \
+            | sed -n 's#^[[:space:]]*[Ll]ocation:[[:space:]]*##p' | tr -d '\r' | head -n1) || true
     fi
     # Only accept a real .../releases/tag/<TAG> URL, so an error page or login
     # interstitial can't be mistaken for a version string.
@@ -107,18 +109,27 @@ if [ -z "$TAG" ]; then
         "$tag_prefix"?*) TAG=${resolved#"$tag_prefix"} ;;
         *) TAG="" ;;
     esac
+    # github.com unreachable from here → ask the mirror.
+    if [ -z "$TAG" ]; then
+        TAG=$(fetch "$MIRROR/latest" - 2>/dev/null | head -c 32) || true
+        case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) TAG="" ;; esac
+    fi
     [ -z "$TAG" ] && die "could not determine latest release (see https://github.com/$REPO/releases)"
 fi
 url="https://github.com/$REPO/releases/download/$TAG/$asset"
 sha_url="${url}.sha256"
+mirror_url="$MIRROR/$TAG/$asset"
 
 # ── download + verify ───────────────────────────────────────────────────────
 mkdir -p "$PREFIX"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-fetch "$url"     "$tmp/todoforai-bridge"     || die "download failed: $url"
-fetch "$sha_url" "$tmp/todoforai-bridge.sha" || die "checksum fetch failed: $sha_url"
+if ! { fetch "$url" "$tmp/todoforai-bridge" && fetch "$sha_url" "$tmp/todoforai-bridge.sha"; }; then
+    info "github.com unreachable — trying $MIRROR"
+    fetch "$mirror_url"        "$tmp/todoforai-bridge"     || die "download failed: $url (and $mirror_url)"
+    fetch "$mirror_url.sha256" "$tmp/todoforai-bridge.sha" || die "checksum fetch failed: $mirror_url.sha256"
+fi
 
 expected=$(awk '{print $1}' "$tmp/todoforai-bridge.sha")
 if command -v sha256sum >/dev/null 2>&1; then

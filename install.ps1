@@ -18,6 +18,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Repo = 'todoforai/bridge'
+# Fallback for hosts that reach todofor.ai but not github.com (same assets, same sha256).
+$Mirror = 'https://todofor.ai/bridge-dl'
 if (-not $Prefix) { $Prefix = $env:TODOFORAI_PREFIX }
 if (-not $Prefix) { $Prefix = Join-Path $env:USERPROFILE '.todoforai\bin' }
 if (-not $Tag)    { $Tag    = $env:TODOFORAI_TAG }
@@ -69,6 +71,7 @@ if (-not $Tag) {
         $req.AllowAutoRedirect = $false
         $req.Method = 'HEAD'
         $req.UserAgent = 'todoforai-bridge-installer'
+        $req.Timeout = 10000
         $resp = $req.GetResponse()
         $location = $resp.Headers['Location']
         $resp.Close()
@@ -85,10 +88,16 @@ if (-not $Tag) {
     if ($location -and $location.StartsWith($expected)) {
         $Tag = $location.Substring($expected.Length)
     }
+    # github.com unreachable from here → ask the mirror.
+    if (-not $Tag) {
+        try { $t = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Uri "$Mirror/latest").Content.Trim() } catch { $t = '' }
+        if ($t -match '^v\d+\.\d+\.\d+$') { $Tag = $t }
+    }
     if (-not $Tag) { Die "could not determine latest release (see https://github.com/$Repo/releases)" }
 }
 $url    = "https://github.com/$Repo/releases/download/$Tag/$asset"
 $shaUrl = "$url.sha256"
+$mirrorUrl = "$Mirror/$Tag/$asset"
 
 # ── download + verify ───────────────────────────────────────────────────────
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
@@ -97,8 +106,14 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
     $bin    = Join-Path $tmp 'todoforai-bridge.exe'
     $shaTxt = Join-Path $tmp 'todoforai-bridge.sha'
-    try { Invoke-WebRequest -UseBasicParsing -Uri $url    -OutFile $bin    } catch { Die "download failed: $url" }
-    try { Invoke-WebRequest -UseBasicParsing -Uri $shaUrl -OutFile $shaTxt } catch { Die "checksum fetch failed: $shaUrl" }
+    try {
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri $url    -OutFile $bin
+        Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri $shaUrl -OutFile $shaTxt
+    } catch {
+        Info "github.com unreachable — trying $Mirror"
+        try { Invoke-WebRequest -UseBasicParsing -Uri $mirrorUrl -OutFile $bin } catch { Die "download failed: $url (and $mirrorUrl)" }
+        try { Invoke-WebRequest -UseBasicParsing -Uri "$mirrorUrl.sha256" -OutFile $shaTxt } catch { Die "checksum fetch failed: $mirrorUrl.sha256" }
+    }
 
     $expected = ((Get-Content $shaTxt -Raw).Trim() -split '\s+')[0]
     $actual   = (Get-FileHash $bin -Algorithm SHA256).Hash.ToLower()
