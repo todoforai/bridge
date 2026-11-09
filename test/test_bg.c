@@ -186,6 +186,8 @@ int main(void) {
     CHECK(!strcmp(g_reason, "timeout") && g_done == 0, "[park] reason=%s done=%d", g_reason, g_done);
     CHECK(pump_until(e, exited, 3000), "[park] no task_exit");
     CHECK(g_exit_code == 0 && strstr(g_tail, "after"), "[park] exit=%ld tail=%s", g_exit_code, g_tail);
+    // The file is the whole log: what ran before the handoff too.
+    CHECK(file_has(g_out_path, "before") && file_has(g_out_path, "after"), "[park] file lacks pre-handoff output");
     pump_until(e, no_active, 3000);
     fprintf(stderr, "[park] done\n");
 

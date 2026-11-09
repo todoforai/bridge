@@ -430,6 +430,12 @@ typedef struct {
     int64_t   bg_started_mono;
     int64_t   bg_in_poll_ms;
     bg_task_t bgt;
+    // What the step printed before it became a task (bg_on_park steps): the
+    // head of the .output file, so the file is the whole log. Heap, lazy,
+    // last BG_PRE_CAP bytes. Freed at handoff / run_finish.
+    uint8_t  *bg_pre;
+    size_t    bg_pre_len;
+    int       bg_pre_dropped;
 } session_t;
 
 // Does the emitted output end on an unanswered question? A program that wants
@@ -1324,6 +1330,7 @@ static void send_step_awaiting_input(edge_t *e, session_t *s, int password_promp
 }
 
 static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n);
+static void bg_pre_free(session_t *s);
 static size_t sentinel_holdback(const session_t *s);
 static void ob_finish(edge_t *e, session_t *s);
 static void ob_reset(out_policy_t *ob);
@@ -1442,6 +1449,7 @@ static void park_step(edge_t *e, session_t *s, int password_prompt, const char *
 // (RUN carried a sessionId) survive.
 static void run_finish(session_t *s) {
     if (s->bg) bg_task_close(&s->bgt);   // TASK_EXIT (if any) already sent
+    bg_pre_free(s);
     s->bg = 0; s->bg_on_park = 0; s->bg_awaiting = 0; s->bg_killed = 0; s->bg_kill_at_ms = 0;
     s->state = SESS_IDLE;
     s->tail_len = 0;
@@ -1518,6 +1526,20 @@ static int bg_handoff(edge_t *e, session_t *s, const char *reason, int password_
     // bytes are wrapper echo, never output — leave them to the drain.
     if (!s->draining_begin) park_flush(e, s);
     flush_output(e, s);
+    // The file starts with what the step already printed (same token scrub).
+    if (s->bg_pre_dropped) {
+        static const char note[] = "[bridge: earlier output discarded]\n";
+        bg_task_write(&s->bgt, note, sizeof note - 1);
+    }
+    for (size_t off = 0; off < s->bg_pre_len; ) {
+        uint8_t cp[BUF_SIZE];
+        size_t k = s->bg_pre_len - off < sizeof cp ? s->bg_pre_len - off : sizeof cp;
+        memcpy(cp, s->bg_pre + off, k);
+        redact_token(e, cp, k);
+        bg_task_write(&s->bgt, cp, k);
+        off += k;
+    }
+    bg_pre_free(s);
     int awaiting = password_prompt || !strcmp(reason, "probe");
     char buf[4096]; size_t u = 0;
     if (emit_bg_common(buf, sizeof buf, &u, "step_background", s) < 0 ||
@@ -2017,6 +2039,28 @@ static size_t ob_emit_capped(edge_t *e, session_t *s, const uint8_t *d, size_t n
 
 // Feed RUN output bytes: stream the head (line-capped), roll the rest into the
 // tail. Drives s->ob; all RUN-path output goes through here.
+#define BG_PRE_CAP (64 * 1024)
+static void bg_pre_append(session_t *s, const uint8_t *d, size_t n) {
+    if (!s->bg_pre && !(s->bg_pre = malloc(BG_PRE_CAP))) return;
+    if (n >= BG_PRE_CAP) {
+        s->bg_pre_dropped |= s->bg_pre_len > 0 || n > BG_PRE_CAP;
+        memcpy(s->bg_pre, d + (n - BG_PRE_CAP), BG_PRE_CAP);
+        s->bg_pre_len = BG_PRE_CAP;
+        return;
+    }
+    if (s->bg_pre_len + n > BG_PRE_CAP) {
+        size_t drop = s->bg_pre_len + n - BG_PRE_CAP;
+        memmove(s->bg_pre, s->bg_pre + drop, s->bg_pre_len - drop);
+        s->bg_pre_len -= drop;
+        s->bg_pre_dropped = 1;
+    }
+    memcpy(s->bg_pre + s->bg_pre_len, d, n);
+    s->bg_pre_len += n;
+}
+static void bg_pre_free(session_t *s) {
+    free(s->bg_pre); s->bg_pre = NULL; s->bg_pre_len = 0; s->bg_pre_dropped = 0;
+}
+
 static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
     out_policy_t *ob = &s->ob;
     if (n == 0) return;
@@ -2024,6 +2068,7 @@ static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
     // are only kept for the truncation tail — otherwise a prompt printed after
     // 10k of build log would be invisible to the awaiting-input probe.
     otail_append(s, d, n);
+    if (s->bg_on_park && !s->bg) bg_pre_append(s, d, n);
     // Background task: the file is the whole log; no OUTPUT frames, no caps.
     // Same token scrub OUTPUT frames get (flush_output), on a copy: `d` may
     // still be scanned by the caller.
