@@ -51,7 +51,8 @@ Options:
 $pa = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 $arch = switch ($pa) {
     'AMD64' { 'x64' }
-    'ARM64' { 'arm64' }
+    # No windows-arm64 build is published; Windows 11 on ARM runs the x64 exe under emulation.
+    'ARM64' { 'x64' }
     default { Die "unsupported arch: $pa" }
 }
 $asset = "todoforai-bridge-windows-$arch.exe"
