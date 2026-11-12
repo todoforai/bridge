@@ -18,6 +18,11 @@
 // A body shorter than <size> means the transfer broke.
 // A `put` (`tfa-cat -w todoforai:…`) is an attach with a "ref": the backend
 // replaces that resource with the bytes instead of attaching them.
+// A `cli` (the built-in `tfa-search` / `tfa-question` / `tfa-show`, see
+// shell_cli.c) is both: {"kind":"cli","name":<command>,"size":N}\n + N bytes
+// (a request line with argv, then its inputs), write side kept open, answered
+// like a fetch with "data <size> <mime>\n" + the reply. The command itself runs
+// in the backend, so it changes without a bridge release.
 // An attach declares `size`; anything but exactly that many bytes before EOF
 // (a killed client, a shrinking file) is aborted and stored nowhere. Every
 // state has a deadline, so a stuck or hostile local client can't pin a slot.
@@ -60,7 +65,9 @@ typedef struct {
     uint32_t id;           // streamId on the wire (never reused)
     int state;             // see shell_relay.c
     int live;              // kind == "live"
-    int fetch;             // kind == "fetch"
+    int fetch;             // kind == "fetch"; a cli once its request is sent
+    int cli;               // kind == "cli": sized request up, then answered like a fetch
+    int replied;           // the error line is out; only the client's EOF is awaited
     char hdr[SHELL_HDR_CAP];
     size_t hdr_len;
     char err[200];         // backend's early rejection, replied after EOF
@@ -117,11 +124,11 @@ int shell_relay_stream_count(const shell_relay_t *r);
 // Connects to 127.0.0.1:$TODOFORAI_BRIDGE_PORT and sends the header line built
 // from the RUN env (token, todo, block, message ids). Returns the socket
 // (blocking) or WS_INVALID_FD with `err`.
-// `size`: an attach's exact byte count (-1 otherwise). `ref`: a fetch's URI
-// (`tty`: stdout is the agent's terminal), NULL otherwise.
+// `size`: an attach's / cli request's exact byte count (-1 otherwise). `ref`: a
+// fetch's URI (`tty`: stdout is the agent's terminal), NULL otherwise.
 ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, long size,
                           const char *ref, int tty, char *err, size_t err_cap);
-// Fetch: read the daemon's first line. Returns 1 = body follows (`size`,
+// Fetch / cli: read the daemon's first line. Returns 1 = body follows (`size`,
 // `mime` set), 0 = attached (nothing to print), -1 = error (in err).
 int shell_client_fetch_head(ws_fd_t fd, long *size, char *mime, size_t mime_cap, char *err, size_t err_cap);
 // Blocking read with the SHELL_IDLE_MS timeout. >0 bytes, 0 EOF, -1 error.

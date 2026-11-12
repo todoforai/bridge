@@ -26,6 +26,11 @@ int  cmd_live(int argc, char **argv);
 // argv[0] dispatch via the ~/.todoforai/tools/bin/tfa-cat symlink; Windows:
 // the tfa-cat() shell function → `<bridge> __cat`.
 int  cmd_cat(int argc, char **argv);
+// `tfa-search` / `tfa-question` / `tfa-show`: argv to the backend, which runs
+// the command and answers exit code + output (shell_cli.c). argv[0] = the name.
+extern const char *const BRIDGE_CLI_NAMES[];   // NULL-terminated
+int  bridge_cli_builtin(const char *name);
+int  cmd_cli(const char *name, int argc, char **argv);
 #ifndef _WIN32
 // (Re)point ~/.todoforai/tools/bin/<name> at this binary. Idempotent, best
 // effort. replace_foreign=0 leaves a file or non-bridge link there alone.

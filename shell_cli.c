@@ -8,6 +8,7 @@
 
 #include "subcmd.h"
 #include "shell_relay.h"
+#include "json.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -460,6 +461,169 @@ int cmd_cat(int argc, char **argv) {
         if (r == 141) return 141;
         if (r) rc = 1;
     }
+    return rc;
+}
+
+// ── `tfa-search`, `tfa-question`, `tfa-show` — commands that run in the backend ──
+// Each is a REST call or two, so nothing of them lives here: argv goes up the
+// relay (kind `cli`), the backend runs the command (packages/shared-fbe
+// shellCli.ts — the code the npm packages of the same names run) and answers
+// exit code + stdout + stderr. A command that reads stdin or a file answers
+// `need` first and is asked again with those bytes, so stdin is only consumed
+// when the command wants it. New flags, help and output need no bridge release.
+// POSIX: argv[0] dispatch via ~/.todoforai/tools/bin symlinks; Windows: shell
+// functions → `<bridge> __cli <name>`.
+
+const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", NULL };
+
+int bridge_cli_builtin(const char *name) {
+    for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) if (strcmp(name, BRIDGE_CLI_NAMES[i]) == 0) return 1;
+    return 0;
+}
+
+#define CLI_MAX_INPUTS 4
+#define CLI_MAX_HEAD   (48 * 1024)   // request line (argv, cwd); the backend allows 64 KB
+
+typedef struct { const char *kind; char path[4096]; char *data; size_t size; int flag; } cli_input_t;
+
+static int stdin_is_tty(void) {
+#ifdef _WIN32
+    DWORD mode;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0;
+#else
+    return isatty(0);
+#endif
+}
+
+// Whole fd → malloc'd buffer (≤ CAT_MAX_BYTES). NULL + err on failure.
+static char *cli_slurp(int fd, size_t *len, char *err, size_t errcap) {
+    size_t cap = 64 * 1024, n = 0;
+    char *buf = malloc(cap);
+    while (buf) {
+        if (n == cap) {
+            cap *= 2;
+            char *b = realloc(buf, cap);
+            if (!b) { free(buf); buf = NULL; break; }
+            buf = b;
+        }
+        sh_ssize r = sh_read(fd, buf + n, cap - n);
+        if (r < 0) { if (errno == EINTR) continue; free(buf); snprintf(err, errcap, "read error"); return NULL; }
+        if (r == 0) { *len = n; return buf; }
+        n += (size_t)r;
+        if (n > (size_t)CAT_MAX_BYTES) { free(buf); snprintf(err, errcap, "over %ld bytes", CAT_MAX_BYTES); return NULL; }
+    }
+    snprintf(err, errcap, "out of memory");
+    return NULL;
+}
+
+// The input the backend asked for. 0, or -1 with err.
+static int cli_read_input(cli_input_t *in, const char *need, const char *path, char *err, size_t errcap) {
+    memset(in, 0, sizeof *in);
+    if (strcmp(need, "stdin") == 0) {
+        in->kind = "stdin";
+        if (stdin_is_tty()) { in->flag = 1; return 0; }
+        return (in->data = cli_slurp(0, &in->size, err, errcap)) ? 0 : -1;
+    }
+    if (strcmp(need, "file") != 0 || !*path) { snprintf(err, errcap, "the server asked for an input this bridge does not know (%s): update the bridge", need); return -1; }
+    in->kind = "file";
+    snprintf(in->path, sizeof in->path, "%s", path);
+    int fd = file_exists(path) ? sh_open(path) : -1;
+    if (fd < 0) { in->flag = 1; return 0; }
+    in->data = cli_slurp(fd, &in->size, err, errcap);
+    sh_close(fd);
+    if (!in->data) { char why[128]; snprintf(why, sizeof why, "%.127s", err); snprintf(err, errcap, "%.300s: %s", path, why); return -1; }
+    return 0;
+}
+
+// {"argv":[…],"cwd":…,"projectId":…,"inputs":[…]}\n → line. -1: too long.
+static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **argv, const cli_input_t *in, int nin) {
+    int bad = json_emit_raw(line, cap, u, "{\"argv\":[", 9) < 0;
+    for (int i = 0; i < argc && !bad; i++)
+        bad = (i && json_emit_raw(line, cap, u, ",", 1) < 0) || json_emit_str(line, cap, u, argv[i], -1) < 0;
+    if (!bad) bad = json_emit_raw(line, cap, u, "]", 1) < 0;
+    char cwd[4096];
+#ifdef _WIN32
+    const char *wd = _getcwd(cwd, sizeof cwd);
+#else
+    const char *wd = getcwd(cwd, sizeof cwd);
+#endif
+    const char *proj = getenv("TODOFORAI_PROJECT_ID");
+    if (!bad && wd) bad = json_emit_raw(line, cap, u, ",\"cwd\":", 7) < 0 || json_emit_str(line, cap, u, wd, -1) < 0;
+    if (!bad && proj && *proj) bad = json_emit_raw(line, cap, u, ",\"projectId\":", 13) < 0 || json_emit_str(line, cap, u, proj, -1) < 0;
+    if (!bad) bad = json_emit_raw(line, cap, u, ",\"inputs\":[", 11) < 0;
+    for (int i = 0; i < nin && !bad; i++) {
+        char k[96];
+        int file = in[i].kind[0] == 'f';
+        int kn = snprintf(k, sizeof k, "%s{\"kind\":\"%s\",\"size\":%zu%s", i ? "," : "", in[i].kind, in[i].size,
+                          in[i].flag ? (file ? ",\"missing\":true" : ",\"tty\":true") : "");
+        bad = json_emit_raw(line, cap, u, k, (size_t)kn) < 0
+           || (file && (json_emit_raw(line, cap, u, ",\"path\":", 8) < 0 || json_emit_str(line, cap, u, in[i].path, -1) < 0))
+           || json_emit_raw(line, cap, u, "}", 1) < 0;
+    }
+    return bad || json_emit_raw(line, cap, u, "]}\n", 3) < 0 ? -1 : 0;
+}
+
+// One round: request up, the whole reply down (malloc'd, *rn bytes). NULL + err on failure.
+static char *cli_round(const char *name, const char *line, size_t ln, const cli_input_t *in, int nin, size_t *rn, char *err, size_t errcap) {
+    size_t total = 0;
+    for (int i = 0; i < nin; i++) total += in[i].size;
+    if (total > (size_t)CAT_MAX_BYTES) { snprintf(err, errcap, "inputs over %ld bytes", CAT_MAX_BYTES); return NULL; }
+    total += ln;   // the backend allows the request line on top
+    ws_fd_t s = shell_client_open("cli", name, NULL, (long)total, NULL, 0, err, errcap);
+    if (s == WS_INVALID_FD) return NULL;
+    int sent = shell_client_send(s, line, ln) == 0;
+    for (int i = 0; i < nin && sent; i++) sent = !in[i].size || shell_client_send(s, in[i].data, in[i].size) == 0;
+    // A send that failed may be a refusal: its reason is on the socket.
+    long size = 0; char mime[128];
+    int h = shell_client_fetch_head(s, &size, mime, sizeof mime, err, errcap);
+    if (h == 0) snprintf(err, errcap, "no answer from the server");
+    char *buf = h == 1 ? malloc((size_t)size + 1) : NULL;
+    if (h == 1 && !buf) snprintf(err, errcap, "out of memory");
+    for (long got = 0; buf && got < size; ) {
+        long r = shell_client_recv(s, buf + got, (size_t)(size - got));
+        if (r <= 0) { free(buf); buf = NULL; snprintf(err, errcap, "the answer broke off"); break; }
+        got += r;
+    }
+    shell_client_close(s);
+    if (buf) { buf[size] = '\0'; *rn = (size_t)size; }
+    return buf;
+}
+
+int cmd_cli(const char *name, int argc, char **argv) {
+    if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) { printf("%s %s\n", name, BRIDGE_VERSION); return 0; }
+    stdio_binary();
+    static cli_input_t in[CLI_MAX_INPUTS];
+    char err[512] = "";
+    char *line = malloc(CLI_MAX_HEAD), *res = NULL;
+    int nin = 0, rc = 1;
+    if (!line) { fprintf(stderr, "%s: out of memory\n", name); return 1; }
+    for (;;) {
+        size_t ln = 0, rn = 0;
+        if (cli_request_line(line, CLI_MAX_HEAD, &ln, argc - 1, argv + 1, in, nin) < 0) { snprintf(err, sizeof err, "arguments too long (pass long text on stdin or as a file)"); break; }
+        free(res);
+        if (!(res = cli_round(name, line, ln, in, nin, &rn, err, sizeof err))) break;
+        const char *nl = memchr(res, '\n', rn);
+        size_t hl = nl ? (size_t)(nl - res) : rn;
+        char need[32], path[4096]; size_t l = 0;
+        if (json_get_str_decoded(res, hl, "need", need, sizeof need, &l)) {
+            if (!json_get_str_decoded(res, hl, "path", path, sizeof path, &l)) path[0] = '\0';
+            if (nin == CLI_MAX_INPUTS) { snprintf(err, sizeof err, "the command reads too many inputs"); break; }
+            if (cli_read_input(&in[nin], need, path, err, sizeof err) < 0) break;
+            nin++;
+            continue;
+        }
+        long code = 1, out = -1, er = -1;
+        if (!nl || !json_get_long(res, hl, "code", &code) || !json_get_long(res, hl, "out", &out) || !json_get_long(res, hl, "err", &er)
+            || out < 0 || er < 0 || (size_t)out + (size_t)er != rn - hl - 1) { snprintf(err, sizeof err, "unexpected answer from the server"); break; }
+        // stdout gone (`| head`): 141 like any filter, the command itself already ran.
+        rc = write_all(1, nl + 1, (size_t)out) < 0 ? 141 : (int)(code & 0xff);
+        (void)write_all(2, nl + 1 + out, (size_t)er);
+        err[0] = '\0';
+        break;
+    }
+    if (err[0]) fprintf(stderr, "%s: %s\n", name, err);
+    for (int i = 0; i < nin; i++) free(in[i].data);
+    free(res); free(line);
     return rc;
 }
 

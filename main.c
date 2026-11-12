@@ -580,7 +580,9 @@ static int output_tail_is_prompt(const session_t *s) {
 // tfa-cat, adb: POSIX gets PATH symlinks (bridge_link_tool); Windows has no
 // symlinks for us, so a function (bash/busybox accept the hyphen).
 #  define DETACH_SHIM_FMT "nohup() { '%s' __detach \"$@\"; }; setsid() { nohup \"$@\"; }; " \
-    "tfa-cat() { '%s' __cat \"$@\"; }; " ADB_SHIM_FMT
+    "tfa-cat() { '%s' __cat \"$@\"; }; " \
+    "tfa-search() { '%s' __cli tfa-search \"$@\"; }; tfa-question() { '%s' __cli tfa-question \"$@\"; }; " \
+    "tfa-show() { '%s' __cli tfa-show \"$@\"; }; " ADB_SHIM_FMT
 #endif
 
 typedef struct {
@@ -3019,7 +3021,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[4 * 1024 * 4 + 1536];  // g_self ≤ 1023 (≤4×), each ' may become '\''
+        char dshim[7 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤7×), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -3048,7 +3050,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q);
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q);
 #else
                 int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif
@@ -4524,6 +4526,7 @@ int bridge_main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "__job") == 0) return cmd_job_worker(argv[2]);
     if (argc >= 2 && strcmp(argv[1], "__live") == 0) return cmd_live(argc - 1, argv + 1);
     if (argc >= 2 && strcmp(argv[1], "__adb") == 0) return cmd_adb(argc - 1, argv + 1);
+    if (argc >= 3 && strcmp(argv[1], "__cli") == 0 && bridge_cli_builtin(argv[2])) return cmd_cli(argv[2], argc - 2, argv + 2);
 #ifdef _WIN32
     if (argc >= 2 && strcmp(argv[1], "__detach") == 0) return bridge_pty_detach_main(argc - 2, argv + 2);
     if (argc >= 2 && strcmp(argv[1], "__cat") == 0) return cmd_cat(argc - 1, argv + 1);
@@ -4533,6 +4536,7 @@ int bridge_main(int argc, char **argv) {
         a0 = a0 ? a0 + 1 : (argc ? argv[0] : "");
         if (strcmp(a0, "tfa-cat") == 0) return cmd_cat(argc, argv);
         if (strcmp(a0, "adb") == 0) return cmd_adb(argc, argv);
+        if (bridge_cli_builtin(a0)) return cmd_cli(a0, argc, argv);
     }
 #endif
     // Resolve our own path while argv0 and the cwd are still trustworthy.
@@ -4766,6 +4770,8 @@ int bridge_main(int argc, char **argv) {
 #ifndef _WIN32
     bridge_link_tool(bridge_jobs_self_path(), "tfa-cat", 1);   // on PATH for every RUN
     bridge_link_tool(bridge_jobs_self_path(), "adb", 0);       // phones by name; else the real adb
+    // Built in unless the machine has its own (the npm package, earlier on PATH, wins anyway).
+    for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) bridge_link_tool(bridge_jobs_self_path(), BRIDGE_CLI_NAMES[i], 0);
 #endif
     bridge_policy_load();
     bg_task_reap_old();   // also creates ~/.todoforai/tasks before the jail grants it

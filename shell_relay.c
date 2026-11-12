@@ -85,6 +85,7 @@ static void stream_free(shell_stream_t *s) {
 // line is tiny and the client has stopped writing, so it fits the send buffer.
 static void reply(shell_stream_t *s, const char *err) {
     char line[256];
+    if (s->replied) { stream_free(s); return; }
     int n = err ? snprintf(line, sizeof line, "error: %.200s\n", *err ? err : "failed") : snprintf(line, sizeof line, "ok\n");
     if (n > 0) (void)sr_send(s->fd, line, (size_t)n);
     stream_free(s);
@@ -153,10 +154,19 @@ static void fetch_finish(shell_stream_t *s, const char *err) {
 
 // Rejected: the reply waits for the client's EOF (so it is read, not lost to
 // an RST) — but at most SHELL_DRAIN_MS. __live never reads a reply: just close.
-// A fetch client never half-closes: it gets the line at once.
+// A fetch client never half-closes: it gets the line at once. Nor does a cli
+// client, but it may still be sending its request: the line goes out now and
+// our write side closes, the rest of the request is discarded until it hangs up.
 static void fail(shell_stream_t *s, const char *err) {
     if (s->live) { stream_free(s); return; }
     if (s->fetch) { fetch_finish(s, err); return; }
+    if (s->cli) {
+        char line[256];
+        int n = snprintf(line, sizeof line, "error: %.200s\n", *err ? err : "failed");
+        if (n > 0) (void)sr_send(s->fd, line, (size_t)n);
+        sr_shut_wr(s->fd);
+        s->replied = 1;
+    }
     snprintf(s->err, sizeof s->err, "%s", err);
     s->state = ST_DRAIN;
     s->deadline_ms = ws_monotonic_ms() + SHELL_DRAIN_MS;
@@ -315,13 +325,14 @@ static void open_stream(shell_relay_t *r, shell_stream_t *s, const char *hdr, si
         if (!json_get_str_decoded(hdr, len, keys[i], vals[i], sizeof vals[i], &vl)) vals[i][0] = '\0';
     }
     s->fetch = strcmp(vals[0], "fetch") == 0;
+    s->cli = strcmp(vals[0], "cli") == 0;
     int needs_ref = s->fetch || strcmp(vals[0], "put") == 0;   // put: stdin replaces `ref`
     if (!vals[0][0] || !vals[1][0] || !vals[2][0] || !vals[3][0] || (needs_ref && !vals[7][0])) { fail(s, "bad request"); return; }
     if (!r->ready || !r->ready(r->ctx)) { fail(s, "bridge is not connected to the backend"); return; }
     s->live = strcmp(vals[0], "live") == 0;
     // An attach declares its size up front: EOF alone can't tell a finished
     // upload from a killed client, so a short (or long) stream is never stored.
-    if (!s->live && !s->fetch && size < 0) { fail(s, "bad request"); return; }
+    if (!s->live && !s->fetch && (size < 0 || (s->cli && size == 0))) { fail(s, "bad request"); return; }
     s->size = size;
     if (s->live) {
         if (!(s->lbuf = malloc(SHELL_LIVE_BUF))) { fail(s, "out of memory"); return; }
@@ -429,6 +440,16 @@ static void on_readable(shell_relay_t *r, shell_stream_t *s) {
     if (off < (size_t)n && send_data(r, s, raw + off, (size_t)n - off) != 0) {
         (void)send_abort(r, s->id);
         fail(s, "bridge is not connected to the backend");
+        return;
+    }
+    // cli: the request is complete by count (the client keeps its write side
+    // open) — from here it is a fetch, answered with READY / DATA / CLOSE.
+    if (s->cli && s->got == s->size) {
+        if (send_simple(r, "shell:end", s->id) != 0) { fail(s, "bridge is not connected to the backend"); return; }
+        s->fetch = 1;
+        s->got = 0;   // counts the answer from here
+        s->state = ST_FETCH;
+        s->deadline_ms = ws_monotonic_ms() + SHELL_REPLY_MS;
     }
 }
 

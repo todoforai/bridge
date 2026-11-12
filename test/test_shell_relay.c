@@ -36,6 +36,11 @@ static const char *fetch_body, *fetch_err;
 static size_t fetch_len;
 static int fetch_attach;
 
+// cli: answers queued per round (a `need` round, then the result), served as a fetch body on END.
+static char cli_replies[4][4096]; static size_t cli_len[4]; static int cli_n, cli_i;
+static long cli_stream = -1, cli_refuse_id = -1;
+static int cli_refuse, cli_opens;   // refuse the Nth round: CLOSE {error} right at OPEN (a backend without `cli`)
+
 static int fake_send(void *ctx, const char *json, size_t len) {
     (void)ctx;
     if (!connected) return -1;
@@ -48,11 +53,23 @@ static int fake_send(void *ctx, const char *json, size_t len) {
         json_get_obj(json, len, "payload", &p, &pl);
         json_get_long(p, pl, "streamId", &fetch_id);
     }
+    if (strstr(json, "\"shell:open\"") && strstr(json, "\"kind\":\"cli\"")) {
+        const char *p = NULL; size_t pl = 0;
+        json_get_obj(json, len, "payload", &p, &pl);
+        json_get_long(p, pl, "streamId", &cli_stream);
+        if (++cli_opens == cli_refuse) { cli_refuse_id = cli_stream; cli_stream = -1; }
+    }
     if (strstr(json, "\"shell:end\"") && !strstr(json, "\"abort\"")) {
         long id = 0; const char *p = NULL; size_t pl = 0;
         json_get_obj(json, len, "payload", &p, &pl);
         json_get_long(p, pl, "streamId", &id);
-        reply_after_end = id;
+        if (id == cli_refuse_id) { /* refused at OPEN: the backend no longer knows it */ }
+        else if (id == cli_stream) {
+            cli_stream = -1;
+            if (!fetch_err && cli_i < cli_n) { fetch_body = cli_replies[cli_i]; fetch_len = cli_len[cli_i]; cli_i++; }
+            fetch_id = id;
+        }
+        else reply_after_end = id;
     }
     return 0;
 }
@@ -70,6 +87,12 @@ static void pump(int ms) {
             ? snprintf(c, sizeof c, "{\"streamId\":%ld,\"error\":\"%s\"}", reply_after_end, reply_err)
             : snprintf(c, sizeof c, "{\"streamId\":%ld}", reply_after_end);
         reply_after_end = -1;
+        shell_relay_on_close(&R, c, (size_t)cn);
+    }
+    if (cli_refuse_id > 0) {
+        char c[96];
+        int cn = snprintf(c, sizeof c, "{\"streamId\":%ld,\"error\":\"bad request\"}", cli_refuse_id);
+        cli_refuse_id = -1;
         shell_relay_on_close(&R, c, (size_t)cn);
     }
     if (fetch_id > 0) {
@@ -148,6 +171,13 @@ static size_t decoded(char *dst, size_t cap) {
 static void reset(void) {
     frames_len = 0; frames[0] = 0; reply_err = NULL; connected = 1; busy = 0;
     fetch_body = fetch_err = NULL; fetch_len = 0; fetch_attach = 0;
+    cli_n = cli_i = 0; cli_refuse = cli_opens = 0;
+}
+
+// Queue one backend answer for a `cli` round: the reply line + `rest`.
+static void cli_answer(const char *line, const char *rest) {
+    cli_len[cli_n] = (size_t)snprintf(cli_replies[cli_n], sizeof cli_replies[0], "%s\n%s", line, rest);
+    cli_n++;
 }
 
 int main(void) {
@@ -352,6 +382,97 @@ int main(void) {
         && strstr(frames, "\"size\":3") && decoded(dec, sizeof dec) == 3 && !memcmp(dec, "hi\n", 3));
     printf("ok 18 put\n");
     assert(shell_relay_stream_count(&R) == 0);
+
+    // 19. cli: argv goes up as one sized request, the backend's code/stdout/stderr come back. stdin untouched.
+    assert(system("cd build/sr && for n in tfa-search tfa-question tfa-show; do ln -sf ../todoforai-bridge $n; done") == 0);
+    reset(); cli_answer("{\"code\":3,\"out\":6,\"err\":5}", "hello\noops\n");
+    snprintf(cmd, sizeof cmd, "cd build/sr && echo keep | (%s TODOFORAI_PROJECT_ID=P1 ./tfa-search -n 3 'a \"b\"' 2>e.txt; echo rc=$?; cat; cat e.txt)", env);
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "hello\nrc=3\nkeep\noops\n"));
+    assert(count(frames, "\"shell:open\"") == 1 && strstr(frames, "\"kind\":\"cli\"") && strstr(frames, "\"name\":\"tfa-search\"") && count(frames, "\"shell:end\"") == 1);
+    dn = decoded(dec, sizeof dec); dec[dn] = 0;
+    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"inputs\":[]}\n"));
+    { char want[64]; snprintf(want, sizeof want, "\"size\":%zu", dn); assert(strstr(frames, want)); }
+    printf("ok 19 cli round trip\n");
+
+    // 20. cli: stdin is read only when the backend asks, then the command is asked again with it.
+    reset(); cli_answer("{\"need\":\"stdin\"}", ""); cli_answer("{\"code\":0,\"out\":6,\"err\":0}", "asked\n");
+    snprintf(cmd, sizeof cmd, "printf '{\"q\":1}' | %s build/sr/tfa-question; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "asked\nrc=0\n") && count(frames, "\"shell:open\"") == 2);
+    dn = decoded(dec, sizeof dec); dec[dn] = 0;
+    assert(strstr(dec, "\"inputs\":[]}\n{\"argv\":[]") && strstr(dec, "\"inputs\":[{\"kind\":\"stdin\",\"size\":7}]}\n{\"q\":1}"));
+    // A terminal on stdin is reported, never read.
+    reset(); cli_answer("{\"need\":\"stdin\"}", ""); cli_answer("{\"code\":2,\"out\":0,\"err\":6}", "usage\n");
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-question; echo rc=$?", env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "usage") && strstr(out, "rc=2"));
+    dn = decoded(dec, sizeof dec); dec[dn] = 0;
+    assert(strstr(dec, "{\"kind\":\"stdin\",\"size\":0,\"tty\":true}"));
+    printf("ok 20 cli stdin on demand\n");
+
+    // 21. cli: a file the backend asks for is sent (3MB, chunked); a missing one is reported.
+    reset(); cli_answer("{\"need\":\"file\",\"path\":\"build/sr/big.bin\"}", ""); cli_answer("{\"code\":0,\"out\":8,\"err\":0}", "T1:plan\n");
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-show build/sr/big.bin --alias plan; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "T1:plan\nrc=0\n"));
+    dn = decoded(dec, sizeof dec);
+    { const char *hdr = "\"inputs\":[{\"kind\":\"file\",\"size\":3000000,\"path\":\"build/sr/big.bin\"}]}\n";
+      char *at = memmem(dec, dn, hdr, strlen(hdr)); assert(at);
+      FILE *bf = fopen("build/sr/big.bin", "rb"); static char want[3000000]; assert(fread(want, 1, sizeof want, bf) == sizeof want); fclose(bf);
+      assert((size_t)(dec + dn - (at + strlen(hdr))) == sizeof want && !memcmp(at + strlen(hdr), want, sizeof want)); }
+    reset(); cli_answer("{\"need\":\"file\",\"path\":\"nope.png\"}", ""); cli_answer("{\"code\":1,\"out\":0,\"err\":10}", "not found\n");
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-show nope.png; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "not found\nrc=1\n"));
+    dn = decoded(dec, sizeof dec); dec[dn] = 0;
+    assert(strstr(dec, "{\"kind\":\"file\",\"size\":0,\"missing\":true,\"path\":\"nope.png\"}"));
+    printf("ok 21 cli file on demand\n");
+
+    // 22. cli: a refusal (old backend, dead run), no backend, a garbled answer → one line on stderr, rc 1; --version is local.
+    reset(); fetch_err = "bad request";
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-search x; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "tfa-search: bad request\nrc=1\n"));
+    // …also when it comes before the request is through (a backend without `cli`), big input or not.
+    reset(); cli_refuse = 1;
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "tfa-search: bad request\nrc=1\n") && shell_relay_stream_count(&R) == 0);
+    reset(); cli_refuse = 2; cli_answer("{\"need\":\"file\",\"path\":\"build/sr/big.bin\"}", "");
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-show build/sr/big.bin; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "tfa-show: bad request\nrc=1\n") && shell_relay_stream_count(&R) == 0);
+    assert(count(frames, "\"shell:data\"") < 70);   // the rest of the 3MB was discarded, not relayed
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-search x; echo rc=$?", env);
+    reset(); connected = 0;
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "tfa-search: bridge is not connected to the backend") && strstr(out, "rc=1") && frames_len == 0);
+    reset(); cli_answer("{\"code\":0,\"out\":99,\"err\":0}", "short");
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "tfa-search: unexpected answer from the server\nrc=1\n"));
+    reset();
+    snprintf(cmd, sizeof cmd, "env -u TODOFORAI_BRIDGE_PORT build/sr/tfa-show --version; build/todoforai-bridge __cli tfa-search -V; build/todoforai-bridge __cli rm 2>&1 | head -c 0; echo rc=$?");
+    run(cmd, 0, out, sizeof out);
+    assert(!strncmp(out, "tfa-show ", 9) && strstr(out, "\ntfa-search ") && frames_len == 0);
+    assert(shell_relay_stream_count(&R) == 0);
+    printf("ok 22 cli errors + version\n");
+
+    // 23. cli: a client that dies mid-request is aborted; one that declares nothing is refused.
+    reset();
+    snprintf(cmd, sizeof cmd, "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',%u));"
+             "s.sendall(b'{\\\"kind\\\":\\\"cli\\\",\\\"name\\\":\\\"tfa-search\\\",\\\"token\\\":\\\"t\\\",\\\"todoId\\\":\\\"T\\\",\\\"blockId\\\":\\\"B\\\",\\\"size\\\":100}\\n{}');"
+             "s.close()\"", R.port);
+    run(cmd, 0, out, sizeof out);
+    for (int i = 0; i < 20; i++) pump(5);
+    assert(strstr(frames, "\"abort\":true") && shell_relay_stream_count(&R) == 0);
+    reset();
+    snprintf(cmd, sizeof cmd, "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',%u));"
+             "s.sendall(b'{\\\"kind\\\":\\\"cli\\\",\\\"name\\\":\\\"tfa-search\\\",\\\"token\\\":\\\"t\\\",\\\"todoId\\\":\\\"T\\\",\\\"blockId\\\":\\\"B\\\",\\\"size\\\":0}\\n');"
+             "print(s.recv(99));s.close()\"", R.port);
+    run(cmd, 0, out, sizeof out);
+    for (int i = 0; i < 20; i++) pump(5);
+    assert(strstr(out, "bad request") && frames_len == 0 && shell_relay_stream_count(&R) == 0);
+    printf("ok 23 cli aborted / empty\n");
 
     shell_relay_close_all(&R);
     printf("all ok\n");
