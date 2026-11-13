@@ -60,14 +60,14 @@ static const char *SID = "00000000-0000-4000-8000-000000000000";
 
 // One RUN of `cmd` (cmd_len raw bytes) on the persistent session; pumps the
 // loop until step_done or ~10 s. Returns 1 when the step settled.
-static int run_cmd(edge_t *e, const char *cmd, size_t cmd_len) {
+static int run_cmd_mode(edge_t *e, const char *cmd, size_t cmd_len, const char *mode) {
     static char b64[400 * 1024], frame[420 * 1024];
     size_t bn = b64_encode((const uint8_t *)cmd, cmd_len, b64, sizeof b64);
     assert(bn > 0 || cmd_len == 0);
     b64[bn] = '\0';
     int fn = snprintf(frame, sizeof frame,
         "{\"type\":\"run\",\"sessionId\":\"%s\",\"blockId\":\"rpc-1\",\"cmdB64\":\"%s\","
-        "\"timeoutMs\":10000,\"output\":\"raw\"}", SID, b64);
+        "\"timeoutMs\":10000,\"output\":\"%s\"}", SID, b64, mode);
     assert(fn > 0 && (size_t)fn < sizeof frame);
     g_out_len = 0; g_done = 0; g_code = -1; g_error[0] = '\0';
     assert(handle_command(e, frame, (size_t)fn) == 0);
@@ -81,6 +81,8 @@ static int run_cmd(edge_t *e, const char *cmd, size_t cmd_len) {
     g_out[g_out_len] = '\0';
     return g_done;
 }
+
+static int run_cmd(edge_t *e, const char *cmd, size_t cmd_len) { return run_cmd_mode(e, cmd, cmd_len, "raw"); }
 
 static int g_fails;
 static const char *g_shell;
@@ -134,6 +136,12 @@ static void suite(edge_t *e) {
     for (int i = 0; i < 1000; i++) n += (size_t)sprintf(big + n, ": %04d padding padding ő\n", i);
     n += (size_t)sprintf(big + n, "echo big-done");
     check("48 KB command with UTF-8", run_cmd(e, big, n) && g_code == 0 && has("big-done"));
+
+    // Line-width cap: the suffix lands right after the kept text, before the
+    // PTY's \r\n (after the \r it overwrote the line's start once collapsed).
+    check("over-long line: suffix before CR LF",
+          run_cmd_mode(e, "printf 'S%.0s' $(seq 40); printf 'm%.0s' $(seq 400); echo", 57, "safe")
+          && g_code == 0 && has("mmm ...[+140 chars]\r\n"));
 
     // Persistent shell is still healthy after all of the above.
     check("session still usable", RUN("echo alive") && g_code == 0 && has("alive"));

@@ -274,7 +274,7 @@ test-runenv: | build
 test-run-bytes: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-run-bytes \
-	    test/test_run_bytes.c noise_ws.c identity.c identity_server.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_run_bytes.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-run-bytes
 # Spawn-time init drain: with PTY echo ON (simulating ConPTY, which has no

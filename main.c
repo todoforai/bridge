@@ -1981,6 +1981,15 @@ static void ob_tail_flush(out_policy_t *ob) {
     ob->tcur_len = 0; ob->tcur_col = 0; ob->tcur_charged = 0;
 }
 
+// Write " ...[+N chars]" for the bytes dropped on the current line (if any)
+// into `out`, reset the count, return the bytes written.
+static size_t ob_line_suffix(out_policy_t *ob, uint8_t *out, size_t room) {
+    if (ob->line_dropped == 0) return 0;
+    int m = snprintf((char *)out, room, " ...[+%zu chars]", ob->line_dropped);
+    ob->line_dropped = 0;
+    return (m > 0 && (size_t)m < room) ? (size_t)m : 0;
+}
+
 // Emit `n` raw bytes through the per-line width cap, tracking the terminal
 // column (col/line_len/head_tok persist across calls so a line can span PTY
 // reads). Escapes pass through uncounted; `\r` / CSI G rewind the column so a
@@ -1998,16 +2007,16 @@ static size_t ob_emit_capped(edge_t *e, session_t *s, const uint8_t *d, size_t n
         uint8_t c = d[i];
         switch (cr_feed(&ob->head_tok, c)) {
         case CR_NL:
-            if (ob->line_dropped > 0) {
-                int m = snprintf((char *)out + u, cap - u, " ...[+%zu chars]", ob->line_dropped);
-                if (m > 0 && (size_t)m < cap - u) u += (size_t)m;
-                ob->line_dropped = 0;
-            }
+            u += ob_line_suffix(ob, out + u, cap - u);
             out[u++] = '\n';
             ob->col = 0; ob->line_len = 0; ob->line_charged = 0;
             effective++;
             break;
         case CR_CR:
+            // The suffix goes BEFORE the \r: a PTY ends lines with \r\n, and a
+            // suffix after the \r is a redraw from column 0 once the backend
+            // collapses carriage returns — it overwrote the line's first chars.
+            u += ob_line_suffix(ob, out + u, cap - u);
             out[u++] = c;
             ob->col = 0;
             break;
