@@ -18,7 +18,7 @@
 // A body shorter than <size> means the transfer broke.
 // A `put` (`tfa-cat -w todoforai:…`) is an attach with a "ref": the backend
 // replaces that resource with the bytes instead of attaching them.
-// A `cli` (the built-in `tfa-search` / `tfa-question` / `tfa-show`, see
+// A `cli` (a built-in `tfa-*` command, BRIDGE_CLI_NAMES, see
 // shell_cli.c) is both: {"kind":"cli","name":<command>,"size":N}\n + N bytes
 // (a request line with argv, then its inputs), write side kept open, answered
 // like a fetch with "data <size> <mime>\n" + the reply. The command itself runs

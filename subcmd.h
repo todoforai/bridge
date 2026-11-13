@@ -26,7 +26,7 @@ int  cmd_live(int argc, char **argv);
 // argv[0] dispatch via the ~/.todoforai/tools/bin/tfa-cat symlink; Windows:
 // the tfa-cat() shell function → `<bridge> __cat`.
 int  cmd_cat(int argc, char **argv);
-// `tfa-search` / `tfa-question` / `tfa-show`: argv to the backend, which runs
+// The built-in `tfa-*` CLIs (BRIDGE_CLI_NAMES): argv to the backend, which runs
 // the command and answers exit code + output (shell_cli.c). argv[0] = the name.
 extern const char *const BRIDGE_CLI_NAMES[];   // NULL-terminated
 int  bridge_cli_builtin(const char *name);

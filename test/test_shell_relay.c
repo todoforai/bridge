@@ -384,14 +384,14 @@ int main(void) {
     assert(shell_relay_stream_count(&R) == 0);
 
     // 19. cli: argv goes up as one sized request, the backend's code/stdout/stderr come back. stdin untouched.
-    assert(system("cd build/sr && for n in tfa-search tfa-question tfa-show; do ln -sf ../todoforai-bridge $n; done") == 0);
+    assert(system("cd build/sr && for n in tfa-search tfa-question tfa-show tfa-surface; do ln -sf ../todoforai-bridge $n; done") == 0);
     reset(); cli_answer("{\"code\":3,\"out\":6,\"err\":5}", "hello\noops\n");
-    snprintf(cmd, sizeof cmd, "cd build/sr && echo keep | (%s TODOFORAI_PROJECT_ID=P1 ./tfa-search -n 3 'a \"b\"' 2>e.txt; echo rc=$?; cat; cat e.txt)", env);
+    snprintf(cmd, sizeof cmd, "cd build/sr && echo keep | (%s TODOFORAI_PROJECT_ID=P1 TODOFORAI_FRONTEND_ID=F1 ./tfa-search -n 3 'a \"b\"' 2>e.txt; echo rc=$?; cat; cat e.txt)", env);
     run(cmd, 0, out, sizeof out);
     assert(!strcmp(out, "hello\nrc=3\nkeep\noops\n"));
     assert(count(frames, "\"shell:open\"") == 1 && strstr(frames, "\"kind\":\"cli\"") && strstr(frames, "\"name\":\"tfa-search\"") && count(frames, "\"shell:end\"") == 1);
     dn = decoded(dec, sizeof dec); dec[dn] = 0;
-    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"inputs\":[]}\n"));
+    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"frontendId\":\"F1\",\"inputs\":[]}\n"));
     { char want[64]; snprintf(want, sizeof want, "\"size\":%zu", dn); assert(strstr(frames, want)); }
     printf("ok 19 cli round trip\n");
 
@@ -451,9 +451,9 @@ int main(void) {
     run(cmd, 0, out, sizeof out);
     assert(!strcmp(out, "tfa-search: unexpected answer from the server\nrc=1\n"));
     reset();
-    snprintf(cmd, sizeof cmd, "env -u TODOFORAI_BRIDGE_PORT build/sr/tfa-show --version; build/todoforai-bridge __cli tfa-search -V; build/todoforai-bridge __cli rm 2>&1 | head -c 0; echo rc=$?");
+    snprintf(cmd, sizeof cmd, "env -u TODOFORAI_BRIDGE_PORT build/sr/tfa-show --version; build/sr/tfa-surface -V; build/todoforai-bridge __cli tfa-search -V; build/todoforai-bridge __cli rm 2>&1 | head -c 0; echo rc=$?");
     run(cmd, 0, out, sizeof out);
-    assert(!strncmp(out, "tfa-show ", 9) && strstr(out, "\ntfa-search ") && frames_len == 0);
+    assert(!strncmp(out, "tfa-show ", 9) && strstr(out, "\ntfa-surface ") && strstr(out, "\ntfa-search ") && frames_len == 0);
     assert(shell_relay_stream_count(&R) == 0);
     printf("ok 22 cli errors + version\n");
 

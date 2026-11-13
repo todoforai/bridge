@@ -474,7 +474,7 @@ int cmd_cat(int argc, char **argv) {
 // POSIX: argv[0] dispatch via ~/.todoforai/tools/bin symlinks; Windows: shell
 // functions → `<bridge> __cli <name>`.
 
-const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", NULL };
+const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-surface", NULL };
 
 int bridge_cli_builtin(const char *name) {
     for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) if (strcmp(name, BRIDGE_CLI_NAMES[i]) == 0) return 1;
@@ -535,7 +535,7 @@ static int cli_read_input(cli_input_t *in, const char *need, const char *path, c
     return 0;
 }
 
-// {"argv":[…],"cwd":…,"projectId":…,"inputs":[…]}\n → line. -1: too long.
+// {"argv":[…],"cwd":…,"projectId":…,"frontendId":…,"inputs":[…]}\n → line. -1: too long.
 static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **argv, const cli_input_t *in, int nin) {
     int bad = json_emit_raw(line, cap, u, "{\"argv\":[", 9) < 0;
     for (int i = 0; i < argc && !bad; i++)
@@ -549,7 +549,9 @@ static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **
 #endif
     const char *proj = getenv("TODOFORAI_PROJECT_ID");
     if (!bad && wd) bad = json_emit_raw(line, cap, u, ",\"cwd\":", 7) < 0 || json_emit_str(line, cap, u, wd, -1) < 0;
+    const char *fe = getenv("TODOFORAI_FRONTEND_ID");   // tfa-surface's target tab
     if (!bad && proj && *proj) bad = json_emit_raw(line, cap, u, ",\"projectId\":", 13) < 0 || json_emit_str(line, cap, u, proj, -1) < 0;
+    if (!bad && fe && *fe) bad = json_emit_raw(line, cap, u, ",\"frontendId\":", 14) < 0 || json_emit_str(line, cap, u, fe, -1) < 0;
     if (!bad) bad = json_emit_raw(line, cap, u, ",\"inputs\":[", 11) < 0;
     for (int i = 0; i < nin && !bad; i++) {
         char k[96];

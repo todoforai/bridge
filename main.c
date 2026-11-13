@@ -582,7 +582,8 @@ static int output_tail_is_prompt(const session_t *s) {
 #  define DETACH_SHIM_FMT "nohup() { '%s' __detach \"$@\"; }; setsid() { nohup \"$@\"; }; " \
     "tfa-cat() { '%s' __cat \"$@\"; }; " \
     "tfa-search() { '%s' __cli tfa-search \"$@\"; }; tfa-question() { '%s' __cli tfa-question \"$@\"; }; " \
-    "tfa-show() { '%s' __cli tfa-show \"$@\"; }; " ADB_SHIM_FMT
+    "tfa-show() { '%s' __cli tfa-show \"$@\"; }; tfa-settings() { '%s' __cli tfa-settings \"$@\"; }; " \
+    "tfa-memory() { '%s' __cli tfa-memory \"$@\"; }; tfa-surface() { '%s' __cli tfa-surface \"$@\"; }; " ADB_SHIM_FMT
 #endif
 
 typedef struct {
@@ -3030,7 +3031,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[7 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤7×), each ' may become '\''
+        char dshim[10 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤10×), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -3059,7 +3060,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q);
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q);
 #else
                 int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif
