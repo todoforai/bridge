@@ -580,7 +580,7 @@ static int output_tail_is_prompt(const session_t *s) {
 // tfa-cat, adb: POSIX gets PATH symlinks (bridge_link_tool); Windows has no
 // symlinks for us, so a function (bash/busybox accept the hyphen).
 #  define DETACH_SHIM_FMT "nohup() { '%s' __detach \"$@\"; }; setsid() { nohup \"$@\"; }; " \
-    "tfa-cat() { '%s' __cat \"$@\"; }; " \
+    "tfa-cat() { '%s' __cat \"$@\"; }; tfa-skill() { '%s' __skill \"$@\"; }; " \
     "tfa-search() { '%s' __cli tfa-search \"$@\"; }; tfa-question() { '%s' __cli tfa-question \"$@\"; }; " \
     "tfa-show() { '%s' __cli tfa-show \"$@\"; }; tfa-settings() { '%s' __cli tfa-settings \"$@\"; }; " \
     "tfa-memory() { '%s' __cli tfa-memory \"$@\"; }; tfa-surface() { '%s' __cli tfa-surface \"$@\"; }; " ADB_SHIM_FMT
@@ -3060,7 +3060,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q);
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q);
 #else
                 int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif
@@ -4540,11 +4540,13 @@ int bridge_main(int argc, char **argv) {
 #ifdef _WIN32
     if (argc >= 2 && strcmp(argv[1], "__detach") == 0) return bridge_pty_detach_main(argc - 2, argv + 2);
     if (argc >= 2 && strcmp(argv[1], "__cat") == 0) return cmd_cat(argc - 1, argv + 1);
+    if (argc >= 2 && strcmp(argv[1], "__skill") == 0) return cmd_skill(argc - 1, argv + 1);
 #else
     {   // Invoked through the tfa-cat symlink (busybox-style).
         const char *a0 = argc ? strrchr(argv[0], '/') : NULL;
         a0 = a0 ? a0 + 1 : (argc ? argv[0] : "");
         if (strcmp(a0, "tfa-cat") == 0) return cmd_cat(argc, argv);
+        if (strcmp(a0, "tfa-skill") == 0) return cmd_skill(argc, argv);
         if (strcmp(a0, "adb") == 0) return cmd_adb(argc, argv);
         if (bridge_cli_builtin(a0)) return cmd_cli(a0, argc, argv);
     }
@@ -4779,6 +4781,7 @@ int bridge_main(int argc, char **argv) {
             host, (unsigned)port, saved_creds.device_id, BRIDGE_VERSION);
 #ifndef _WIN32
     bridge_link_tool(bridge_jobs_self_path(), "tfa-cat", 1);   // on PATH for every RUN
+    bridge_link_tool(bridge_jobs_self_path(), "tfa-skill", 1);
     bridge_link_tool(bridge_jobs_self_path(), "adb", 0);       // phones by name; else the real adb
     // Built in unless the machine has its own (the npm package, earlier on PATH, wins anyway).
     for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) bridge_link_tool(bridge_jobs_self_path(), BRIDGE_CLI_NAMES[i], 0);

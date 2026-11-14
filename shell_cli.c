@@ -362,6 +362,9 @@ static int cat_ref(const char *ref, int attach, int tty, cat_range_t *rng) {
     return rc;
 }
 
+// The command name in skill errors: `tfa-skill` reuses cat_one through a skill: ref.
+static const char *cat_prog = "tfa-cat";
+
 // One input. 0 ok, 1 error (already reported), 141 stdout gone.
 static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
     int is_stdin = strcmp(arg, "-") == 0;
@@ -377,7 +380,7 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
     }
     if (!is_stdin && strncmp(arg, "skill:", 6) == 0) {
         if (skill_path(arg + 6, skill, sizeof skill) != 0) {
-            fprintf(stderr, "tfa-cat: %s: no such skill on this machine (looked in .agents/skills and .claude/skills of the cwd, its parents and home)\n", arg);
+            fprintf(stderr, "%s: %s: no such skill on this machine (looked in .agents/skills and .claude/skills of the cwd, its parents and home)\n", cat_prog, arg + 6);
             return 1;
         }
         arg = skill;
@@ -442,7 +445,6 @@ int cmd_cat(int argc, char **argv) {
                "cat, but images/PDFs printed to an agent's terminal are attached to the bash call,\n"
                "so the model sees them. Redirected/piped output is raw bytes, exactly like cat.\n"
                "  FILE:FROM:TO            lines FROM..TO only (FILE:FROM = to the end)\n"
-               "  skill:<name>[/<file>]   a skill on this machine (SKILL.md by default)\n"
                "  todoforai:<path>        a TODOforAI file, e.g. todoforai:todos/<todoId>/<name>\n"
                "                          (a folder prints its listing)\n"
                "tfa-cat -w todoforai:<path> < data   stdin replaces (or creates) that file\n");
@@ -458,6 +460,34 @@ int cmd_cat(int argc, char **argv) {
     if (argc < 2) return cat_one("-", attach, tty, &seq);
     for (int i = 1; i < argc; i++) {
         int r = cat_one(argv[i], attach, tty, &seq);
+        if (r == 141) return 141;
+        if (r) rc = 1;
+    }
+    return rc;
+}
+
+// `tfa-skill <name>[/<file>][:FROM[:TO]]`: a skill's SKILL.md (or another file of
+// it) on this machine, found like the agent's discovery (skill_path). Its own
+// command so the Skills permission can govern it (agent CLI_FOR_NATIVE);
+// `tfa-cat skill:…` still resolves for older prompts.
+int cmd_skill(int argc, char **argv) {
+    if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) {
+        printf("tfa-skill %s\n", BRIDGE_VERSION); return 0;
+    }
+    if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+        printf("Usage: tfa-skill <name>[/<file>][:FROM[:TO]]...\n"
+               "Print a skill on this machine: its SKILL.md, or <file> inside its folder.\n"
+               "Looked up in .agents/skills and .claude/skills of the cwd, its parents, then home.\n");
+        return argc < 2 ? 2 : 0;
+    }
+    stdio_binary();
+    cat_prog = "tfa-skill";
+    const char *blk = getenv("TODOFORAI_BLOCK_ID");
+    int attach = blk && *blk, tty = stdout_is_tty(), seq = 0, rc = 0;
+    for (int i = 1; i < argc; i++) {
+        char ref[4096];
+        if (snprintf(ref, sizeof ref, "skill:%s", argv[i]) >= (int)sizeof ref) { fprintf(stderr, "tfa-skill: %s: name too long\n", argv[i]); rc = 1; continue; }
+        int r = cat_one(ref, attach, tty, &seq);
         if (r == 141) return 141;
         if (r) rc = 1;
     }

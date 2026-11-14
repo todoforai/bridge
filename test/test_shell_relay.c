@@ -188,7 +188,7 @@ int main(void) {
     snprintf(env, sizeof env, "env -u TODOFORAI_MESSAGE_ID TODOFORAI_BRIDGE_PORT=%u TODOFORAI_API_TOKEN=dst_x TODOFORAI_TODO_ID=T1 TODOFORAI_BLOCK_ID=B1 ", R.port);
     char cmd[2048];
     static char out[1 << 20], dec[24 << 20];
-    assert(system("mkdir -p build/sr && cd build/sr && ln -sf ../todoforai-bridge tfa-cat"
+    assert(system("mkdir -p build/sr && cd build/sr && ln -sf ../todoforai-bridge tfa-cat && ln -sf ../todoforai-bridge tfa-skill"
                   " && printf '\\211PNG\\r\\n\\032\\n0123456789' > a.png && printf 'hello\\n' > t.txt"
                   " && head -c 3000000 /dev/urandom > big.bin && (printf '%%PDF-1.4\\n'; cat big.bin) > big.pdf"
                   " && (printf '%%PDF-1.4\\n'; head -c 21000000 /dev/zero) > huge.pdf"
@@ -320,6 +320,13 @@ int main(void) {
     run(cmd, 0, out, sizeof out);
     assert(strstr(out, "skill body\nref\n") && strstr(out, "no such skill") && strstr(out, "rc=1") && frames_len == 0);
     printf("ok 13 skill refs\n");
+
+    // 13b. tfa-skill <name>[/file]: same lookup as skill: refs, its own name in errors.
+    reset();
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-skill demo demo/ref.md; %s HOME=/nonexistent ../../tfa-skill nope; echo rc=$?; ../../tfa-skill; echo rc=$?", env, env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "skill body\nref\n") && strstr(out, "tfa-skill: nope: no such skill") && strstr(out, "rc=1") && strstr(out, "Usage: tfa-skill") && strstr(out, "rc=2") && frames_len == 0);
+    printf("ok 13b tfa-skill\n");
 
     // 14. fetch: body streamed (3MB, backpressure through a pipe), exact bytes.
     reset();
