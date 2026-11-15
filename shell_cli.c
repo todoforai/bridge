@@ -504,7 +504,7 @@ int cmd_skill(int argc, char **argv) {
 // POSIX: argv[0] dispatch via ~/.todoforai/tools/bin symlinks; Windows: shell
 // functions → `<bridge> __cli <name>`.
 
-const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-surface", NULL };
+const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-files", "tfa-surface", NULL };
 
 int bridge_cli_builtin(const char *name) {
     for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) if (strcmp(name, BRIDGE_CLI_NAMES[i]) == 0) return 1;
