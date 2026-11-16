@@ -47,7 +47,7 @@
 #define SHELL_IDLE_MS     30000         // attach: max gap between reads
 #define SHELL_DRAIN_MS    10000         // rejected: wait for the client's EOF
 #define SHELL_LIVE_IDLE_MS (10 * 60000) // live: silent this long → stop relaying (the tee goes on)
-#define SHELL_FETCH_MAX   (20L * 1024 * 1024 + 256)  // fetch: body bytes buffered for a slow client
+#define SHELL_FETCH_MAX   (32L * 1024 * 1024 + 256)  // fetch / cli answer (a 4K image + its output) buffered for a slow client
 
 // `live` streams (tail shim) are throttled here, not in the CLI: the CLI is a
 // plain tee, and we batch lines (≤ every SHELL_LIVE_FLUSH_MS, ≤ SHELL_LIVE_LINES_PER_S,
@@ -115,6 +115,9 @@ void shell_relay_on_close(shell_relay_t *r, const char *payload, size_t len);
 // SHELL_READY / SHELL_DATA from the backend (a `fetch` body).
 void shell_relay_on_ready(shell_relay_t *r, const char *payload, size_t len);
 void shell_relay_on_data(shell_relay_t *r, const char *payload, size_t len);
+// SHELL_WAIT: a `cli` command still runs (image generation, transcription) — wait
+// another SHELL_REPLY_MS for its READY, and tell the client (a `wait` line).
+void shell_relay_on_wait(shell_relay_t *r, const char *payload, size_t len);
 // Backend connection lost: fail every stream (the backend forgot them).
 void shell_relay_drop_streams(shell_relay_t *r, const char *why);
 
@@ -128,8 +131,8 @@ int shell_relay_stream_count(const shell_relay_t *r);
 // fetch's URI (`tty`: stdout is the agent's terminal), NULL otherwise.
 ws_fd_t shell_client_open(const char *kind, const char *name, const char *mime, long size,
                           const char *ref, int tty, char *err, size_t err_cap);
-// Fetch / cli: read the daemon's first line. Returns 1 = body follows (`size`,
-// `mime` set), 0 = attached (nothing to print), -1 = error (in err).
+// Fetch / cli: read the daemon's first line (`wait` lines skipped: a long cli command).
+// Returns 1 = body follows (`size`, `mime` set), 0 = attached (nothing to print), -1 = error (in err).
 int shell_client_fetch_head(ws_fd_t fd, long *size, char *mime, size_t mime_cap, char *err, size_t err_cap);
 // Blocking read with the SHELL_IDLE_MS timeout. >0 bytes, 0 EOF, -1 error.
 long shell_client_recv(ws_fd_t fd, void *p, size_t n);

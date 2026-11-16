@@ -39,7 +39,9 @@ static int fetch_attach;
 // cli: answers queued per round (a `need` round, then the result), served as a fetch body on END.
 static char cli_replies[4][4096]; static size_t cli_len[4]; static int cli_n, cli_i;
 static long cli_stream = -1, cli_refuse_id = -1;
-static int cli_refuse, cli_opens;   // refuse the Nth round: CLOSE {error} right at OPEN (a backend without `cli`)
+static int cli_refuse, cli_opens;
+static int cli_waits;   // SHELL_WAITs before the answer (a long command)
+static long cli_wait_id = -1;   // refuse the Nth round: CLOSE {error} right at OPEN (a backend without `cli`)
 
 static int fake_send(void *ctx, const char *json, size_t len) {
     (void)ctx;
@@ -67,7 +69,7 @@ static int fake_send(void *ctx, const char *json, size_t len) {
         else if (id == cli_stream) {
             cli_stream = -1;
             if (!fetch_err && cli_i < cli_n) { fetch_body = cli_replies[cli_i]; fetch_len = cli_len[cli_i]; cli_i++; }
-            fetch_id = id;
+            if (cli_waits) cli_wait_id = id; else fetch_id = id;
         }
         else reply_after_end = id;
     }
@@ -94,6 +96,12 @@ static void pump(int ms) {
         int cn = snprintf(c, sizeof c, "{\"streamId\":%ld,\"error\":\"bad request\"}", cli_refuse_id);
         cli_refuse_id = -1;
         shell_relay_on_close(&R, c, (size_t)cn);
+    }
+    if (cli_wait_id > 0) {
+        char c[64];
+        int cn = snprintf(c, sizeof c, "{\"streamId\":%ld}", cli_wait_id);
+        shell_relay_on_wait(&R, c, (size_t)cn);
+        if (--cli_waits == 0) { fetch_id = cli_wait_id; cli_wait_id = -1; }
     }
     if (fetch_id > 0) {
         long id = fetch_id; fetch_id = -1;
@@ -171,7 +179,7 @@ static size_t decoded(char *dst, size_t cap) {
 static void reset(void) {
     frames_len = 0; frames[0] = 0; reply_err = NULL; connected = 1; busy = 0;
     fetch_body = fetch_err = NULL; fetch_len = 0; fetch_attach = 0;
-    cli_n = cli_i = 0; cli_refuse = cli_opens = 0;
+    cli_n = cli_i = 0; cli_refuse = cli_opens = 0; cli_waits = 0; cli_wait_id = -1;
 }
 
 // Queue one backend answer for a `cli` round: the reply line + `rest`.
@@ -442,7 +450,7 @@ int main(void) {
     assert(!strcmp(out, "hello\nrc=3\nkeep\noops\n"));
     assert(count(frames, "\"shell:open\"") == 1 && strstr(frames, "\"kind\":\"cli\"") && strstr(frames, "\"name\":\"tfa-search\"") && count(frames, "\"shell:end\"") == 1);
     dn = decoded(dec, sizeof dec); dec[dn] = 0;
-    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"frontendId\":\"F1\",\"inputs\":[]}\n"));
+    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"frontendId\":\"F1\",\"stdoutTty\":false,\"inputs\":[]}\n"));
     { char want[64]; snprintf(want, sizeof want, "\"size\":%zu", dn); assert(strstr(frames, want)); }
     printf("ok 19 cli round trip\n");
 
@@ -524,6 +532,27 @@ int main(void) {
     for (int i = 0; i < 20; i++) pump(5);
     assert(strstr(out, "bad request") && frames_len == 0 && shell_relay_stream_count(&R) == 0);
     printf("ok 23 cli aborted / empty\n");
+
+    // 24. cli: SHELL_WAITs keep a long command waiting (the client skips them); the answer's file is
+    //     written as typed before stdout/stderr; an unwritable one fails the run; the request says stdoutTty.
+    assert(system("cd build/sr && rm -f img.png && ln -sf ../todoforai-bridge tfa-imagegen") == 0);
+    reset(); cli_waits = 3; cli_answer("{\"code\":0,\"out\":0,\"err\":14,\"file\":\"build/sr/img.png\",\"fileSize\":4}", "Saved img.png\n\x89PNG");
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-imagegen generate cat; echo rc=$?; od -An -c build/sr/img.png | tr -d ' '", env);
+    run(cmd, 0, out, sizeof out);
+    assert(!strcmp(out, "Saved img.png\nrc=0\n211PNG\n") && cli_waits == 0);   // od: \\211, tr drops the backslash
+    reset(); cli_answer("{\"code\":0,\"out\":0,\"err\":6,\"file\":\"build/sr/no/dir/x.png\",\"fileSize\":1}", "Saved\nX");
+    snprintf(cmd, sizeof cmd, "%s build/sr/tfa-imagegen generate cat; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "tfa-imagegen: build/sr/no/dir/x.png: No such file or directory\nrc=1\n") && !strstr(out, "Saved"));
+    reset(); cli_answer("{\"code\":0,\"out\":0,\"err\":0,\"file\":\"build/sr/img.png\"}", "X");
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "unexpected answer from the server"));
+    reset(); cli_answer("{\"code\":0,\"out\":0,\"err\":0}", "");
+    run(cmd, 1, out, sizeof out);
+    dn = decoded(dec, sizeof dec); dec[dn] = 0;
+    assert(strstr(dec, "\"stdoutTty\":true,\"inputs\":[]"));
+    assert(shell_relay_stream_count(&R) == 0);
+    printf("ok 24 cli wait + file\n");
 
     shell_relay_close_all(&R);
     printf("all ok\n");

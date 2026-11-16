@@ -584,7 +584,8 @@ static int output_tail_is_prompt(const session_t *s) {
     "tfa-search() { '%s' __cli tfa-search \"$@\"; }; tfa-question() { '%s' __cli tfa-question \"$@\"; }; " \
     "tfa-show() { '%s' __cli tfa-show \"$@\"; }; tfa-settings() { '%s' __cli tfa-settings \"$@\"; }; " \
     "tfa-memory() { '%s' __cli tfa-memory \"$@\"; }; tfa-surface() { '%s' __cli tfa-surface \"$@\"; }; " \
-    "tfa-files() { '%s' __cli tfa-files \"$@\"; }; " ADB_SHIM_FMT
+    "tfa-files() { '%s' __cli tfa-files \"$@\"; }; tfa-imagegen() { '%s' __cli tfa-imagegen \"$@\"; }; " \
+    "tfa-stt() { '%s' __cli tfa-stt \"$@\"; }; tfa-tts() { '%s' __cli tfa-tts \"$@\"; }; tfa-speech() { '%s' __cli tfa-speech \"$@\"; }; " ADB_SHIM_FMT
 #endif
 
 typedef struct {
@@ -3032,7 +3033,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[12 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤12×), each ' may become '\''
+        char dshim[16 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤16×), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -3061,7 +3062,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q, q);
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q);  // one per %s (DETACH + ADB + TAIL)
 #else
                 int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif
@@ -3817,11 +3818,12 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         if (IS("adb:data")) adb_relay_on_data(&e->adb, payload, payload_len);
         else                adb_relay_on_close(&e->adb, payload, payload_len);
         return 0;
-    } else if (IS("shell:close") || IS("shell:ready") || IS("shell:data")) {
+    } else if (IS("shell:close") || IS("shell:ready") || IS("shell:data") || IS("shell:wait")) {
         const char *payload = NULL; size_t payload_len = 0;
         if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len)) return 0;
         if (IS("shell:close"))      shell_relay_on_close(&e->shell, payload, payload_len);
         else if (IS("shell:ready")) shell_relay_on_ready(&e->shell, payload, payload_len);
+        else if (IS("shell:wait"))  shell_relay_on_wait(&e->shell, payload, payload_len);
         else                        shell_relay_on_data(&e->shell, payload, payload_len);
         return 0;
     } else if (IS("preview:http_request")) {

@@ -628,14 +628,15 @@ int cmd_skill(int argc, char **argv) {
 // POSIX: argv[0] dispatch via ~/.todoforai/tools/bin symlinks; Windows: shell
 // functions → `<bridge> __cli <name>`.
 
-const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-files", "tfa-surface", NULL };
+const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-files", "tfa-surface",
+    "tfa-imagegen", "tfa-stt", "tfa-tts", "tfa-speech", NULL };
 
 int bridge_cli_builtin(const char *name) {
     for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) if (strcmp(name, BRIDGE_CLI_NAMES[i]) == 0) return 1;
     return 0;
 }
 
-#define CLI_MAX_INPUTS 4
+#define CLI_MAX_INPUTS 8   // = the backend's (tfa-imagegen edit: up to 7 references + stdin)
 #define CLI_MAX_HEAD   (48 * 1024)   // request line (argv, cwd); the backend allows 64 KB
 
 typedef struct { const char *kind; char path[4096]; char *data; size_t size; int flag; } cli_input_t;
@@ -689,7 +690,7 @@ static int cli_read_input(cli_input_t *in, const char *need, const char *path, c
     return 0;
 }
 
-// {"argv":[…],"cwd":…,"projectId":…,"frontendId":…,"inputs":[…]}\n → line. -1: too long.
+// {"argv":[…],"cwd":…,"projectId":…,"frontendId":…,"stdoutTty":…,"inputs":[…]}\n → line. -1: too long.
 static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **argv, const cli_input_t *in, int nin) {
     int bad = json_emit_raw(line, cap, u, "{\"argv\":[", 9) < 0;
     for (int i = 0; i < argc && !bad; i++)
@@ -706,6 +707,7 @@ static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **
     const char *fe = getenv("TODOFORAI_FRONTEND_ID");   // tfa-surface's target tab
     if (!bad && proj && *proj) bad = json_emit_raw(line, cap, u, ",\"projectId\":", 13) < 0 || json_emit_str(line, cap, u, proj, -1) < 0;
     if (!bad && fe && *fe) bad = json_emit_raw(line, cap, u, ",\"frontendId\":", 14) < 0 || json_emit_str(line, cap, u, fe, -1) < 0;
+    if (!bad) bad = stdout_is_tty() ? json_emit_raw(line, cap, u, ",\"stdoutTty\":true", 17) < 0 : json_emit_raw(line, cap, u, ",\"stdoutTty\":false", 18) < 0;
     if (!bad) bad = json_emit_raw(line, cap, u, ",\"inputs\":[", 11) < 0;
     for (int i = 0; i < nin && !bad; i++) {
         char k[96];
@@ -717,6 +719,19 @@ static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **
            || json_emit_raw(line, cap, u, "}", 1) < 0;
     }
     return bad || json_emit_raw(line, cap, u, "]}\n", 3) < 0 ? -1 : 0;
+}
+
+// `path` ← bytes (created / truncated). 0, or -1 with err.
+static int cli_write_file(const char *path, const char *p, size_t n, char *err, size_t errcap) {
+#ifdef _WIN32
+    int fd = _open(path, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+#endif
+    int ok = fd >= 0 && write_all(fd, p, n) == 0, e = errno;
+    if (fd >= 0 && sh_close(fd) != 0 && ok) { ok = 0; e = errno; }
+    if (!ok) snprintf(err, errcap, "%.300s: %s", path, strerror(e));
+    return ok ? 0 : -1;
 }
 
 // One round: request up, the whole reply down (malloc'd, *rn bytes). NULL + err on failure.
@@ -768,9 +783,16 @@ int cmd_cli(const char *name, int argc, char **argv) {
             nin++;
             continue;
         }
-        long code = 1, out = -1, er = -1;
+        long code = 1, out = -1, er = -1, fs = 0;
+        int has_file = json_get_str_decoded(res, hl, "file", path, sizeof path, &l) && *path;
         if (!nl || !json_get_long(res, hl, "code", &code) || !json_get_long(res, hl, "out", &out) || !json_get_long(res, hl, "err", &er)
-            || out < 0 || er < 0 || (size_t)out + (size_t)er != rn - hl - 1) { snprintf(err, sizeof err, "unexpected answer from the server"); break; }
+            || (has_file && !json_get_long(res, hl, "fileSize", &fs))
+            || out < 0 || er < 0 || fs < 0 || (size_t)out > rn - hl - 1 || (size_t)er > rn - hl - 1 - (size_t)out
+            || (size_t)fs != rn - hl - 1 - (size_t)out - (size_t)er) { snprintf(err, sizeof err, "unexpected answer from the server"); break; }
+        // The command's one output file (its -o, else a fixed default like out.png), as typed
+        // from here: before its "Saved …" goes out. The path is the server's word, the same
+        // trust as the output it prints. A file we can't write fails the run, nothing else printed.
+        if (has_file && cli_write_file(path, nl + 1 + out + er, (size_t)fs, err, sizeof err) < 0) break;
         // stdout gone (`| head`): 141 like any filter, the command itself already ran.
         rc = write_all(1, nl + 1, (size_t)out) < 0 ? 141 : (int)(code & 0xff);
         (void)write_all(2, nl + 1 + out, (size_t)er);

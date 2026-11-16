@@ -543,6 +543,13 @@ void shell_relay_on_data(shell_relay_t *r, const char *payload, size_t len) {
     s->deadline_ms = ws_monotonic_ms() + SHELL_IDLE_MS;
 }
 
+void shell_relay_on_wait(shell_relay_t *r, const char *payload, size_t len) {
+    shell_stream_t *s = fetch_stream(r, payload, len);
+    if (!s || s->ready || !s->cli) return;
+    s->deadline_ms = ws_monotonic_ms() + SHELL_REPLY_MS;
+    if (fetch_push(s, "wait\n", 5) != 0) { (void)send_abort(r, s->id); stream_free(s); }
+}
+
 // ── Client side ──────────────────────────────────────────────────────────────
 
 int shell_client_send(ws_fd_t fd, const void *buf, size_t n) {
@@ -641,7 +648,10 @@ int shell_client_fetch_head(ws_fd_t fd, long *size, char *mime, size_t mime_cap,
         if (poll(&pf, 1, SHELL_REPLY_MS + 5000) <= 0) break;
         sr_ssize r = sr_recv(fd, line + n, 1);
         if (r <= 0) break;
-        if (line[n] == '\n') break;
+        if (line[n] == '\n') {
+            if (n == 4 && !memcmp(line, "wait", 4)) { n = 0; continue; }   // still running: wait again
+            break;
+        }
         n++;
     }
     line[n] = '\0';
