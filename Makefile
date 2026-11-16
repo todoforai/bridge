@@ -19,7 +19,7 @@ HARDEN_CFLAGS = -fstack-protector-strong -fPIE
 HARDEN_LD     = -pie -Wl,-z,relro,-z,now
 HARDEN_LD_WIN = -Wl,--dynamicbase,--nxcompat,--high-entropy-va
 
-CFLAGS  ?= -Os -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wno-unused-function \
+CFLAGS  ?= -Os -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Werror=format -Wno-unused-function \
            -ffunction-sections -fdata-sections -fomit-frame-pointer \
            $(HARDEN_CFLAGS) \
            -DBRIDGE_VERSION=\"$(BRIDGE_VERSION)\" \

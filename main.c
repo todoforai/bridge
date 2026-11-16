@@ -3032,7 +3032,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[11 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤11×), each ' may become '\''
+        char dshim[12 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤12×), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -3061,7 +3061,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q);
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q, q);
 #else
                 int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif
