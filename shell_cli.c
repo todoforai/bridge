@@ -10,6 +10,7 @@
 #include "shell_relay.h"
 #include "json.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -288,50 +289,168 @@ static int file_exists(const char *p) {
 #endif
 }
 
-// skill:<name>[/<file>] → <root>/{.agents,.claude}/skills/<name>/<file|SKILL.md>,
-// roots = cwd and its parents, then $HOME — the agent's discovery order
-// (repo first). 0 found, -1 not found / bad name.
-static int skill_path(const char *spec, char *out, size_t cap) {
-    if (!*spec || strstr(spec, "..") || spec[0] == '/' || spec[0] == '\\') return -1;
-    char rel[512];
-    const char *slash = strchr(spec, '/');
-    if (snprintf(rel, sizeof rel, slash ? "%s" : "%s/SKILL.md", spec) >= (int)sizeof rel) return -1;
-    static const char *const dirs[] = { ".agents", ".claude" };
-    char dir[4096];
-    const char *home = getenv("HOME");
+// ── skills on this machine, as the agent's discovery walk lists them ──
+// (agent/src/agents/skills_info.jl `_bridge_get_skills`): per root — $HOME first
+// (the agent lists a repo's skills with their path, so names are for these), then
+// the cwd and its parents — {.agents,.claude}/{skills,plugins/*/skills}; in each,
+// in `find -L -maxdepth 6` order, a <name>/SKILL.md, then a loose <name>.md. Only
+// what the agent would list: a closed frontmatter (optional for a loose .md), not
+// disable-model-invocation, and no other `name:` in it. First hit wins.
+
+static int is_dir(const char *p) {
 #ifdef _WIN32
+    struct _stat st;
+    return _stat(p, &st) == 0 && (st.st_mode & _S_IFDIR);
+#else
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+// Would the agent list the file at `path` as the skill `name`? `loose`: a
+// <name>.md, whose frontmatter is optional.
+static int skill_listed_as(const char *path, const char *name, int loose) {
+    int fd = sh_open(path);
+    if (fd < 0) return 0;
+    char buf[8193];
+    sh_ssize n = sh_read(fd, buf, sizeof buf - 1);
+    sh_close(fd);
+    if (n < 0) return 0;
+    buf[n] = '\0';
+    char *p = buf;
+    if (!strncmp(p, "\xef\xbb\xbf", 3)) p += 3;
+    if (strncmp(p, "---", 3) || (p[3] != '\n' && p[3] != '\r')) return loose;
+    for (p = strchr(p, '\n'); p && *++p; p = strchr(p, '\n')) {
+        size_t l = strcspn(p, "\r\n");
+        while (l && (p[l - 1] == ' ' || p[l - 1] == '\t')) l--;
+        if (l == 3 && !strncmp(p, "---", 3)) return 1;   // closed, nothing against it
+        // A top-level `key: value` as the agent's _parse_simple_yaml reads it (comment, quotes off).
+        size_t k = 0;
+        while (k < l && (p[k] == '_' || p[k] == '-' || (p[k] | 0x20) - 'a' < 26u || (unsigned)(p[k] - '0') < 10u)) k++;
+        size_t c = k;
+        while (c < l && (p[c] == ' ' || p[c] == '\t')) c++;
+        if (!k || c >= l || p[c] != ':') continue;
+        const char *v = p + c + 1;
+        size_t vl = l - (size_t)(v - p);
+        while (vl && (*v == ' ' || *v == '\t')) { v++; vl--; }
+        for (size_t i = 1; i < vl; i++) if (v[i] == '#' && (v[i - 1] == ' ' || v[i - 1] == '\t')) { vl = i; break; }
+        while (vl && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+        if (vl >= 2 && (*v == '"' || *v == '\'') && v[vl - 1] == *v) { v++; vl -= 2; }
+        if (k == 24 && !strncmp(p, "disable-model-invocation", 24) && vl == 4 && !strncmp(v, "true", 4)) return 0;
+        if (k == 4 && !strncmp(p, "name", 4) && vl && (vl != strlen(name) || strncmp(v, name, vl))) return 0;   // listed under another name
+    }
+    return 0;   // never closed: not a skill (or cut at 8K, as the agent's walk is)
+}
+
+// SKILL.md files under dir (`depth` levels left), first listed as `name` → out.
+static int skill_walk(const char *dir, int depth, const char *name, char *out, size_t cap) {
+    if (depth <= 0) return 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    char sub[4096];
+    int found = 0;
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name) >= (int)sizeof sub || !is_dir(sub)) continue;
+        found = (!strcmp(e->d_name, name) && snprintf(out, cap, "%s/SKILL.md", sub) < (int)cap
+                 && file_exists(out) && skill_listed_as(out, name, 0))
+             || skill_walk(sub, depth - 1, name, out, cap);
+    }
+    closedir(d);
+    return found;
+}
+
+// One skills dir: the walk (SKILL.md ≤ 6 deep, as `find -maxdepth 6`), then a loose <name>.md.
+static int skill_in_base(const char *base, const char *name, char *out, size_t cap) {
+    if (!is_dir(base)) return 0;
+    if (skill_walk(base, 5, name, out, cap)) return 1;
+    return strcmp(name, "README") && strcmp(name, "SKILL") && snprintf(out, cap, "%s/%s.md", base, name) < (int)cap
+        && file_exists(out) && skill_listed_as(out, name, 1);
+}
+
+static int skill_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+// <root>/{.agents,.claude}/{skills,plugins/*/skills}, in the agent's order.
+static int skill_in_root(const char *root, const char *name, char *out, size_t cap) {
+    static const char *const dirs[] = { ".agents", ".claude" };
+    char base[4096];
+    for (int i = 0; i < 2; i++) {
+        if (snprintf(base, sizeof base, "%s/%s/skills", root, dirs[i]) < (int)sizeof base && skill_in_base(base, name, out, cap)) return 1;
+        if (snprintf(base, sizeof base, "%s/%s/plugins", root, dirs[i]) >= (int)sizeof base) continue;
+        // Plugins in `plugins/*/skills` glob order (sorted), as the agent's walk expands them.
+        DIR *d = opendir(base);
+        if (!d) continue;
+        struct dirent *e;
+        char *pl[64]; int np = 0, found = 0;
+        while (np < 64 && (e = readdir(d))) if (e->d_name[0] != '.' && (pl[np] = strdup(e->d_name))) np++;
+        closedir(d);
+        qsort(pl, (size_t)np, sizeof *pl, skill_cmp);
+        char sk[4096];
+        for (int j = 0; j < np; j++) {
+            found = found || (snprintf(sk, sizeof sk, "%s/%s/skills", base, pl[j]) < (int)sizeof sk && skill_in_base(sk, name, out, cap));
+            free(pl[j]);
+        }
+        if (found) return 1;
+    }
+    return 0;
+}
+
+// <name>[/<file>] → the skill's SKILL.md (or <file> in its folder) on this machine.
+// 0 found, -1 no such skill here (bad name too), -2 a loose <name>.md: no files beside it.
+static int skill_path(const char *spec, char *out, size_t cap) {
+    if (!*spec || strstr(spec, "..") || strchr(spec, '\\') || spec[0] == '/') return -1;
+    char name[256], skill[4096];
+    size_t nl = strcspn(spec, "/");
+    if (nl >= sizeof name) return -1;
+    memcpy(name, spec, nl); name[nl] = '\0';
+    const char *file = spec[nl] ? spec + nl + 1 : NULL;
+    char dir[4096], home[4096] = "";
+    const char *h = getenv("HOME");
+#ifdef _WIN32
+    if (!h || !*h) h = getenv("USERPROFILE");
     if (!_getcwd(dir, sizeof dir)) dir[0] = '\0';
-    if (!home || !*home) home = getenv("USERPROFILE");
 #else
     if (!getcwd(dir, sizeof dir)) dir[0] = '\0';
 #endif
-    while (dir[0]) {   // cwd, its parents, then the root itself ("" + "/…")
-        for (int i = 0; i < 2; i++)
-            if (snprintf(out, cap, "%s/%s/skills/%s", dir, dirs[i], rel) < (int)cap && file_exists(out)) return 0;
-        char *cut = NULL;
-        for (char *c = dir; *c; c++) if (*c == '/' || *c == '\\') cut = c;
-        if (!cut) break;
-        if (cut[1] == '\0') break;   // was "/" or "C:\" — done
+    if (h) snprintf(home, sizeof home, "%s", h);
+    for (char *c = dir; *c; c++) if (*c == '\\') *c = '/';
+    for (char *c = home; *c; c++) if (*c == '\\') *c = '/';
+    int found = *home && skill_in_root(home, name, skill, sizeof skill);
+    while (dir[0] && !found) {   // the cwd, its parents, then the root itself ("" + "/…")
+        found = strcmp(dir, home) && skill_in_root(dir, name, skill, sizeof skill);
+        char *cut = strrchr(dir, '/');
+        if (found || !cut || cut[1] == '\0') break;   // was "/" or "C:/" — done
         cut[cut == dir || (cut == dir + 2 && dir[1] == ':') ? 1 : 0] = '\0';   // keep the root's slash
     }
-    for (int i = 0; i < 2 && home && *home; i++)
-        if (snprintf(out, cap, "%s/%s/skills/%s", home, dirs[i], rel) < (int)cap && file_exists(out)) return 0;
-    return -1;
+    if (!found) return -1;
+    if (!file) return snprintf(out, cap, "%s", skill) < (int)cap ? 0 : -1;
+    char *slash = strrchr(skill, '/');
+    if (!slash || strcmp(slash, "/SKILL.md")) { snprintf(out, cap, "%s", skill); return -2; }
+    *slash = '\0';
+    return snprintf(out, cap, "%s/%s", skill, file) < (int)cap ? 0 : -1;
 }
 
 // A backend resource, as the agent's `read` sees it. On the agent's terminal
 // an image/PDF is attached by the backend directly (no bytes come here);
 // anything else — and everything when piped — is printed like a file.
+// The command name in messages: `tfa-skill` reuses cat_one through a skill: ref.
+static const char *cat_prog = "tfa-cat";
+// The file the last skill: ref resolved to on this machine ("" = none / the backend's).
+static char cat_skill_file[4096];
+
 static int cat_ref(const char *ref, int attach, int tty, cat_range_t *rng) {
-    if (!attach) { fprintf(stderr, "tfa-cat: %s: refs need an agent shell (TODOFORAI_BLOCK_ID unset)\n", ref); return 1; }
+    // tfa-skill names its skill, not the `skill:` ref it fetches.
+    const char *shown = strcmp(cat_prog, "tfa-skill") == 0 && strncmp(ref, "skill:", 6) == 0 ? ref + 6 : ref;
+    if (!attach) { fprintf(stderr, "%s: %s: refs need an agent shell (TODOFORAI_BLOCK_ID unset)\n", cat_prog, shown); return 1; }
     char err[512], mime[128];
     ws_fd_t s = shell_client_open("fetch", NULL, NULL, -1, ref, tty, err, sizeof err);
-    if (s == WS_INVALID_FD) { fprintf(stderr, "tfa-cat: %s: %s\n", ref, err); return 1; }
+    if (s == WS_INVALID_FD) { fprintf(stderr, "%s: %s: %s\n", cat_prog, shown, err); return 1; }
     long size = 0;
     int r = shell_client_fetch_head(s, &size, mime, sizeof mime, err, sizeof err);
     if (r <= 0) {
         shell_client_close(s);
-        if (r < 0) { fprintf(stderr, "tfa-cat: %s: %s\n", ref, err); return 1; }
+        if (r < 0) { fprintf(stderr, "%s: %s: %s\n", cat_prog, shown, err); return 1; }
         return 0;   // attached
     }
     static char buf[64 * 1024];
@@ -362,8 +481,6 @@ static int cat_ref(const char *ref, int attach, int tty, cat_range_t *rng) {
     return rc;
 }
 
-// The command name in skill errors: `tfa-skill` reuses cat_one through a skill: ref.
-static const char *cat_prog = "tfa-cat";
 
 // One input. 0 ok, 1 error (already reported), 141 stdout gone.
 static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
@@ -379,10 +496,13 @@ static int cat_one(const char *arg, int attach, int tty, int *stdin_seq) {
         arg = spec;
     }
     if (!is_stdin && strncmp(arg, "skill:", 6) == 0) {
-        if (skill_path(arg + 6, skill, sizeof skill) != 0) {
-            fprintf(stderr, "%s: %s: no such skill on this machine (looked in .agents/skills and .claude/skills of the cwd, its parents and home)\n", cat_prog, arg + 6);
-            return 1;
-        }
+        cat_skill_file[0] = '\0';
+        // Not on this machine: the backend has the project's and the built-in ones.
+        int sp = skill_path(arg + 6, skill, sizeof skill);
+        // A skill found here keeps its own files: never a same-named one's from the backend.
+        if (sp == -2) { fprintf(stderr, "%s: %s: %s is a single file, nothing beside it\n", cat_prog, arg + 6, skill); return 1; }
+        if (sp != 0) return cat_ref(arg, attach, tty, &rng);
+        snprintf(cat_skill_file, sizeof cat_skill_file, "%s", skill);
         arg = skill;
     } else if (!is_stdin && strncmp(arg, "todoforai:", 10) == 0 && !file_exists(arg)) {
         return cat_ref(arg, attach, tty, &rng);
@@ -466,18 +586,20 @@ int cmd_cat(int argc, char **argv) {
     return rc;
 }
 
-// `tfa-skill <name>[/<file>][:FROM[:TO]]`: a skill's SKILL.md (or another file of
-// it) on this machine, found like the agent's discovery (skill_path). Its own
-// command so the Skills permission can govern it (agent CLI_FOR_NATIVE);
-// `tfa-cat skill:…` still resolves for older prompts.
+// `tfa-skill <name>[/<file>][:FROM[:TO]]`: a listed skill's SKILL.md (or another
+// file of it), wherever the agent found it: this machine's (skill_path, the agent's
+// walk), else — one fetch — yours in the project, the project's, the built-in
+// (backend fetchShellResource). Its own command so the Skills permission governs
+// it (agent CLI_FOR_NATIVE); `tfa-cat skill:…` still resolves for older prompts.
 int cmd_skill(int argc, char **argv) {
     if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) {
         printf("tfa-skill %s\n", BRIDGE_VERSION); return 0;
     }
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
         printf("Usage: tfa-skill <name>[/<file>][:FROM[:TO]]...\n"
-               "Print a skill on this machine: its SKILL.md, or <file> inside its folder.\n"
-               "Looked up in .agents/skills and .claude/skills of the cwd, its parents, then home.\n");
+               "Print a skill: its SKILL.md, or <file> inside its folder.\n"
+               "This machine's first (.agents/ and .claude/ skills and plugins of home, then of\n"
+               "the cwd and its parents), else yours in the project, the project's, a built-in.\n");
         return argc < 2 ? 2 : 0;
     }
     stdio_binary();
@@ -490,6 +612,8 @@ int cmd_skill(int argc, char **argv) {
         int r = cat_one(ref, attach, tty, &seq);
         if (r == 141) return 141;
         if (r) rc = 1;
+        // Where it lives, for its scripts/ and references/ (the listing has no paths).
+        else if (tty && cat_skill_file[0]) fprintf(stderr, "\ntfa-skill: %s is %s\n", argv[i], cat_skill_file);
     }
     return rc;
 }

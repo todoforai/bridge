@@ -193,8 +193,22 @@ int main(void) {
                   " && head -c 3000000 /dev/urandom > big.bin && (printf '%%PDF-1.4\\n'; cat big.bin) > big.pdf"
                   " && (printf '%%PDF-1.4\\n'; head -c 21000000 /dev/zero) > huge.pdf"
                   " && (printf '\\211PNG\\r\\n\\032\\n'; head -c 3600000 /dev/zero) > big.png"
-                  " && mkdir -p repo/sub .claude/skills/demo && printf 'skill body\\n' > .claude/skills/demo/SKILL.md"
-                  " && printf 'ref\\n' > .claude/skills/demo/ref.md") == 0);
+                  " && mkdir -p repo/sub .claude/skills/demo && printf -- '---\\nname: demo\\n---\\nskill body\\n' > .claude/skills/demo/SKILL.md"
+                  " && printf 'ref\\n' > .claude/skills/demo/ref.md"
+                  // As the agent lists them: nested deep, named by frontmatter, a plugin's, a loose .md.
+                  " && mkdir -p .agents/skills/synced/acct/deep .claude/skills/folder .claude/plugins/pl/skills/plug"
+                  " && printf -- '---\\n---\\ndeep\\n' > .agents/skills/synced/acct/deep/SKILL.md"
+                  " && printf -- '---\\nname: \"renamed\"\\n---\\nbody\\n' > .claude/skills/folder/SKILL.md"
+                  " && printf -- '---\\nname: plug # a comment\\n---\\nplug\\n' > .claude/plugins/pl/skills/plug/SKILL.md"
+                  " && printf 'loose\\n' > .claude/skills/loose.md"
+                  // Not listed by the agent as these names: never found here.
+                  " && mkdir -p .claude/skills/off .claude/skills/open"
+                  " && printf -- '---\\ndisable-model-invocation: \"true\" # off\\n---\\n' > .claude/skills/off/SKILL.md"
+                  " && mkdir -p .claude/skills/on .claude/skills/other && printf -- '---\\ndisable-model-invocation: false # true would hide it\\n---\\non\\n' > .claude/skills/on/SKILL.md"
+                  " && printf -- '---\\nname : another\\n---\\n' > .claude/skills/other/SKILL.md"
+                  " && printf -- '---\\nname: open\\n' > .claude/skills/open/SKILL.md"
+                  // A home skill beats a same-named one up the cwd.
+                  " && mkdir -p home/.claude/skills/demo && printf -- '---\\n---\\nhome demo\\n' > home/.claude/skills/demo/SKILL.md") == 0);
 
     // 1. PNG on a TTY → open/data/end, ok, silent, rc 0.
     reset();
@@ -314,18 +328,48 @@ int main(void) {
     assert(strstr(out, "downscale") && strstr(out, "rc=1") && frames_len == 0);
     printf("ok 12 image cap\n");
 
-    // 13. skill:<name>[/file] from cwd's parents; unknown skill explains.
+    // 13. skill:<name>[/file] from cwd's parents (no relay); unknown → the backend's answer.
     reset();
-    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-cat skill:demo skill:demo/ref.md; %s ../../tfa-cat skill:nope; echo rc=$?", env, env);
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-cat skill:demo skill:demo/ref.md", env);
     run(cmd, 0, out, sizeof out);
-    assert(strstr(out, "skill body\nref\n") && strstr(out, "no such skill") && strstr(out, "rc=1") && frames_len == 0);
+    assert(strstr(out, "skill body\nref\n") && frames_len == 0);
+    reset(); fetch_err = "no such skill on this machine, in this project or built in";
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-cat skill:nope; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "tfa-cat: skill:nope: no such skill") && strstr(out, "rc=1"));
     printf("ok 13 skill refs\n");
 
-    // 13b. tfa-skill <name>[/file]: same lookup as skill: refs, its own name in errors.
+    // 13b. tfa-skill <name>[/file]: found as the agent's walk finds it, its own name in errors.
     reset();
-    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-skill demo demo/ref.md; %s HOME=/nonexistent ../../tfa-skill nope; echo rc=$?; ../../tfa-skill; echo rc=$?", env, env);
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-skill demo demo/ref.md deep plug loose on; ../../tfa-skill; echo rc=$?", env);
     run(cmd, 0, out, sizeof out);
-    assert(strstr(out, "skill body\nref\n") && strstr(out, "tfa-skill: nope: no such skill") && strstr(out, "rc=1") && strstr(out, "Usage: tfa-skill") && strstr(out, "rc=2") && frames_len == 0);
+    assert(strstr(out, "skill body\nref\n---\n---\ndeep\n---\nname: plug # a comment\n---\nplug\nloose\n---\ndisable-model-invocation: false # true would hide it\n---\non\n") && strstr(out, "Usage: tfa-skill") && strstr(out, "rc=2") && frames_len == 0);
+    // Renamed by frontmatter (the agent lists it with its path), disabled, unclosed → the backend is asked.
+    for (int k = 0; k < 5; k++) {
+        static const char *const n[] = { "folder", "renamed", "off", "open", "other" };
+        reset(); fetch_err = "no such skill on this machine, in this project or built in";
+        snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-skill %s", env, n[k]);
+        run(cmd, 0, out, sizeof out);
+        assert(strstr(out, "no such skill") && strstr(frames, "\"kind\":\"fetch\""));
+    }
+    reset();
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=$PWD/../../home ../../tfa-skill demo loose/x", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "home demo\n") && strstr(out, "loose.md is a single file") && frames_len == 0);
+    // Not on this machine → one fetch of `skill:<name>` (the project's / built-in); its error named.
+    reset(); fetch_body = "cloud skill\n"; fetch_len = 12;
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-skill sales", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "cloud skill") && strstr(frames, "\"ref\":\"skill:sales\""));
+    reset(); fetch_err = "no such skill on this machine, in this project or built in";
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-skill nope; echo rc=$?", env);
+    run(cmd, 0, out, sizeof out);
+    assert(strstr(out, "tfa-skill: nope: no such skill") && strstr(out, "rc=1"));
+    // On the agent's terminal it says where a local one lives (its scripts/ are beside it).
+    reset();
+    snprintf(cmd, sizeof cmd, "cd build/sr/repo/sub && %s HOME=/nonexistent ../../tfa-skill deep", env);
+    run(cmd, 1, out, sizeof out);
+    assert(strstr(out, "tfa-skill: deep is ") && strstr(out, ".agents/skills/synced/acct/deep/SKILL.md"));
     printf("ok 13b tfa-skill\n");
 
     // 14. fetch: body streamed (3MB, backpressure through a pipe), exact bytes.
