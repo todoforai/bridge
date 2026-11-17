@@ -445,12 +445,12 @@ int main(void) {
     // 19. cli: argv goes up as one sized request, the backend's code/stdout/stderr come back. stdin untouched.
     assert(system("cd build/sr && for n in tfa-search tfa-question tfa-show tfa-surface; do ln -sf ../todoforai-bridge $n; done") == 0);
     reset(); cli_answer("{\"code\":3,\"out\":6,\"err\":5}", "hello\noops\n");
-    snprintf(cmd, sizeof cmd, "cd build/sr && echo keep | (%s TODOFORAI_PROJECT_ID=P1 TODOFORAI_FRONTEND_ID=F1 ./tfa-search -n 3 'a \"b\"' 2>e.txt; echo rc=$?; cat; cat e.txt)", env);
+    snprintf(cmd, sizeof cmd, "cd build/sr && echo keep | (%s TODOFORAI_PROJECT_ID=P1 TODOFORAI_FRONTEND_ID=F1 TODOFORAI_AGENT_SETTINGS_ID=A1 ./tfa-search -n 3 'a \"b\"' 2>e.txt; echo rc=$?; cat; cat e.txt)", env);
     run(cmd, 0, out, sizeof out);
     assert(!strcmp(out, "hello\nrc=3\nkeep\noops\n"));
     assert(count(frames, "\"shell:open\"") == 1 && strstr(frames, "\"kind\":\"cli\"") && strstr(frames, "\"name\":\"tfa-search\"") && count(frames, "\"shell:end\"") == 1);
     dn = decoded(dec, sizeof dec); dec[dn] = 0;
-    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"frontendId\":\"F1\",\"stdoutTty\":false,\"inputs\":[]}\n"));
+    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"frontendId\":\"F1\",\"agentSettingsId\":\"A1\",\"stdoutTty\":false,\"inputs\":[]}\n"));
     { char want[64]; snprintf(want, sizeof want, "\"size\":%zu", dn); assert(strstr(frames, want)); }
     printf("ok 19 cli round trip\n");
 

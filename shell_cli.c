@@ -629,7 +629,8 @@ int cmd_skill(int argc, char **argv) {
 // functions → `<bridge> __cli <name>`.
 
 const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-files", "tfa-surface",
-    "tfa-imagegen", "tfa-stt", "tfa-tts", "tfa-speech", "tfa-treg", "tfa-device", NULL };
+    "tfa-imagegen", "tfa-stt", "tfa-tts", "tfa-speech", "tfa-treg", "tfa-device",
+    "tfa-summary", "tfa-explore", "tfa-handoff", NULL };
 
 int bridge_cli_builtin(const char *name) {
     for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) if (strcmp(name, BRIDGE_CLI_NAMES[i]) == 0) return 1;
@@ -690,7 +691,7 @@ static int cli_read_input(cli_input_t *in, const char *need, const char *path, c
     return 0;
 }
 
-// {"argv":[…],"cwd":…,"projectId":…,"frontendId":…,"stdoutTty":…,"inputs":[…]}\n → line. -1: too long.
+// {"argv":[…],"cwd":…,"projectId":…,"frontendId":…,"agentSettingsId":…,"stdoutTty":…,"inputs":[…]}\n → line. -1: too long.
 static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **argv, const cli_input_t *in, int nin) {
     int bad = json_emit_raw(line, cap, u, "{\"argv\":[", 9) < 0;
     for (int i = 0; i < argc && !bad; i++)
@@ -707,6 +708,8 @@ static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **
     const char *fe = getenv("TODOFORAI_FRONTEND_ID");   // tfa-surface's target tab
     if (!bad && proj && *proj) bad = json_emit_raw(line, cap, u, ",\"projectId\":", 13) < 0 || json_emit_str(line, cap, u, proj, -1) < 0;
     if (!bad && fe && *fe) bad = json_emit_raw(line, cap, u, ",\"frontendId\":", 14) < 0 || json_emit_str(line, cap, u, fe, -1) < 0;
+    const char *ag = getenv("TODOFORAI_AGENT_SETTINGS_ID");   // this turn's agent: a sub-agent patches its settings
+    if (!bad && ag && *ag) bad = json_emit_raw(line, cap, u, ",\"agentSettingsId\":", 19) < 0 || json_emit_str(line, cap, u, ag, -1) < 0;
     if (!bad) bad = stdout_is_tty() ? json_emit_raw(line, cap, u, ",\"stdoutTty\":true", 17) < 0 : json_emit_raw(line, cap, u, ",\"stdoutTty\":false", 18) < 0;
     if (!bad) bad = json_emit_raw(line, cap, u, ",\"inputs\":[", 11) < 0;
     for (int i = 0; i < nin && !bad; i++) {
