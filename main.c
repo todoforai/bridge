@@ -572,6 +572,8 @@ static int output_tail_is_prompt(const session_t *s) {
     "if [ \"$__n\" = arg ]; then case $__a in [0-9]*) __n=1 ;; *) __n=; break ;; esac; continue; fi; " \
     "case $__a in -n|-c) __n=arg ;; -[0-9]*|-n[0-9]*|-c[0-9]*|--lines=[0-9]*|--bytes=[0-9]*|-q|-v) ;; *) __n=; break ;; esac; done; fi; " \
     "if [ \"$__n\" = 1 ]; then '%s' __live | command tail \"$@\"; else command tail \"$@\"; fi; }; "
+// Windows: route to the native command (POSIX: the tools/bin symlink).
+#define WEBFETCH_SHIM_FMT "tfa-webfetch() { '%s' __cli tfa-webfetch \"$@\"; }; "
 // Windows only (POSIX: the adb symlink): `adb connect "<phone>"` → the
 // daemon's ADB relay (adb_relay.h); other verbs go to the real adb.
 #define ADB_SHIM_FMT "adb() { case \"$1\" in connect|pair|disconnect) '%s' __adb \"$@\" ;; *) command adb \"$@\" ;; esac; }; " \
@@ -587,7 +589,7 @@ static int output_tail_is_prompt(const session_t *s) {
     "tfa-files() { '%s' __cli tfa-files \"$@\"; }; tfa-imagegen() { '%s' __cli tfa-imagegen \"$@\"; }; " \
     "tfa-stt() { '%s' __cli tfa-stt \"$@\"; }; tfa-tts() { '%s' __cli tfa-tts \"$@\"; }; tfa-speech() { '%s' __cli tfa-speech \"$@\"; }; " \
     "tfa-treg() { '%s' __cli tfa-treg \"$@\"; }; tfa-device() { '%s' __cli tfa-device \"$@\"; }; " \
-    "tfa-summary() { '%s' __cli tfa-summary \"$@\"; }; tfa-explore() { '%s' __cli tfa-explore \"$@\"; }; tfa-handoff() { '%s' __cli tfa-handoff \"$@\"; }; " ADB_SHIM_FMT
+    "tfa-summary() { '%s' __cli tfa-summary \"$@\"; }; tfa-explore() { '%s' __cli tfa-explore \"$@\"; }; tfa-handoff() { '%s' __cli tfa-handoff \"$@\"; }; " WEBFETCH_SHIM_FMT ADB_SHIM_FMT
 #endif
 
 typedef struct {
@@ -3035,7 +3037,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[21 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤21×), each ' may become '\''
+        char dshim[22 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤22×), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -3064,7 +3066,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q);  // one per %s (DETACH + ADB + TAIL)
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q);  // one per %s (DETACH + ADB + TAIL)
 #else
                 int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif

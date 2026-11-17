@@ -33,11 +33,12 @@ ifeq ($(UNAME_S),Darwin)
   LIBS    =
 endif
 
-COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c bg_task.c \
+WEBFETCH_SRCS = webfetch.c html2md/md.c html2md/fe_tok.c html2md/charset.c
+COMMON_SRCS = entry_main.c main.c pty_pool.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c env_path.c preview.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c bg_task.c \
        $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c
 SRCS = $(COMMON_SRCS) pty_posix.c
 WIN_SRCS = $(COMMON_SRCS) pty_win.c
-HDRS = bg_task.h agent_browser_guard.h noise_ws.h pty.h pty_win.c identity.h identity_server.h cdp_local.h adb_relay.h shell_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
+HDRS = webfetch.h $(wildcard html2md/*.h) bg_task.h agent_browser_guard.h noise_ws.h pty.h pty_win.c identity.h identity_server.h cdp_local.h adb_relay.h shell_relay.h file_server.h subcmd.h tools.h json.h ws.h preview.h jobs.h update.h policy.h cloud_ssh.h keep_awake.h \
        $(CORE)/noise/noise.h $(CORE)/noise/vendor/monocypher.h \
        $(CORE)/cli/args.h $(CORE)/cli/vendor/ketopt.h $(CORE)/login/login.h
 
@@ -252,7 +253,7 @@ test-timing: | build
 test-coalesce: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-coalesce \
-	    test/test_coalesce.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_coalesce.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-coalesce
 
@@ -264,7 +265,7 @@ test-coalesce: | build
 test-runenv: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-runenv \
-	    test/test_runenv.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_runenv.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-runenv
 
@@ -274,7 +275,7 @@ test-runenv: | build
 test-run-bytes: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-run-bytes \
-	    test/test_run_bytes.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_run_bytes.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-run-bytes
 # Spawn-time init drain: with PTY echo ON (simulating ConPTY, which has no
@@ -284,7 +285,7 @@ test-run-bytes: | build
 test-initdrain: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-initdrain \
-	    test/test_initdrain.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_initdrain.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-initdrain
 
@@ -296,7 +297,7 @@ test-initdrain: | build
 test-oneshot-leak: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-oneshot-leak \
-	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_oneshot_leak.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-oneshot-leak
 
@@ -337,10 +338,15 @@ test-probe: | build
 # Trailing `| tail -N` strip on the RUN path: parser cases + live steps on a
 # real PTY (last-N cut, prefix exit code, park shows progress).
 .PHONY: test-tail-strip
+test-html2md: | build
+	$(CC) -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all \
+	    -o build/test-html2md test/test_html2md.c html2md/md.c html2md/fe_tok.c html2md/charset.c
+	./build/test-html2md
+
 test-tail-strip: | build
 	$(CC) -O0 -g -Wall -Wextra -Wno-unused-function -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-tail-strip \
-	    test/test_tail_strip.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_tail_strip.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-tail-strip
 
@@ -348,7 +354,7 @@ test-tail-strip: | build
 test-prompt-tail: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-prompt-tail \
-	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_prompt_tail.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-prompt-tail
 
@@ -358,7 +364,7 @@ test-prompt-tail: | build
 test-park: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-park \
-	    test/test_park.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_park.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-park
 
@@ -367,13 +373,13 @@ test-park: | build
 test-bg: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-bg \
-	    test/test_bg.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_bg.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-bg
 
 # Static analysis: GCC analyzer + cppcheck + clang static analyzer (if present).
 # Only scans bridge sources, not vendored todoforai-c-core / monocypher.
-BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c shell_relay.c shell_cli.c tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c bg_task.c
+BRIDGE_SRCS := main.c pty_pool.c noise_ws.c identity.c subcmd.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) tools.c json.c ws.c env_path.c pty_posix.c jobs.c update.c policy.c cloud_ssh.c keep_awake.c bg_task.c
 ANALYZE_INCLUDES := -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login
 ANALYZE_DEFS := -DBRIDGE_VERSION='"analyze"'
 
@@ -462,6 +468,6 @@ clean:
 test-pool: | build
 	$(CC) -O0 -g -Wall -Wextra -iquote . -I$(CORE)/noise -I$(CORE)/cli -I$(CORE)/login \
 	    -DBRIDGE_VERSION='"test"' -o build/test-pool \
-	    test/test_pool.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
+	    test/test_pool.c noise_ws.c identity.c identity_server.c cdp_local.c adb_relay.c shell_relay.c shell_cli.c $(WEBFETCH_SRCS) file_server.c subcmd.c tools.c json.c ws.c preview.c jobs.c update.c cloud_ssh.c keep_awake.c \
 	    $(DAEMON_TEST_DEPS) $(CORE)/noise/noise.c $(CORE)/noise/vendor/monocypher.c -lutil -lpthread
 	./build/test-pool

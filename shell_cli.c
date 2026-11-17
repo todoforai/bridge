@@ -9,6 +9,7 @@
 #include "subcmd.h"
 #include "shell_relay.h"
 #include "json.h"
+#include "webfetch.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -630,7 +631,7 @@ int cmd_skill(int argc, char **argv) {
 
 const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-files", "tfa-surface",
     "tfa-imagegen", "tfa-stt", "tfa-tts", "tfa-speech", "tfa-treg", "tfa-device",
-    "tfa-summary", "tfa-explore", "tfa-handoff", NULL };
+    "tfa-summary", "tfa-explore", "tfa-handoff", "tfa-webfetch", NULL };
 
 int bridge_cli_builtin(const char *name) {
     for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) if (strcmp(name, BRIDGE_CLI_NAMES[i]) == 0) return 1;
@@ -763,8 +764,7 @@ static char *cli_round(const char *name, const char *line, size_t ln, const cli_
     return buf;
 }
 
-int cmd_cli(const char *name, int argc, char **argv) {
-    if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) { printf("%s %s\n", name, BRIDGE_VERSION); return 0; }
+static int cli_run(const char *name, int argc, char **argv, const char *input, size_t size) {
     stdio_binary();
     static cli_input_t in[CLI_MAX_INPUTS];
     char err[512] = "";
@@ -782,7 +782,10 @@ int cmd_cli(const char *name, int argc, char **argv) {
         if (json_get_str_decoded(res, hl, "need", need, sizeof need, &l)) {
             if (!json_get_str_decoded(res, hl, "path", path, sizeof path, &l)) path[0] = '\0';
             if (nin == CLI_MAX_INPUTS) { snprintf(err, sizeof err, "the command reads too many inputs"); break; }
-            if (cli_read_input(&in[nin], need, path, err, sizeof err) < 0) break;
+            if (input) {
+                if (strcmp(need, "stdin") || nin) { snprintf(err, sizeof err, "unexpected input request"); break; }
+                in[nin] = (cli_input_t){ .kind = "stdin", .data = (char *)input, .size = size };
+            } else if (cli_read_input(&in[nin], need, path, err, sizeof err) < 0) break;
             nin++;
             continue;
         }
@@ -803,9 +806,15 @@ int cmd_cli(const char *name, int argc, char **argv) {
         break;
     }
     if (err[0]) fprintf(stderr, "%s: %s\n", name, err);
-    for (int i = 0; i < nin; i++) free(in[i].data);
+    if (!input) for (int i = 0; i < nin; i++) free(in[i].data);
     free(res); free(line);
     return rc;
+}
+
+int cmd_cli(const char *name, int argc, char **argv) {
+    if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) { printf("%s %s\n", name, BRIDGE_VERSION); return 0; }
+    if (!strcmp(name, "tfa-webfetch")) { stdio_binary(); return cmd_webfetch(argc, argv, cli_run); }
+    return cli_run(name, argc, argv, NULL, 0);
 }
 
 #ifndef _WIN32
