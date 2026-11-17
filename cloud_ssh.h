@@ -55,7 +55,8 @@ int cloud_ssh_ready_json(const char *device_id, int ready, char *out, size_t cap
 // 1 if user-written ssh_config text already defines the alias (Host/Match).
 int cloud_ssh_user_defines_alias(const char *text, size_t n);
 // Render the managed Host block. Returns length, or -1 on overflow.
-int cloud_ssh_render_config(const char *dir, const cloud_ssh_cfg_t *c, char *out, size_t cap);
+// known_hosts_cmd: emit `KnownHostsCommand none` (only if this ssh knows it).
+int cloud_ssh_render_config(const char *dir, const cloud_ssh_cfg_t *c, int known_hosts_cmd, char *out, size_t cap);
 
 // 1 on POSIX with ssh + ssh-keygen on PATH.
 int cloud_ssh_supported(void);

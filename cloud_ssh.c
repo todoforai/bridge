@@ -176,7 +176,7 @@ int cloud_ssh_user_defines_alias(const char *text, size_t n) {
     return 0;
 }
 
-int cloud_ssh_render_config(const char *dir, const cloud_ssh_cfg_t *c, char *out, size_t cap) {
+int cloud_ssh_render_config(const char *dir, const cloud_ssh_cfg_t *c, int known_hosts_cmd, char *out, size_t cap) {
     int n = snprintf(out, cap,
         MANAGED_HEADER
         "# profile=%s cloudDeviceId=%s\n"
@@ -192,6 +192,11 @@ int cloud_ssh_render_config(const char *dir, const cloud_ssh_cfg_t *c, char *out
         "  KbdInteractiveAuthentication no\n"
         "  UserKnownHostsFile \"%s/tfa_cloud_known_hosts\"\n"
         "  GlobalKnownHostsFile /dev/null\n"
+        // The pin is the only trust: no DNS SSHFP, no helper vouching for other
+        // keys. KnownHostsCommand only where ssh knows it (8.5+): an unknown
+        // keyword fails parsing of the whole Included file, i.e. ALL ssh.
+        "  VerifyHostKeyDNS no\n"
+        "%s"
         "  HostKeyAlias tfa-cloud-%s\n"
         "  StrictHostKeyChecking yes\n"
         "  UpdateHostKeys no\n"
@@ -207,7 +212,8 @@ int cloud_ssh_render_config(const char *dir, const cloud_ssh_cfg_t *c, char *out
         // Close our block: whatever follows the Include in ~/.ssh/config must
         // stay global, never become conditional on tfa-cloud.
         "Host *\n",
-        c->profile[0] ? c->profile : "default", c->device_id, c->host, c->port, dir, dir, c->device_id);
+        c->profile[0] ? c->profile : "default", c->device_id, c->host, c->port, dir, dir,
+        known_hosts_cmd ? "  KnownHostsCommand none\n" : "", c->device_id);
     return (n < 0 || (size_t)n >= cap) ? -1 : n;
 }
 
@@ -519,7 +525,7 @@ static int verify_effective(const cloud_ssh_env_t *env, const cloud_ssh_cfg_t *c
     if (run_cmd(argv, out, 64 * 1024, 10000) != 0) {
         first_line(out); seterr(err, ecap, "ssh -G failed: %s", out); free(out); return -1;
     }
-    char want[12][1100]; int n = 0;
+    char want[14][1100]; int n = 0;
     snprintf(want[n++], sizeof want[0], "hostname %s", c->host);
     snprintf(want[n++], sizeof want[0], "port %ld", c->port);
     snprintf(want[n++], sizeof want[0], "user root");
@@ -531,12 +537,22 @@ static int verify_effective(const cloud_ssh_env_t *env, const cloud_ssh_cfg_t *c
     snprintf(want[n++], sizeof want[0], "stricthostkeychecking true");
     snprintf(want[n++], sizeof want[0], "forwardagent no");
     snprintf(want[n++], sizeof want[0], "controlmaster false");
-    int seen[12] = {0}, id_extra = 0, rc = 0;
+    snprintf(want[n++], sizeof want[0], "globalknownhostsfile /dev/null");
+    snprintf(want[n++], sizeof want[0], "verifyhostkeydns false");
+    int seen[14] = {0}, id_extra = 0, rc = 0;
     size_t pos = 0, len = strlen(out); const char *ls, *le;
     while (rc == 0 && next_line(out, len, &pos, &ls, &le)) {
         size_t l = (size_t)(le - ls);
         if ((l > 13 && strncmp(ls, "proxycommand ", 13) == 0 && strncmp(ls + 13, "none", 4) != 0) ||
             (l > 10 && strncmp(ls, "proxyjump ", 10) == 0 && strncmp(ls + 10, "none", 4) != 0)) rc = -1;
+        // `none` prints nothing: any value here came from an earlier user line
+        // (a helper vouching for host keys, or a shared master socket).
+        if (rc == 0 && ((l > 18 && strncmp(ls, "knownhostscommand ", 18) == 0) ||
+                        (l > 12 && strncmp(ls, "controlpath ", 12) == 0))) {
+            seterr(err, ecap, "ssh -G: an earlier %.*s applies to " CLOUD_SSH_ALIAS "; remove it for this host",
+                   (int)strcspn(ls, " "), ls);
+            rc = -1;
+        }
         for (int i = 0; i < n; i++) {
             size_t k = strcspn(want[i], " ") + 1;
             if (l < k || strncmp(ls, want[i], k) != 0) continue;
@@ -555,6 +571,14 @@ static int verify_effective(const cloud_ssh_env_t *env, const cloud_ssh_cfg_t *c
     if (rc != 0 && err && !err[0]) seterr(err, ecap, "ssh -G: a proxy is configured for " CLOUD_SSH_ALIAS);
     free(out);
     return rc;
+}
+
+// 1 if this ssh knows KnownHostsCommand (8.5+). Asked with -F /dev/null so
+// the user's config (and its Match exec) plays no part; older ssh rejects it.
+static int ssh_knows_known_hosts_command(void) {
+    char out[4096];
+    char *argv[] = { "ssh", "-F", "/dev/null", "-G", "-o", "KnownHostsCommand=none", "localhost", NULL };
+    return run_cmd(argv, out, sizeof out, 10000) == 0;
 }
 
 // 1 if `ssh -G tfa-cloud` resolves to something other than the bare alias
@@ -592,7 +616,7 @@ int cloud_ssh_apply(const cloud_ssh_env_t *env, const cloud_ssh_cfg_t *c, char *
     // First install: the alias must be unclaimed anywhere ssh looks
     // (including files the user Includes), i.e. still resolve to itself.
     if (access(p, F_OK) != 0 && alias_claimed(env, err, ecap)) goto out;
-    n = cloud_ssh_render_config(env->dir, c, body, sizeof body);
+    n = cloud_ssh_render_config(env->dir, c, ssh_knows_known_hosts_command(), body, sizeof body);
     if (n < 0 || write_atomic(p, body, (size_t)n, 0600, NULL) != 0) { seterr(err, ecap, "cannot write %s", p); goto out; }
     if (ensure_include(env, err, ecap) != 0 || verify_effective(env, c, err, ecap) != 0) {
         // Don't leave a rejected block live: keep only the ownership header.

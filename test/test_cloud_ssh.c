@@ -182,7 +182,9 @@ static void test_alias_detection(void) {
 static void test_render(void) {
     cloud_ssh_cfg_t c = base_cfg("h.example", 2222, "");
     char out[4096];
-    CHECK(cloud_ssh_render_config("/home/u/.ssh", &c, out, sizeof out) > 0);
+    // Older ssh (<8.5) gets no KnownHostsCommand line: unknown keywords break all ssh.
+    CHECK(cloud_ssh_render_config("/home/u/.ssh", &c, 0, out, sizeof out) > 0 && !strstr(out, "KnownHostsCommand"));
+    CHECK(cloud_ssh_render_config("/home/u/.ssh", &c, 1, out, sizeof out) > 0);
     const char *must[] = {
         "Host tfa-cloud\n", "  HostName h.example\n", "  Port 2222\n", "  User root\n",
         "  IdentityFile \"/home/u/.ssh/tfa_cloud\"\n", "  IdentitiesOnly yes\n", "  IdentityAgent none\n",
@@ -191,13 +193,13 @@ static void test_render(void) {
         "  StrictHostKeyChecking yes\n", "  ForwardAgent no\n", "  ForwardX11 no\n",
         "  ProxyCommand none\n", "  ProxyJump none\n", "  ControlMaster no\n", "  ControlPersist no\n",
         "  PasswordAuthentication no\n", "  KbdInteractiveAuthentication no\n", "# profile=default ",
-        "  ControlPath none\n",
+        "  ControlPath none\n", "  KnownHostsCommand none\n", "  GlobalKnownHostsFile /dev/null\n", "  VerifyHostKeyDNS no\n",
     };
     for (size_t i = 0; i < sizeof must / sizeof *must; i++) CHECK(strstr(out, must[i]) != NULL);
     // The block is closed so the rest of ~/.ssh/config stays global.
     size_t ol = strlen(out);
     CHECK(ol > 8 && strcmp(out + ol - 8, "Host *\n\n") != 0 && strcmp(out + ol - 7, "Host *\n") == 0);
-    CHECK(cloud_ssh_render_config("/x", &c, out, 64) < 0);
+    CHECK(cloud_ssh_render_config("/x", &c, 1, out, 64) < 0);
 }
 
 static int apply(const cloud_ssh_env_t *env, const cloud_ssh_cfg_t *c, char *err) {
@@ -437,6 +439,30 @@ static void test_no_leak(const char *root) {
     mkdir(env.dir, 0700);
     spit(pj(&env, "config"), "Host *\n  IdentityFile ~/.ssh/other_key\n");
     CHECK(apply(&env, &c, err) != 0 && strstr(err, "another IdentityFile"));
+
+    // Earlier user lines (first value wins) must not weaken the pin or share a
+    // master socket: each is refused, the block not left live.
+    const char *weak[][2] = {
+        { "KnownHostsCommand /bin/echo %H\n", "knownhostscommand" },
+        { "ControlPath /tmp/cp-%h\n",         "controlpath" },
+        { "GlobalKnownHostsFile /etc/hosts\n", "globalknownhostsfile" },
+        { "VerifyHostKeyDNS yes\n",            "verifyhostkeydns" },
+    };
+    // ssh <8.5 can't parse KnownHostsCommand at all: nothing to defend there.
+    int khc = system("ssh -F /dev/null -G -o KnownHostsCommand=none localhost >/dev/null 2>&1") == 0;
+    for (size_t i = khc ? 0 : 1; i < sizeof weak / sizeof *weak; i++) {
+        char name[32], body[1024];
+        snprintf(name, sizeof name, "weak%zu", i);
+        fresh_env(&env, root, name);
+        mkdir(env.dir, 0700);
+        snprintf(body, sizeof body, "%sInclude \"%s/tfa_cloud_config\"\n", weak[i][0], env.dir);
+        spit(pj(&env, "config"), body);
+        CHECK(apply(&env, &c, err) != 0 && strstr(err, weak[i][1]));
+        if (!strstr(err, weak[i][1])) fprintf(stderr, "  %s: %s\n", name, err);
+        mb = slurp(pj(&env, "tfa_cloud_config"));
+        CHECK(mb && !strstr(mb, "Host tfa-cloud"));
+        free(mb);
+    }
 }
 
 static int capture(void *ctx, const char *d, size_t n) { (void)ctx; (void)d; (void)n; return 0; }
