@@ -586,7 +586,7 @@ static int output_tail_is_prompt(const session_t *s) {
     "tfa-memory() { '%s' __cli tfa-memory \"$@\"; }; tfa-surface() { '%s' __cli tfa-surface \"$@\"; }; " \
     "tfa-files() { '%s' __cli tfa-files \"$@\"; }; tfa-imagegen() { '%s' __cli tfa-imagegen \"$@\"; }; " \
     "tfa-stt() { '%s' __cli tfa-stt \"$@\"; }; tfa-tts() { '%s' __cli tfa-tts \"$@\"; }; tfa-speech() { '%s' __cli tfa-speech \"$@\"; }; " \
-    "tfa-treg() { '%s' __cli tfa-treg \"$@\"; }; " ADB_SHIM_FMT
+    "tfa-treg() { '%s' __cli tfa-treg \"$@\"; }; tfa-device() { '%s' __cli tfa-device \"$@\"; }; " ADB_SHIM_FMT
 #endif
 
 typedef struct {
@@ -3034,7 +3034,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         // kill the shell → reap → STEP_DONE code≠0.
         char cdpre[sizeof s->cwd * 4 + 32];
         cdpre[0] = '\0';
-        char dshim[17 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤17×), each ' may become '\''
+        char dshim[18 * 1024 * 4 + 2048];  // g_self ≤ 1023 (≤18×), each ' may become '\''
         dshim[0] = '\0';
         {
             const char *self = bridge_jobs_self_path();
@@ -3063,7 +3063,7 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
                 }
                 q[qn] = '\0';
 #ifdef _WIN32
-                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q);  // one per %s (DETACH + ADB + TAIL)
+                int dn = snprintf(dshim, sizeof dshim, DETACH_SHIM_FMT, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q, q);  // one per %s (DETACH + ADB + TAIL)
 #else
                 int dn = snprintf(dshim, sizeof dshim, TAIL_SHIM_FMT, q);
 #endif
