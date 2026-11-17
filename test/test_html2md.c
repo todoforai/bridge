@@ -35,6 +35,21 @@ int main(void) {
     has("aside outside dropped", S("<aside>drop</aside><main>x</main>"), "text/html", "drop", 0);
     /* Table with role=main inside a hidden list must not unbalance the list stack. */
     has("gate/list balance", S("<ul hidden><table role=main><tr><td>x</td></tr></table></ul><ol><li>a</ol><ul><li>b</ul>"), "text/html", "- b", 1);
+    /* Tables: colspan widens to its columns, rowspan repeats short text below, header = widest row. */
+    has("colspan header", S("<table><tr><th colspan=2>Cur<th>Spot<tr><td>HUF<td>forint<td>364</table>"), "text/html", "| Cur | | Spot |\n| --- | --- | --- |\n| HUF | forint | 364 |", 1);
+    has("rowspan repeat", S("<table><tr><th>R<th>N<tr><td rowspan=2>62<td>Dom<tr><td>Pak</table>"), "text/html", "| 62 | Pak |", 1);
+    has("rowspan+colspan grid", S("<table><tr><td rowspan=2><th colspan=2>Mars<tr><th>P<th>S<tr><th>Bears<td>1<td>2</table>"), "text/html", "| | Mars | |\n| --- | --- | --- |\n| | P | S |\n| Bears | 1 | 2 |", 1);
+    has("wider body widens header", S("<table><tr><th>A<tr><td>1<td>2<td>3</table>"), "text/html", "| A | | |\n| --- | --- | --- |\n| 1 | 2 | 3 |", 1);
+    has("rowspan through empty row", S("<table><tr><th>a<th>b<tr><td rowspan=3>x<td>1<tr><tr><td>2<tr><td>3<td>4</table>"), "text/html", "| x | 2 |\n| 3 | 4 |", 1);
+    has("trailing colspan counts", S("<table><tr><td colspan=2>a<tr><td colspan=2>b</table>"), "text/html", "| a | |\n| --- | --- |", 1);
+    has("rowspan ends at row group", S("<table><thead><tr><th rowspan=2>h<th>x</thead><tbody><tr><td>1<td>2</tbody></table>"), "text/html", "| 1 | 2 |", 1);
+    has("leading-zero span", S("<table><tr><th colspan=0000002>a<th>b<tr><td>1<td>2<td>3</table>"), "text/html", "| a | | b |", 1);
+    has("adjacent trailing rowspans", S("<table><tr><td>A<td rowspan=3>B<td rowspan=3>C<tr><td>D<tr><td>E</table>"), "text/html", "| D | B | C |\n| E | B | C |", 1);
+    has("implied tbody close", S("<table><thead><tr><th>H<th>I<tbody><tr><td>B<td>C</table>"), "text/html", "| H | I |\n| --- | --- |\n| B | C |", 1);
+    has("rowspan stops at </thead>", S("<table><thead><tr><th rowspan=2>h<th>x</thead><tr><td>1<td>2</table>"), "text/html", "| 1 | 2 |", 1);
+    has("rowspan=0 to group end", S("<table><tr><th>a<th>b<tr><td rowspan=0>x<td>1<tr><td>2</table>"), "text/html", "| x | 2 |", 1);
+    has("stray tbody in cell content", S("<table><tr><th>a<th>b<tr><td><div><tbody>x</div><td>y</table>"), "text/html", "| x | y |", 1);
+    has("huge spans capped", S("<table><tr><td colspan=99999999 rowspan=99999999>x<td>y<tr><td>z</table>"), "text/html", "x", 1);
     has("huge start", S("<ol start=99999999999999999999><li>a</ol>"), "text/html", "a", 1);
 
     /* Hostile shapes: must finish, stay within the cap, and not crash under ASan. */

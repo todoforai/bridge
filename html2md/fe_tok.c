@@ -141,6 +141,11 @@ char *html2md_tok(const char *s, size_t n, const char *base, size_t *out_len, in
             static const char *const DT[] = {"dt","dd",0}, *const DTSTOP[] = {"dl",0};
             if (in(t, tn, LI)) sib = LI, stop = LISTOP; else if (in(t, tn, TD)) sib = TD, stop = TDSTOP;
             else if (tn == 2 && !strncasecmp(t, "tr", 2)) sib = TR, stop = TRSTOP; else if (in(t, tn, DT)) sib = DT, stop = DTSTOP;
+            static const char *const SECT[] = {"thead","tbody","tfoot",0}, *const INSECT[] = {"thead","tbody","tfoot","tr","td","th",0}, *const TBL[] = {"table",0};
+            if (in(t, tn, SECT)) {   /* a row group closes the open cell, row and previous group of its table */
+                int lo = -1, i = sp - 1;   /* only a straight table/group/row/cell chain: a stray one inside cell content is ignored */
+                for (; i >= 0 && in(st[i].t, st[i].n, INSECT); i--) lo = i;
+                if (lo >= 0 && i >= 0 && in(st[i].t, st[i].n, TBL)) while (sp > lo) CLOSE_TOP(); }
             if (sib) for (int i = sp - 1; i >= 0; i--) { if (in(st[i].t, st[i].n, stop)) break; if (in(st[i].t, st[i].n, sib)) { while (sp > i) CLOSE_TOP(); break; } }
             /* attribute values with entities decoded */
             size_t off[48]; vals.n = 0;           /* one buffer reused across tags (musl malloc churn) */

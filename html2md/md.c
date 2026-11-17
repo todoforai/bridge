@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <ctype.h>
 
+#define MD_MAXC 128      /* columns tracked for colspan/rowspan; beyond that cells just append */
+#define MD_SPANTXT 64    /* rowspan text repeated in covered rows up to this many bytes, else an empty cell */
 typedef struct { char *p; size_t n, cap, limit; int cut; } buf_t;
 static void bput(buf_t *b, const char *s, size_t n) {
     if (b->cut) return;
@@ -24,9 +26,13 @@ static void bput(buf_t *b, const char *s, size_t n) {
     memcpy(b->p + b->n, s, n); b->n += n; b->p[b->n] = 0;
 }
 static void bstr(buf_t *b, const char *s) { bput(b, s, strlen(s)); }
+static void binsert(buf_t *b, size_t at, const char *s, size_t n) {   /* ignores the limit: a few bytes per table */
+    if (b->n + n + 1 > b->cap) { b->cap = (b->n + n + 1) * 2; b->p = md_alloc(realloc(b->p, b->cap)); }
+    memmove(b->p + at + n, b->p + at, b->n - at + 1); memcpy(b->p + at, s, n); b->n += n;
+}
 
 enum { K_OTHER, K_SKIP, K_CLEANSKIP, K_BLOCK, K_H, K_P, K_BR, K_HR, K_PRE, K_CODE, K_STRONG, K_EM, K_DEL,
-       K_A, K_IMG, K_UL, K_OL, K_LI, K_BQ, K_TABLE, K_TR, K_TD, K_DT, K_DD, K_HEADER, K_MAIN, K_ARTICLE, K_ASIDE };
+       K_A, K_IMG, K_UL, K_OL, K_LI, K_BQ, K_TABLE, K_TSECT, K_TR, K_TD, K_DT, K_DD, K_HEADER, K_MAIN, K_ARTICLE, K_ASIDE };
 static const struct { const char *t; int k; } TAGS[] = {
     {"script",K_SKIP},{"style",K_SKIP},{"noscript",K_SKIP},{"template",K_SKIP},{"svg",K_SKIP},{"head",K_SKIP},
     {"iframe",K_SKIP},{"canvas",K_SKIP},{"object",K_SKIP},{"math",K_SKIP},{"title",K_SKIP},{"dialog",K_SKIP},
@@ -40,7 +46,7 @@ static const struct { const char *t; int k; } TAGS[] = {
     {"pre",K_PRE},{"code",K_CODE},{"kbd",K_CODE},{"samp",K_CODE},{"tt",K_CODE},
     {"strong",K_STRONG},{"b",K_STRONG},{"em",K_EM},{"i",K_EM},{"del",K_DEL},{"s",K_DEL},{"strike",K_DEL},
     {"a",K_A},{"img",K_IMG},{"ul",K_UL},{"menu",K_UL},{"ol",K_OL},{"li",K_LI},{"blockquote",K_BQ},
-    {"table",K_TABLE},{"tr",K_TR},{"td",K_TD},{"th",K_TD},{"dt",K_DT},{"dd",K_DD},
+    {"table",K_TABLE},{"thead",K_TSECT},{"tbody",K_TSECT},{"tfoot",K_TSECT},{"tr",K_TR},{"td",K_TD},{"th",K_TD},{"dt",K_DT},{"dd",K_DD},
 };
 static int kind(const char *t, size_t n) {
     for (size_t i = 0; i < sizeof TAGS / sizeof *TAGS; i++)
@@ -57,6 +63,11 @@ struct md {
     list_t lists[64]; int nlist;
     int flags, skip, pre, code, sp, nl, first_skip, cell, heading, gate, gated_in, saw_gate, in_article;
     int tbl_layout[64], ntbl, row_cells, rows;
+    /* data-table grid: col = next column of the current row, hw = header width, maxw = widest row;
+       span[c] = cells still covered by an earlier rowspan (text repeated if short); hdr_end/sep_end = where
+       the header row / separator line end, to widen both when a later row is wider */
+    int dt, col, wc, hw, maxw; size_t hdr_end, sep_end;   /* dt = a data table is being tracked */   /* wc = cells written: empty ones only before a later cell */
+    struct { int left; char *txt; } span[MD_MAXC];
     char base[8193];
 };
 
@@ -180,6 +191,24 @@ static int cleanskip_attr(md_attr_fn a, void *c) {
     return 0;
 }
 
+/* span attribute: digits only, bounded (attrs are not NUL-terminated); missing/garbage → dflt, "0" → zero */
+static int span_attr(md_attr_fn a, void *c, const char *name, int dflt, int zero, int max) {
+    size_t l, i = 0, d = 0; const char *s = a ? a(c, name, &l) : NULL; int v = 0;
+    while (s && i < l && s[i] == '0') i++;
+    if (i && !v && (i == l || !isdigit((unsigned char)s[i]))) return zero;
+    for (; s && i < l && d++ < 6 && isdigit((unsigned char)s[i]); i++) v = v * 10 + s[i] - '0';
+    return v < 1 ? dflt : v > max ? max : v;
+}
+static void span_clear(md_t *m) { for (int i = 0; i < MD_MAXC; i++) { free(m->span[i].txt); m->span[i].txt = NULL; m->span[i].left = 0; } }
+/* consume one row of the rowspan covering m->col; emit=0 only drops it (overlap, dropped row) */
+static void pad(md_t *m) { while (m->wc < m->col) { bstr(&m->out, " |"); m->wc++; } }   /* empty cells up to col */
+static void span_take(md_t *m, int emit) {
+    int c = m->col++;
+    if (emit && m->span[c].txt) { m->col--; pad(m); m->col++; bstr(&m->out, " "); bstr(&m->out, m->span[c].txt); bstr(&m->out, " |"); m->wc++; }
+    if (--m->span[c].left == 0) { free(m->span[c].txt); m->span[c].txt = NULL; }
+}
+static void span_fill(md_t *m) { while (m->col < MD_MAXC && m->span[m->col].left > 0) span_take(m, 1); }
+
 static frame_t *push(md_t *m, int k) {
     if (m->sp_n == m->st_cap) { m->st_cap = m->st_cap ? m->st_cap * 2 : 64; m->st = md_alloc(realloc(m->st, sizeof *m->st * (size_t)m->st_cap)); }
     frame_t *f = &m->st[m->sp_n++];
@@ -245,18 +274,24 @@ void md_open(md_t *m, const char *tag, size_t tn, md_attr_fn a, void *c) {
         m->first_skip = (int)w; break; }
     case K_BQ: want_nl(m, 2); if (m->pfx.n < 64) bstr(&m->pfx, "> "); break;
     case K_TABLE: {
-        int layout = attr_has(a, c, ":layout") || m->cell;
+        int layout = attr_has(a, c, ":layout") || m->cell || m->dt;   /* one grid at a time: a nested table is layout */
         want_nl(m, 2);
         if (m->ntbl < 64) m->tbl_layout[m->ntbl] = layout;
+        if (!layout && m->ntbl < 64) { m->rows = m->hw = m->maxw = 0; m->dt = 1; span_clear(m); f->aux |= 32; }
         m->ntbl++; f->aux |= layout ? 4 : 0;
-        if (!layout) { m->rows = 0; }
         break; }
+    case K_TSECT: if (m->dt && !m->cell) span_clear(m); break;   /* rowspans end at a row-group boundary */
     case K_TR:
-        if (m->ntbl && m->ntbl <= 64 && !m->tbl_layout[m->ntbl - 1] && !m->cell) { want_nl(m, 1); flush(m); bstr(&m->out, "|"); m->row_cells = 0; f->aux |= 8; }
+        if (m->ntbl && m->ntbl <= 64 && !m->tbl_layout[m->ntbl - 1] && !m->cell) { want_nl(m, 1); flush(m); bstr(&m->out, "|"); m->row_cells = m->col = m->wc = 0; f->aux |= 8; }
         else want_nl(m, 1);
         break;
     case K_TD:
-        if (m->ntbl && m->ntbl <= 64 && !m->tbl_layout[m->ntbl - 1] && !m->cell) { m->cell = 1; m->sp = 1; f->aux |= 8; m->row_cells++; }
+        if (m->ntbl && m->ntbl <= 64 && !m->tbl_layout[m->ntbl - 1] && !m->cell) {
+            m->cell = 1; m->sp = 1; f->aux |= 8; m->row_cells++;
+            span_fill(m); pad(m); f->out_at = m->out.n;   /* cells covered from above come first; this cell starts here */
+            f->aux |= span_attr(a, c, "colspan", 1, 1, 1000) << 8;   /* colspan/rowspan ride in aux bits 8+ / 18+ */
+            f->aux |= span_attr(a, c, "rowspan", 1, 1000, 1000) << 18;
+        }
         else m->sp = 1;
         break;
     default: break;
@@ -302,17 +337,49 @@ void md_close(md_t *m, const char *tag, size_t tn) {
     case K_UL: case K_OL: if (f.aux & 16) m->nlist--;   /* only lists that were counted */ want_nl(m, m->nlist ? 1 : 2); break;
     case K_LI: if (empty) { m->pend.n = f.pend_at; m->pend.p[m->pend.n] = 0; m->first_skip = 0; } want_nl(m, 1); break;
     case K_TD:
-        if (f.aux & 8) { m->cell = 0; m->nl = 0; m->sp = 0; m->pend.n = 0; m->pend.p[0] = 0; rtrim(m); bstr(&m->out, " |"); }
+        if (f.aux & 8) {
+            m->cell = 0; m->nl = 0; m->sp = 0; m->pend.n = 0; m->pend.p[0] = 0; rtrim(m);
+            int cs = (f.aux >> 8) & 1023, rs = (f.aux >> 18) & 1023;
+            m->wc++;
+            if (m->col >= MD_MAXC) { bstr(&m->out, " |"); m->col++; break; }   /* untracked wide tail */
+            if (cs > MD_MAXC - m->col) cs = MD_MAXC - m->col;
+            size_t t0 = f.out_at; while (t0 < m->out.n && m->out.p[t0] == ' ') t0++;
+            size_t tl = m->out.n - t0;
+            for (int i = 0; i < cs; i++) {
+                if (!i) bstr(&m->out, " |");   /* the extra columns are written lazily by pad() */
+                if (m->span[m->col].left > 0) span_take(m, 0); else m->col++;   /* overlap: this cell wins */
+                if (rs > 1) { int c0 = m->col - 1; m->span[c0].left = rs - 1; free(m->span[c0].txt); m->span[c0].txt = NULL;
+                    if (!i && tl && tl <= MD_SPANTXT) { m->span[c0].txt = md_alloc(malloc(tl + 1)); memcpy(m->span[c0].txt, m->out.p + t0, tl); m->span[c0].txt[tl] = 0; } }
+            }
+        }
         break;
     case K_TR:
         if (f.aux & 8) {
-            if (m->row_cells == 0) { m->out.n = f.out_at; m->out.p[m->out.n] = 0; break; }   /* empty row */
-            if (m->rows++ == 0) { bput(&m->out, "\n", 1); bput(&m->out, m->pfx.p, m->pfx.n); bstr(&m->out, "|");
-                for (int i = 0; i < m->row_cells; i++) bstr(&m->out, " --- |"); }
+            if (m->row_cells == 0) {   /* empty row: dropped, but it still uses up a row of each rowspan */
+                m->out.n = f.out_at; m->out.p[m->out.n] = 0;
+                for (m->col = 0; m->col < MD_MAXC;) if (m->span[m->col].left > 0) span_take(m, 0); else m->col++;
+                break; }
+            for (int c = m->col; c < MD_MAXC; c++) if (m->span[c].left > 0) { m->col = c; span_take(m, 1); }
+            int w = m->col > m->wc ? m->col : m->wc;   /* a trailing colspan still counts */
+            if (w > m->maxw) m->maxw = w;
+            if (m->rows++ == 0) { pad(m); /* header: trailing colspan as empty cells (body rows: renderers fill short rows) */ m->hdr_end = m->out.n; m->hw = w; bput(&m->out, "\n", 1); bput(&m->out, m->pfx.p, m->pfx.n); bstr(&m->out, "|");
+                for (int i = 0; i < w; i++) bstr(&m->out, " --- |");
+                m->sep_end = m->out.n; }
             want_nl(m, 1);
         } else want_nl(m, 1);
         break;
-    case K_TABLE: m->ntbl--; want_nl(m, 2); break;
+    case K_TSECT: if (m->dt && !m->cell) span_clear(m); break;
+    case K_TABLE:
+        m->ntbl--; want_nl(m, 2);
+        if ((f.aux & 32) && m->rows && m->maxw > m->hw && !m->out.cut && m->sep_end <= m->out.n
+            && (size_t)(m->maxw - m->hw) * 8 <= HTML2MD_MAX_BYTES - m->out.n) {   /* widen header to the widest row, within the cap */
+            buf_t sep = {0}, hdr = {0};   /* one insert each: no per-column shifting of the body */
+            for (int i = m->hw; i < m->maxw; i++) { bstr(&sep, " --- |"); bstr(&hdr, " |"); }
+            binsert(&m->out, m->sep_end, sep.p, sep.n); binsert(&m->out, m->hdr_end, hdr.p, hdr.n);
+            free(sep.p); free(hdr.p);
+        } else if ((f.aux & 32) && m->rows && m->maxw > m->hw && !m->out.cut) m->out.cut = 1;   /* no room for a full header: partial page */
+        if (f.aux & 32) { span_clear(m); m->dt = 0; }
+        break;
     default: break;
     }
     m->pfx.n = f.pfx_at; m->pfx.p[m->pfx.n] = 0;
@@ -345,6 +412,6 @@ char *md_finish(md_t *m, size_t *len) {
         if (o.n - j < width) o.p[o.n = j] = 0;
     }
     for (int j = 0; j < m->sp_n; j++) free(m->st[j].href);
-    free(m->st); free(m->out.p); free(m->pend.p); free(m->pfx.p); free(m);
+    span_clear(m); free(m->st); free(m->out.p); free(m->pend.p); free(m->pfx.p); free(m);
     *len = o.n; return o.p;
 }
