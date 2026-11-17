@@ -414,7 +414,8 @@ static int run_cmd(char *const argv[], char *out, size_t cap, int timeout_ms) {
 static void first_line(char *s) { s[strcspn(s, "\r\n")] = '\0'; }
 
 // Local refusals shared by both jobs: an alias the user defined themselves,
-// a managed block owned by another credential profile, or a ~/.ssh/config we
+// a managed block owned by another credential profile (unless we are the
+// default profile), or a ~/.ssh/config we
 // won't rewrite (symlink / foreign owner). Must be called under the lock.
 static int check_conflicts(const cloud_ssh_env_t *env, const char *profile, char *err, size_t ecap) {
     char p[1024]; char *buf; size_t len;
@@ -436,7 +437,10 @@ static int check_conflicts(const cloud_ssh_env_t *env, const char *profile, char
         int mine = ours && strstr(buf, want) != NULL;
         free(buf);
         if (!ours) { seterr(err, ecap, "%s was not written by the bridge; leaving it alone", p); return -1; }
-        if (!mine) { seterr(err, ecap, "%s belongs to another bridge profile", p); return -1; }
+        // `ssh tfa-cloud` is the user's real alias: the default profile takes it
+        // back from a dev/test profile; others never take it from anyone.
+        int is_default = !profile[0] || strcmp(profile, "default") == 0;
+        if (!mine && !is_default) { seterr(err, ecap, "%s belongs to another bridge profile", p); return -1; }
     }
     return 0;
 }

@@ -257,6 +257,14 @@ static void test_apply(const char *root) {
     // Another credential profile must not hijack the managed block.
     cloud_ssh_cfg_t cdev = base_cfg("127.0.0.1", 2222, "dev");
     CHECK(apply(&env, &cdev, err) != 0 && strstr(err, "another bridge profile"));
+    // ...but the default profile takes the alias back from a dev/test profile.
+    spit(pj(&env, "tfa_cloud_config"), "# Managed by TODOforAI bridge (ssh tfa-cloud). Regenerated automatically; do not edit.\n"
+                                        "# profile=connector-tests cloudDeviceId=0f8fad5b-d9cb-469f-a165-70867728950e\nHost tfa-cloud\n  HostName 10.9.9.9\nHost *\n");
+    CHECK(apply(&env, &c3, err) == 0);
+    mc = slurp(pj(&env, "tfa_cloud_config"));
+    CHECK(mc && strstr(mc, "# profile=default ") && strstr(mc, "HostName 10.1.2.3\n"));
+    free(mc);
+    CHECK(apply(&env, &cdev, err) != 0 && strstr(err, "another bridge profile"));
 
     // Connect probe runs and fails fast against a closed port → not ready.
     env.skip_connect = 0;
