@@ -433,8 +433,9 @@ static int check_conflicts(const cloud_ssh_env_t *env, const char *profile, char
     if (r == 1) {
         char want[160];
         snprintf(want, sizeof want, "# profile=%s ", profile[0] ? profile : "default");
-        int ours = len > strlen(MANAGED_HEADER) && memcmp(buf, MANAGED_HEADER, strlen(MANAGED_HEADER)) == 0;
-        int mine = ours && strstr(buf, want) != NULL;
+        size_t hl = strlen(MANAGED_HEADER), wl = strlen(want);
+        int ours = len > hl && memcmp(buf, MANAGED_HEADER, hl) == 0;
+        int mine = ours && len >= hl + wl && memcmp(buf + hl, want, wl) == 0;
         free(buf);
         if (!ours) { seterr(err, ecap, "%s was not written by the bridge; leaving it alone", p); return -1; }
         // `ssh tfa-cloud` is the user's real alias: the default profile takes it
@@ -602,18 +603,22 @@ int cloud_ssh_apply(const cloud_ssh_env_t *env, const cloud_ssh_cfg_t *c, char *
     }
     rc = 0;
 out:
-    close(lk);   // drop the lock before the (up to ~20s) connect probe
-    if (rc != 0 || env->skip_connect) return rc;
+    // The probe runs under the lock (bounded, ~20s, off-loop): otherwise another
+    // profile could swap the alias in between and we'd report its endpoint ready.
+    if (rc != 0 || env->skip_connect) { close(lk); return rc; }
     char cfg[1024], out_buf[512];
     path_in(env, "config", cfg, sizeof cfg);
-    char *argv[10]; int a = 0;
-    argv[a++] = "ssh"; argv[a++] = "-o"; argv[a++] = "BatchMode=yes";
+    // A pure reachability check: no forwards, no RemoteCommand, no pty from the user's globals.
+    char *argv[16]; int a = 0;
+    argv[a++] = "ssh"; argv[a++] = "-T"; argv[a++] = "-o"; argv[a++] = "BatchMode=yes";
     argv[a++] = "-o"; argv[a++] = "ConnectTimeout=5";
+    argv[a++] = "-o"; argv[a++] = "ClearAllForwardings=yes";
+    argv[a++] = "-o"; argv[a++] = "RemoteCommand=none";
     if (env->use_F) { argv[a++] = "-F"; argv[a++] = cfg; }
     argv[a++] = CLOUD_SSH_ALIAS; argv[a++] = "true"; argv[a] = NULL;
-    if (run_cmd(argv, out_buf, sizeof out_buf, 20000) != 0) {
-        first_line(out_buf); seterr(err, ecap, "ssh probe failed: %s", out_buf); return -1;
-    }
+    int pr = run_cmd(argv, out_buf, sizeof out_buf, 20000);
+    close(lk);
+    if (pr != 0) { first_line(out_buf); seterr(err, ecap, "ssh probe failed: %s", out_buf); return -1; }
     return 0;
 }
 
@@ -634,7 +639,9 @@ int cloud_ssh_key_job(const char *payload, size_t len, bridge_job_emit_fn emit, 
     int rc = check_conflicts(&env, profile, err, sizeof err) == 0 &&
              cloud_ssh_ensure_key(&env, pub, sizeof pub, err, sizeof err) == 0 ? 0 : -1;
     close(lk);
-    if (rc != 0) { fprintf(stderr, "cloud-ssh: %s\n", err); return -1; }
+    // Handled refusal: said why, ends cleanly with no key (the backend sends no
+    // config). -1 would add jobs.c's generic "worker exited without finishing".
+    if (rc != 0) { fprintf(stderr, "cloud-ssh: %s\n", err); return 0; }
     char msg[256];
     int n = snprintf(msg, sizeof msg, "{\"type\":\"cloud_ssh_key\",\"publicKey\":\"%s\"}", pub);
     return emit(ctx, msg, (size_t)n);

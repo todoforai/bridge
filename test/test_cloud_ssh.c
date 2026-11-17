@@ -265,6 +265,11 @@ static void test_apply(const char *root) {
     CHECK(mc && strstr(mc, "# profile=default ") && strstr(mc, "HostName 10.1.2.3\n"));
     free(mc);
     CHECK(apply(&env, &cdev, err) != 0 && strstr(err, "another bridge profile"));
+    // The owner is the header's own line: "dev2" is not "dev", and a stray
+    // "# profile=dev " further down claims nothing.
+    spit(pj(&env, "tfa_cloud_config"), "# Managed by TODOforAI bridge (ssh tfa-cloud). Regenerated automatically; do not edit.\n"
+                                        "# profile=dev2 cloudDeviceId=0f8fad5b-d9cb-469f-a165-70867728950e\n# profile=dev \nHost *\n");
+    CHECK(apply(&env, &cdev, err) != 0 && strstr(err, "another bridge profile"));
 
     // Connect probe runs and fails fast against a closed port → not ready.
     env.skip_connect = 0;
@@ -352,15 +357,17 @@ static void test_apply(const char *root) {
     (void)st2;
 }
 
-// `ssh -F <cfg> -G <host>` output, for before/after comparison.
+// `ssh -F <cfg> -G <host>` output, for before/after comparison. Led by a
+// newline so "\n<key> " matches the first line too (OpenSSH 8.9 puts `user` there).
 static char *ssh_G(const char *cfg, const char *host) {
     char cmd[2048];
     snprintf(cmd, sizeof cmd, "ssh -F '%s' -G '%s' 2>&1", cfg, host);
     FILE *p = popen(cmd, "r");
     if (!p) return NULL;
     char *b = calloc(1, 1 << 16);
-    size_t n = fread(b, 1, (1 << 16) - 1, p);
-    b[n] = '\0';
+    b[0] = '\n';
+    size_t n = fread(b + 1, 1, (1 << 16) - 2, p);
+    b[n + 1] = '\0';
     pclose(p);
     return b;
 }
