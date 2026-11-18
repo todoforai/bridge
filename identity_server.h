@@ -31,6 +31,9 @@
 // without it, so callers just skip polling.
 ws_fd_t bridge_identity_server_open(uint16_t port);
 
+// The port a listener is bound to (for one opened on port 0), 0 on error.
+uint16_t bridge_identity_server_port(ws_fd_t listen_fd);
+
 // Accept and answer one pending connection (call on POLLIN of the listen fd).
 // The whole exchange shares one ~300ms budget, so a slow local client can
 // never stall the daemon loop for longer than that.

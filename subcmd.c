@@ -578,9 +578,14 @@ int cmd_adb(int argc, char **argv) {
         // "<phone>" — connect uses adbd's connect port, pair its pairing port.
         const char *pspec = strcmp(verb, "pair") == 0 ? "pair" : "connect";
         if (strlen(target) >= 64) { fprintf(stderr, "adb %s: phone name too long\n", verb); return 1; }
+        // This run's own daemon first: the fixed port may belong to another
+        // bridge on this host (another account, a --network host container).
         uint16_t srv = IDENTITY_SERVER_PORT;
         const char *api = getenv("TODOFORAI_API_URL");
-        if (api && (strstr(api, "localhost") || strstr(api, "127.0.0.1"))) srv = IDENTITY_SERVER_PORT_LOCAL;
+        const char *own = getenv("TODOFORAI_CDP_LOCAL_PORT");
+        long ownp = own ? strtol(own, NULL, 10) : 0;
+        if (ownp > 0 && ownp <= 65535) srv = (uint16_t)ownp;
+        else if (api && (strstr(api, "localhost") || strstr(api, "127.0.0.1"))) srv = IDENTITY_SERVER_PORT_LOCAL;
         char err[256], last[192] = "";
         if (strcmp(verb, "disconnect") == 0) {
             // Drop the relay listener; the real adb forgets 127.0.0.1:<port>.

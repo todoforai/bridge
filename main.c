@@ -4135,9 +4135,21 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     e->device_secret = device_secret;
     adb_relay_drop_streams(&e->adb);   // backend streams died with the last connection
     shell_relay_drop_streams(&e->shell, "bridge reconnected to the backend");
-    e->identity_port = login_is_local_host(host) ? IDENTITY_SERVER_PORT_LOCAL : IDENTITY_SERVER_PORT;
-    g_cdpl_port = e->identity_port;
-    if (e->identity_fd == WS_INVALID_FD && !e->mayfly) e->identity_fd = bridge_identity_server_open(e->identity_port);
+    if (e->identity_fd == WS_INVALID_FD && !e->mayfly) {
+        e->identity_port = login_is_local_host(host) ? IDENTITY_SERVER_PORT_LOCAL : IDENTITY_SERVER_PORT;
+        e->identity_fd = bridge_identity_server_open(e->identity_port);
+        // Fixed port held by another daemon (e.g. a --network host container's
+        // bridge, another account): our runs still need their own loopback
+        // server (adb relay, cdp-local, file grants), found via
+        // TODOFORAI_CDP_LOCAL_PORT — never the other daemon's.
+        if (e->identity_fd == WS_INVALID_FD) {
+            fprintf(stderr, "[bridge] loopback port %u taken by another process; using an ephemeral port for this bridge's runs\n", (unsigned)e->identity_port);
+            e->identity_fd = bridge_identity_server_open(0);
+            e->identity_port = e->identity_fd == WS_INVALID_FD ? 0 : bridge_identity_server_port(e->identity_fd);
+            if (!e->identity_port && e->identity_fd != WS_INVALID_FD) { bridge_identity_server_close(e->identity_fd); e->identity_fd = WS_INVALID_FD; }
+        }
+        g_cdpl_port = e->identity_port;
+    }
     // Derive the public HTTP API URL from the Noise host. In prod a TLS
     // terminator (nginx/Cloudflare) fronts the backend on 443 while the Noise
     // channel rides plain WS on port 80 — so the transport `port` must NOT leak

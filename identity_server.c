@@ -103,6 +103,12 @@ ws_fd_t bridge_identity_server_open(uint16_t port) {
     return fd;
 }
 
+uint16_t bridge_identity_server_port(ws_fd_t listen_fd) {
+    struct sockaddr_in a; socklen_t alen = sizeof a;
+    if (getsockname(listen_fd, (struct sockaddr *)&a, &alen) != 0) return 0;
+    return ntohs(a.sin_port);
+}
+
 // Any https origin or a local dev server. The loopback bind is the real gate;
 // this only decides whether a page may READ the (non-secret) id.
 static int origin_allowed(const char *origin, size_t n) {
