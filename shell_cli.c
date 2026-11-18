@@ -631,7 +631,7 @@ int cmd_skill(int argc, char **argv) {
 
 const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-files", "tfa-surface",
     "tfa-imagegen", "tfa-stt", "tfa-tts", "tfa-speech", "tfa-treg", "tfa-device",
-    "tfa-summary", "tfa-explore", "tfa-handoff", "tfa-webfetch", NULL };
+    "tfa-summary", "tfa-explore", "tfa-review", "tfa-handoff", "tfa-webfetch", NULL };
 
 int bridge_cli_builtin(const char *name) {
     for (int i = 0; BRIDGE_CLI_NAMES[i]; i++) if (strcmp(name, BRIDGE_CLI_NAMES[i]) == 0) return 1;
@@ -673,6 +673,41 @@ static char *cli_slurp(int fd, size_t *len, char *err, size_t errcap) {
     return NULL;
 }
 
+// An explicit empty pipe means an empty selection, not the whole working tree.
+static int review_default_input(void) {
+#ifdef _WIN32
+    return GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR;
+#else
+    struct stat st;
+    return fstat(0, &st) == 0 && S_ISCHR(st.st_mode);
+#endif
+}
+
+// The reviewer runs remotely; capture the current checkout locally. No user input
+// goes into this fixed command. A supplied patch takes precedence over git.
+static int review_diff(cli_input_t *in, char *err, size_t errcap) {
+#ifdef _WIN32
+    FILE *f = _popen("git diff --no-ext-diff --no-textconv HEAD --", "rb");
+#else
+    FILE *f = popen("git diff --no-ext-diff --no-textconv HEAD --", "r");
+#endif
+    if (!f) { snprintf(err, errcap, "cannot start git diff"); return -1; }
+    free(in->data);
+    in->flag = 0;
+#ifdef _WIN32
+    in->data = cli_slurp(_fileno(f), &in->size, err, errcap);
+    int status = _pclose(f);
+#else
+    in->data = cli_slurp(fileno(f), &in->size, err, errcap);
+    int status = pclose(f);
+#endif
+    if (!in->data) return -1;
+    if (!status) return 0;
+    free(in->data); in->data = NULL;
+    snprintf(err, errcap, "git diff HEAD failed; run in a repository or pipe a diff");
+    return -1;
+}
+
 // The input the backend asked for. 0, or -1 with err.
 static int cli_read_input(cli_input_t *in, const char *need, const char *path, char *err, size_t errcap) {
     memset(in, 0, sizeof *in);
@@ -711,6 +746,8 @@ static int cli_request_line(char *line, size_t cap, size_t *u, int argc, char **
     if (!bad && fe && *fe) bad = json_emit_raw(line, cap, u, ",\"frontendId\":", 14) < 0 || json_emit_str(line, cap, u, fe, -1) < 0;
     const char *ag = getenv("TODOFORAI_AGENT_SETTINGS_ID");   // this turn's agent: a sub-agent patches its settings
     if (!bad && ag && *ag) bad = json_emit_raw(line, cap, u, ",\"agentSettingsId\":", 19) < 0 || json_emit_str(line, cap, u, ag, -1) < 0;
+    const char *mid = getenv("TODOFORAI_MODEL_ID");   // this turn's running model: tfa-review picks another vendor
+    if (!bad && mid && *mid) bad = json_emit_raw(line, cap, u, ",\"modelId\":", 11) < 0 || json_emit_str(line, cap, u, mid, -1) < 0;
     if (!bad) bad = stdout_is_tty() ? json_emit_raw(line, cap, u, ",\"stdoutTty\":true", 17) < 0 : json_emit_raw(line, cap, u, ",\"stdoutTty\":false", 18) < 0;
     if (!bad) bad = json_emit_raw(line, cap, u, ",\"inputs\":[", 11) < 0;
     for (int i = 0; i < nin && !bad; i++) {
@@ -786,6 +823,8 @@ static int cli_run(const char *name, int argc, char **argv, const char *input, s
                 if (strcmp(need, "stdin") || nin) { snprintf(err, sizeof err, "unexpected input request"); break; }
                 in[nin] = (cli_input_t){ .kind = "stdin", .data = (char *)input, .size = size };
             } else if (cli_read_input(&in[nin], need, path, err, sizeof err) < 0) break;
+            if (!strcmp(name, "tfa-review") && !strcmp(need, "stdin") && !in[nin].size && review_default_input()
+                && review_diff(&in[nin], err, sizeof err) < 0) break;
             nin++;
             continue;
         }

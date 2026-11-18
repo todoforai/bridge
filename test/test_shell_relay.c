@@ -193,7 +193,7 @@ int main(void) {
     shell_relay_init(&R, fake_send, fake_busy, fake_ready, NULL);
     assert(R.port);
     char env[512];
-    snprintf(env, sizeof env, "env -u TODOFORAI_MESSAGE_ID TODOFORAI_BRIDGE_PORT=%u TODOFORAI_API_TOKEN=dst_x TODOFORAI_TODO_ID=T1 TODOFORAI_BLOCK_ID=B1 ", R.port);
+    snprintf(env, sizeof env, "env -u TODOFORAI_MESSAGE_ID -u TODOFORAI_MODEL_ID -u TODOFORAI_AGENT_SETTINGS_ID -u TODOFORAI_PROJECT_ID -u TODOFORAI_FRONTEND_ID TODOFORAI_BRIDGE_PORT=%u TODOFORAI_API_TOKEN=dst_x TODOFORAI_TODO_ID=T1 TODOFORAI_BLOCK_ID=B1 ", R.port);
     char cmd[2048];
     static char out[1 << 20], dec[24 << 20];
     assert(system("mkdir -p build/sr && cd build/sr && ln -sf ../todoforai-bridge tfa-cat && ln -sf ../todoforai-bridge tfa-skill"
@@ -445,12 +445,12 @@ int main(void) {
     // 19. cli: argv goes up as one sized request, the backend's code/stdout/stderr come back. stdin untouched.
     assert(system("cd build/sr && for n in tfa-search tfa-question tfa-show tfa-surface; do ln -sf ../todoforai-bridge $n; done") == 0);
     reset(); cli_answer("{\"code\":3,\"out\":6,\"err\":5}", "hello\noops\n");
-    snprintf(cmd, sizeof cmd, "cd build/sr && echo keep | (%s TODOFORAI_PROJECT_ID=P1 TODOFORAI_FRONTEND_ID=F1 TODOFORAI_AGENT_SETTINGS_ID=A1 ./tfa-search -n 3 'a \"b\"' 2>e.txt; echo rc=$?; cat; cat e.txt)", env);
+    snprintf(cmd, sizeof cmd, "cd build/sr && echo keep | (%s TODOFORAI_PROJECT_ID=P1 TODOFORAI_FRONTEND_ID=F1 TODOFORAI_AGENT_SETTINGS_ID=A1 TODOFORAI_MODEL_ID=M1 ./tfa-search -n 3 'a \"b\"' 2>e.txt; echo rc=$?; cat; cat e.txt)", env);
     run(cmd, 0, out, sizeof out);
     assert(!strcmp(out, "hello\nrc=3\nkeep\noops\n"));
     assert(count(frames, "\"shell:open\"") == 1 && strstr(frames, "\"kind\":\"cli\"") && strstr(frames, "\"name\":\"tfa-search\"") && count(frames, "\"shell:end\"") == 1);
     dn = decoded(dec, sizeof dec); dec[dn] = 0;
-    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"frontendId\":\"F1\",\"agentSettingsId\":\"A1\",\"stdoutTty\":false,\"inputs\":[]}\n"));
+    assert(strstr(dec, "{\"argv\":[\"-n\",\"3\",\"a \\\"b\\\"\"],\"cwd\":\"") && strstr(dec, "/build/sr\",\"projectId\":\"P1\",\"frontendId\":\"F1\",\"agentSettingsId\":\"A1\",\"modelId\":\"M1\",\"stdoutTty\":false,\"inputs\":[]}\n"));
     { char want[64]; snprintf(want, sizeof want, "\"size\":%zu", dn); assert(strstr(frames, want)); }
     printf("ok 19 cli round trip\n");
 
@@ -469,6 +469,16 @@ int main(void) {
     dn = decoded(dec, sizeof dec); dec[dn] = 0;
     assert(strstr(dec, "{\"kind\":\"stdin\",\"size\":0,\"tty\":true}"));
     printf("ok 20 cli stdin on demand\n");
+
+    // Review reads this checkout only with terminal/null stdin, never for an empty pipeline.
+    assert(system("rm -rf build/sr/repo && mkdir -p build/sr/repo && cd build/sr/repo && git init -q && printf before >file && git add file && git -c user.name=T -c user.email=t@test commit -qm base && printf after >file") == 0);
+    for (int mode = 0; mode < 3; mode++) {
+        reset(); cli_answer("{\"need\":\"stdin\"}", ""); cli_answer("{\"code\":0,\"out\":0,\"err\":0}", "");
+        snprintf(cmd, sizeof cmd, "cd build/sr/repo && %s %s ../../todoforai-bridge __cli tfa-review %s", mode == 0 ? "" : mode == 1 ? "printf patch |" : "printf '' |", env, mode == 0 ? "</dev/null" : "");
+        run(cmd, 0, out, sizeof out);
+        dn = decoded(dec, sizeof dec); dec[dn] = 0;
+        assert(mode == 0 ? strstr(dec, "+after") != NULL : mode == 1 ? strstr(dec, "}\npatch") != NULL : strstr(dec, "\"size\":0}]}\n") != NULL);
+    }
 
     // 21. cli: a file the backend asks for is sent (3MB, chunked); a missing one is reported.
     reset(); cli_answer("{\"need\":\"file\",\"path\":\"build/sr/big.bin\"}", ""); cli_answer("{\"code\":0,\"out\":8,\"err\":0}", "T1:plan\n");
