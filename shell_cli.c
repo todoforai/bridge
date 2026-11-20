@@ -630,7 +630,7 @@ int cmd_skill(int argc, char **argv) {
 // functions → `<bridge> __cli <name>`.
 
 const char *const BRIDGE_CLI_NAMES[] = { "tfa-search", "tfa-question", "tfa-show", "tfa-settings", "tfa-memory", "tfa-files", "tfa-surface",
-    "tfa-imagegen", "tfa-videogen", "tfa-stt", "tfa-tts", "tfa-speech", "tfa-treg", "tfa-device",
+    "tfa-imagegen", "tfa-videogen", "tfa-music", "tfa-stt", "tfa-tts", "tfa-speech", "tfa-treg", "tfa-device",
     "tfa-summary", "tfa-explore", "tfa-review", "tfa-handoff", "tfa-webfetch", NULL };
 
 int bridge_cli_builtin(const char *name) {
