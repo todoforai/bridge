@@ -90,6 +90,7 @@ static void *memmem_compat(const void *h, size_t hl, const void *n, size_t nl) {
 #include "ws.h"
 #include "jobs.h"
 #include "preview.h"
+#include "preview_ws.h"
 #include "pty.h"
 #include "pty_pool.h"
 #include "subcmd.h"
@@ -612,6 +613,7 @@ typedef struct {
     ws_fd_t identity_fd;
     uint16_t identity_port;  // 43127 for prod, 43128 for a local/dev backend
     adb_relay_t adb;         // loopback adb relays (adb_relay.h)
+    preview_ws_relay_t preview_ws; // live_preview WebSocket relay (preview_ws.h)
     shell_relay_t shell;     // tfa-cat / __live → backend (shell_relay.h)
     // Mayfly mode (--mayfly <todoId>): ephemeral, task-scoped session. Auths
     // with the normal saved credentials but registers backend-side under the
@@ -3831,6 +3833,13 @@ static int handle_command(edge_t *e, const char *msg, size_t msg_len) {
         else if (IS("shell:wait"))  shell_relay_on_wait(&e->shell, payload, payload_len);
         else                        shell_relay_on_data(&e->shell, payload, payload_len);
         return 0;
+    } else if (IS("preview:ws_open") || IS("preview:ws_data") || IS("preview:ws_close")) {
+        const char *payload = NULL; size_t payload_len = 0;
+        if (!json_get_obj(msg, msg_len, "payload", &payload, &payload_len)) return 0;
+        if (IS("preview:ws_open"))       preview_ws_on_open(&e->preview_ws, payload, payload_len);
+        else if (IS("preview:ws_data"))  preview_ws_on_data(&e->preview_ws, payload, payload_len);
+        else                             preview_ws_on_close(&e->preview_ws, payload, payload_len);
+        return 0;
     } else if (IS("preview:http_request")) {
         // live_preview relay fetch. Payload-wrapped like FUNCTION_CALL_*:
         // {"payload":{requestId, port, method, path, headers{}, bodyB64?}}.
@@ -4134,6 +4143,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     e->device_id = device_id;
     e->device_secret = device_secret;
     adb_relay_drop_streams(&e->adb);   // backend streams died with the last connection
+    preview_ws_close_all(&e->preview_ws); // preview WS streams died with the last connection
     shell_relay_drop_streams(&e->shell, "bridge reconnected to the backend");
     if (e->identity_fd == WS_INVALID_FD && !e->mayfly) {
         e->identity_port = login_is_local_host(host) ? IDENTITY_SERVER_PORT_LOCAL : IDENTITY_SERVER_PORT;
@@ -4185,7 +4195,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
     // pfds[0] is always the WS fd; remaining slots are active sessions' PTY
     // master fds so output wakes the loop immediately instead of waiting out
     // the timeout. +1 for the WS slot.
-    const size_t pfds_cap = (size_t)g_max_sessions + 2 + ADB_MAX_LISTENERS + ADB_MAX_STREAMS + 1 + SHELL_MAX_STREAMS + CDPL_MAX_CONNS;
+    const size_t pfds_cap = (size_t)g_max_sessions + 2 + ADB_MAX_LISTENERS + ADB_MAX_STREAMS + 1 + SHELL_MAX_STREAMS + CDPL_MAX_CONNS + PREVIEW_WS_MAX_STREAMS;
     struct pollfd *pfds = calloc(pfds_cap, sizeof *pfds);
     if (!pfds) { fail(e, "out of memory allocating pollfds"); ws_close(&e->ws); noise_ws_wipe(&e->noise); return -1; }
 
@@ -4220,11 +4230,14 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
         size_t cdpl_first = shell_n, cdpl_n = shell_n;
         shell_n -= shell_first;
         cdp_local_fill_pfds(pfds, &cdpl_n, pfds_cap);
+        size_t pws_first = cdpl_n, pws_n = cdpl_n;
         cdpl_n -= cdpl_first;
+        preview_ws_fill_pfds(&e->preview_ws, pfds, &pws_n, pfds_cap);
+        pws_n -= pws_first;
 #ifdef _WIN32
-        nfds = (ULONG)(cdpl_first + cdpl_n);
+        nfds = (ULONG)(pws_first + pws_n);
 #else
-        nfds = (nfds_t)(cdpl_first + cdpl_n);
+        nfds = (nfds_t)(pws_first + pws_n);
 #endif
         struct pollfd *pfd = &pfds[0];
         // Keep a 50ms ceiling so the awaiting-input probe and deadline checks in
@@ -4279,6 +4292,7 @@ static int run(edge_t *e, const char *device_id, const char *device_secret,
             if (adb_n && e->noise.handshake_done && e->identity_sent) adb_relay_service(&e->adb, pfds, adb_first, adb_n);
             if (shell_n) shell_relay_service(&e->shell, pfds, shell_first, shell_n);
             if (cdpl_n) cdp_local_service(pfds, cdpl_first, cdpl_n);
+            if (pws_n && e->noise.handshake_done && e->identity_sent) preview_ws_service(&e->preview_ws, pfds, pws_first, pws_n);
         }
         shell_relay_tick(&e->shell);
         cdp_local_tick();
@@ -4836,6 +4850,7 @@ int bridge_main(int argc, char **argv) {
     // answers "which device is this machine".
     e->identity_fd = WS_INVALID_FD;  // opened in run(), after e->mayfly is known
     adb_relay_init(&e->adb, adb_send_cb, adb_busy_cb, e);
+    preview_ws_init(&e->preview_ws, adb_send_cb, adb_busy_cb, e);
     shell_relay_init(&e->shell, adb_send_cb, adb_busy_cb, shell_ready_cb, e);
     bridge_identity_server_set_adb_hook(adb_hook_cb, adb_last_error_cb, adb_forget_cb, e);
     cdp_local_init(cdpl_grant_cb);
@@ -5052,6 +5067,7 @@ done:
     }
     pty_pool_shutdown();
     adb_relay_close_all(&e->adb);
+    preview_ws_close_all(&e->preview_ws);
     shell_relay_close_all(&e->shell);
     bridge_identity_server_close(e->identity_fd);
     free(e->sessions);

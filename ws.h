@@ -62,6 +62,8 @@ ws_fd_t ws_tcp_connect(const char *host, uint16_t port, int timeout_ms,
 // Does NOT validate Sec-WebSocket-Accept: Noise authenticates the server,
 // so a bogus 101 fails the handshake anyway (and avoids bundling SHA-1).
 // Returns 0 on success; ws->err on failure.
+int ws_connect_ex(ws_t *ws, const char *host, uint16_t port, const char *path,
+                  const char *protocols, size_t max_msg, int connect_timeout_ms);
 int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
                size_t max_msg, int connect_timeout_ms);
 

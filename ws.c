@@ -196,8 +196,8 @@ static long recv_http_response(ws_fd_t fd, char *buf, size_t cap, int timeout_ms
     return -1;
 }
 
-int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
-               size_t max_msg, int connect_timeout_ms) {
+int ws_connect_ex(ws_t *ws, const char *host, uint16_t port, const char *path,
+                  const char *protocols, size_t max_msg, int connect_timeout_ms) {
     memset(ws, 0, sizeof(*ws));
     ws->fd = WS_INVALID;
     ws->rx = malloc(max_msg);
@@ -217,7 +217,19 @@ int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
     uint8_t nonce[16]; noise_random(nonce, sizeof(nonce));
     char key_b64[32]; b64_encode(nonce, sizeof(nonce), key_b64, sizeof(key_b64));
 
-    char req[1024];
+    char proto_hdr[300] = "";
+    if (protocols && protocols[0]) {
+        // Strip CR/LF to prevent header injection.
+        char clean[256];
+        size_t j = 0;
+        for (size_t i = 0; protocols[i] && j + 1 < sizeof(clean); i++) {
+            unsigned char c = (unsigned char)protocols[i];
+            if (c >= 0x20 && c != 0x7f) clean[j++] = (char)c;
+        }
+        clean[j] = '\0';
+        if (j > 0) snprintf(proto_hdr, sizeof(proto_hdr), "Sec-WebSocket-Protocol: %s\r\n", clean);
+    }
+    char req[1536];
     int rn = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
         "Host: %s:%u\r\n"
@@ -225,8 +237,9 @@ int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: %s\r\n"
         "Sec-WebSocket-Version: 13\r\n"
+        "%s"
         "\r\n",
-        path, host, (unsigned)port, key_b64);
+        path, host, (unsigned)port, key_b64, proto_hdr);
     if (rn <= 0 || (size_t)rn >= sizeof(req)) {
         ws_set_err(ws, "request too large");
         ws_close(ws); return -1;
@@ -270,6 +283,11 @@ int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
     // watchdog measures idle time from a fresh connection. Done.
     ws->last_recv_ms = ws_monotonic_ms();
     return 0;
+}
+
+int ws_connect(ws_t *ws, const char *host, uint16_t port, const char *path,
+               size_t max_msg, int connect_timeout_ms) {
+    return ws_connect_ex(ws, host, port, path, NULL, max_msg, connect_timeout_ms);
 }
 
 void ws_close(ws_t *ws) {

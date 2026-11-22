@@ -22,6 +22,8 @@
 #include "../jobs.h"
 #include "../json.h"
 #include "../preview.h"
+#include "../preview_ws.h"
+#include <poll.h>
 
 // ── Tiny HTTP/1.0 server ────────────────────────────────────────────────────
 
@@ -125,6 +127,134 @@ static int job_on_frame(void *c, const bridge_job_t *j, const char *d, size_t l)
 static void job_on_done(void *c, const bridge_job_t *j, int ok, const char *e) {
     (void)c; (void)j; (void)e;
     g_job_dones++; g_job_oks += ok;
+}
+
+
+// ── Minimal RFC 6455 loopback echo server for preview_ws tests ──────────────
+static int g_ws_srv_port = 0;
+static char g_ws_seen_proto[128] = "";
+
+static int read_exact(int fd, uint8_t *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        if (r <= 0) return -1;
+        got += (size_t)r;
+    }
+    return 0;
+}
+
+static int write_exact(int fd, const uint8_t *buf, size_t n) {
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = write(fd, buf + sent, n - sent);
+        if (w <= 0) return -1;
+        sent += (size_t)w;
+    }
+    return 0;
+}
+
+static void *ws_echo_thread(void *arg) {
+    int lfd = *(int *)arg;
+    for (;;) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) break;
+        char hdr[4096];
+        size_t hlen = 0;
+        while (hlen + 1 < sizeof hdr) {
+            ssize_t r = read(cfd, hdr + hlen, 1);
+            if (r <= 0) break;
+            hlen++;
+            if (hlen >= 4 && memcmp(hdr + hlen - 4, "\r\n\r\n", 4) == 0) break;
+        }
+        hdr[hlen] = '\0';
+        const char *ph = strstr(hdr, "Sec-WebSocket-Protocol: ");
+        if (ph) {
+            ph += 24;
+            const char *eol = strstr(ph, "\r\n");
+            size_t pl = eol ? (size_t)(eol - ph) : strlen(ph);
+            if (pl >= sizeof g_ws_seen_proto) pl = sizeof g_ws_seen_proto - 1;
+            memcpy(g_ws_seen_proto, ph, pl);
+            g_ws_seen_proto[pl] = '\0';
+        }
+        const char *resp =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: dummy\r\n\r\n";
+        (void)write_exact(cfd, (const uint8_t *)resp, strlen(resp));
+
+        for (;;) {
+            uint8_t h2[2];
+            if (read_exact(cfd, h2, 2) != 0) break;
+            uint8_t op = h2[0] & 0x0f;
+            int masked = (h2[1] & 0x80) != 0;
+            uint64_t plen = h2[1] & 0x7f;
+            if (plen == 126) {
+                uint8_t ext[2];
+                if (read_exact(cfd, ext, 2) != 0) break;
+                plen = ((uint64_t)ext[0] << 8) | ext[1];
+            } else if (plen == 127) {
+                uint8_t ext[8];
+                if (read_exact(cfd, ext, 8) != 0) break;
+                plen = 0;
+                for (int i = 0; i < 8; i++) plen = (plen << 8) | ext[i];
+            }
+            uint8_t mask[4] = {0};
+            if (masked && read_exact(cfd, mask, 4) != 0) break;
+            uint8_t *body = plen ? malloc((size_t)plen) : NULL;
+            if (plen && (!body || read_exact(cfd, body, (size_t)plen) != 0)) { free(body); break; }
+            if (masked) for (size_t i = 0; i < (size_t)plen; i++) body[i] ^= mask[i & 3];
+
+            if (op == 0x8) { free(body); break; }
+            uint8_t oh[10];
+            size_t ohl = 0;
+            oh[ohl++] = (uint8_t)(0x80 | op);
+            if (plen < 126) {
+                oh[ohl++] = (uint8_t)plen;
+            } else {
+                oh[ohl++] = 126;
+                oh[ohl++] = (uint8_t)(plen >> 8);
+                oh[ohl++] = (uint8_t)(plen & 0xff);
+            }
+            if (write_exact(cfd, oh, ohl) != 0 || (plen && write_exact(cfd, body, (size_t)plen) != 0)) {
+                free(body);
+                break;
+            }
+            free(body);
+        }
+        close(cfd);
+    }
+    return NULL;
+}
+
+static char  *g_pws_msgs[32];
+static size_t g_pws_lens[32];
+static int    g_pws_n = 0;
+
+static void pws_reset(void) {
+    for (int i = 0; i < g_pws_n; i++) free(g_pws_msgs[i]);
+    g_pws_n = 0;
+}
+
+static int pws_capture(void *ctx, const char *json, size_t len) {
+    (void)ctx;
+    assert(g_pws_n < 32);
+    g_pws_msgs[g_pws_n] = malloc(len + 1);
+    memcpy(g_pws_msgs[g_pws_n], json, len);
+    g_pws_msgs[g_pws_n][len] = '\0';
+    g_pws_lens[g_pws_n] = len;
+    g_pws_n++;
+    return 0;
+}
+
+static void pws_pump(preview_ws_relay_t *r, int timeout_ms) {
+    struct pollfd pfds[4];
+    size_t n = 0;
+    preview_ws_fill_pfds(r, pfds, &n, 4);
+    if (n == 0) return;
+    if (poll(pfds, (nfds_t)n, timeout_ms) > 0)
+        preview_ws_service(r, pfds, 0, n);
 }
 
 int main(int argc, char **argv) {
@@ -271,6 +401,106 @@ int main(int argc, char **argv) {
         bridge_jobs_shutdown(&jobs);
     }
     printf("ok 6 fetch through an off-loop worker process\n");
+
+    // 7: preview_ws rejects unregistered port
+    {
+        preview_ws_relay_t rel;
+        preview_ws_init(&rel, pws_capture, NULL, NULL);
+        pws_reset();
+        const char *open_bad = "{\"streamId\":\"ws1\",\"port\":19999,\"path\":\"/\"}";
+        preview_ws_on_open(&rel, open_bad, strlen(open_bad));
+        assert(g_pws_n == 1);
+        assert(strstr(g_pws_msgs[0], "\"type\":\"preview:ws_opened\""));
+        assert(strstr(g_pws_msgs[0], "\"error\":"));
+        preview_ws_close_all(&rel);
+    }
+    printf("ok 7 preview_ws rejects unregistered port\n");
+
+    // 8: preview_ws open (with subprotocol) + text echo + 40KB chunked binary round-trip
+    {
+        int wlfd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(wlfd >= 0);
+        int one = 1;
+        setsockopt(wlfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in wa = { .sin_family = AF_INET, .sin_port = 0 };
+        wa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        assert(bind(wlfd, (struct sockaddr *)&wa, sizeof wa) == 0);
+        assert(listen(wlfd, 4) == 0);
+        socklen_t walen = sizeof wa;
+        getsockname(wlfd, (struct sockaddr *)&wa, &walen);
+        g_ws_srv_port = ntohs(wa.sin_port);
+        pthread_t wtid;
+        pthread_create(&wtid, NULL, ws_echo_thread, &wlfd);
+        pthread_detach(wtid);
+
+        bridge_preview_allow_port(g_ws_srv_port);
+        preview_ws_relay_t rel;
+        preview_ws_init(&rel, pws_capture, NULL, NULL);
+        pws_reset();
+
+        char open_ok[256];
+        snprintf(open_ok, sizeof open_ok,
+                 "{\"streamId\":\"ws2\",\"port\":%d,\"path\":\"/hmr\",\"protocols\":[\"vite-hmr\"]}",
+                 g_ws_srv_port);
+        preview_ws_on_open(&rel, open_ok, strlen(open_ok));
+        assert(g_pws_n == 1);
+        assert(strstr(g_pws_msgs[0], "\"type\":\"preview:ws_opened\""));
+        assert(!strstr(g_pws_msgs[0], "\"error\""));
+        assert(strcmp(g_ws_seen_proto, "vite-hmr") == 0);
+
+        // Text round-trip
+        pws_reset();
+        const char *d1 = "{\"streamId\":\"ws2\",\"binary\":false,\"text\":\"hello hmr\",\"fin\":true}";
+        preview_ws_on_data(&rel, d1, strlen(d1));
+        for (int i = 0; i < 40 && g_pws_n == 0; i++) pws_pump(&rel, 25);
+        assert(g_pws_n == 1);
+        const char *pl; size_t pll;
+        assert(json_get_obj(g_pws_msgs[0], g_pws_lens[0], "payload", &pl, &pll));
+        const char *b64; size_t b64l;
+        assert(json_get_str(pl, pll, "dataB64", &b64, &b64l));
+        char dec[64];
+        size_t dl = b64_decode(b64, b64l, dec, sizeof dec);
+        assert(dl == 9 && memcmp(dec, "hello hmr", 9) == 0);
+
+        // 40KB binary round-trip: chunked in (20KB + 20KB) -> echoed -> chunked out (32KB + 8KB)
+        pws_reset();
+        size_t big_n = 40 * 1024;
+        uint8_t *big = malloc(big_n);
+        for (size_t i = 0; i < big_n; i++) big[i] = (uint8_t)(i * 31 + 7);
+        char *b1 = malloc(32000), *b2 = malloc(32000);
+        b64_encode(big, 20 * 1024, b1, 32000);
+        b64_encode(big + 20 * 1024, 20 * 1024, b2, 32000);
+        char *f1 = malloc(36000), *f2 = malloc(36000);
+        snprintf(f1, 36000, "{\"streamId\":\"ws2\",\"binary\":true,\"dataB64\":\"%s\",\"fin\":false}", b1);
+        snprintf(f2, 36000, "{\"streamId\":\"ws2\",\"binary\":true,\"dataB64\":\"%s\",\"fin\":true}", b2);
+        preview_ws_on_data(&rel, f1, strlen(f1));
+        preview_ws_on_data(&rel, f2, strlen(f2));
+        free(b1); free(b2); free(f1); free(f2);
+
+        for (int i = 0; i < 60 && g_pws_n < 2; i++) pws_pump(&rel, 25);
+        assert(g_pws_n == 2);
+        uint8_t *re = malloc(big_n + 64);
+        size_t re_len = 0;
+        for (int c = 0; c < g_pws_n; c++) {
+            const char *cp; size_t cpl;
+            assert(json_get_obj(g_pws_msgs[c], g_pws_lens[c], "payload", &cp, &cpl));
+            int is_bin = 0, is_fin = -1;
+            assert(json_get_bool(cp, cpl, "binary", &is_bin) && is_bin == 1);
+            assert(json_get_bool(cp, cpl, "fin", &is_fin) && is_fin == (c == 1 ? 1 : 0));
+            const char *cb; size_t cbl;
+            assert(json_get_str(cp, cpl, "dataB64", &cb, &cbl));
+            re_len += b64_decode(cb, cbl, re + re_len, big_n + 64 - re_len);
+        }
+        assert(re_len == big_n && memcmp(re, big, big_n) == 0);
+        free(big); free(re);
+
+        const char *cls = "{\"streamId\":\"ws2\",\"code\":1000}";
+        preview_ws_on_close(&rel, cls, strlen(cls));
+        pws_reset();
+        preview_ws_close_all(&rel);
+        close(wlfd);
+    }
+    printf("ok 8 preview_ws subprotocol + text + 40KB chunked binary round-trip\n");
 
     printf("all preview tests passed\n");
     return 0;
