@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -743,8 +744,44 @@ static void skill_list_root(skill_list_t *l, const char *root) {
     }
 }
 
-// The backend's skills (`skills:` ref → `name: description` lines) into `l`, after the local ones.
-static int skill_list_remote(skill_list_t *l, char *err, size_t ecap) {
+typedef struct { char *pat; int allow; } skill_rule_t;
+typedef struct { skill_rule_t *v; size_t n, cap; } skill_rules_t;
+
+static void skill_rules_add(skill_rules_t *rs, int allow, const char *pat) {
+    if (!*pat) return;
+    if (rs->n == rs->cap) {
+        size_t nc = rs->cap ? rs->cap * 2 : 16;
+        skill_rule_t *nv = realloc(rs->v, nc * sizeof *nv);
+        if (!nv) return;
+        rs->v = nv; rs->cap = nc;
+    }
+    char *p = strdup(pat);
+    if (!p) return;
+    rs->v[rs->n++] = (skill_rule_t){ p, allow };
+}
+
+// Mirrors shared-fbe `skillFilterLines` / Julia `skill_on`: exact beats trailing `*`,
+// longer prefix wins, `-` beats `+` on a tie, unmatched = allowed.
+static int skill_rule_allows(const skill_rules_t *rs, const char *name) {
+    int best = -1, allowed = 1;
+    for (size_t i = 0; i < rs->n; i++) {
+        const char *pat = rs->v[i].pat;
+        size_t len = strlen(pat);
+        int wild = len > 0 && pat[len - 1] == '*';
+        int matched = wild ? !strncmp(name, pat, len - 1) : !strcmp(name, pat);
+        if (!matched) continue;
+        int spec = wild ? (int)(len - 1) : INT_MAX;
+        if (spec > best || (spec == best && !rs->v[i].allow)) {
+            best = spec;
+            allowed = rs->v[i].allow;
+        }
+    }
+    return allowed;
+}
+
+// The backend's skills (`skills:` ref → optional `\t+pat`/`\t-pat` filter lines, then
+// `name: description` lines) into `l` and `rs`, after the local ones.
+static int skill_list_remote(skill_list_t *l, skill_rules_t *rs, char *err, size_t ecap) {
     char mime[128];
     ws_fd_t s = shell_client_open("fetch", NULL, NULL, -1, "skills:", 0, err, ecap);
     if (s == WS_INVALID_FD) return -1;
@@ -764,6 +801,11 @@ static int skill_list_remote(skill_list_t *l, char *err, size_t ecap) {
     for (char *line = buf, *nl; *line; line = nl ? nl + 1 : line + strlen(line)) {
         nl = strchr(line, '\n');
         if (nl) *nl = '\0';
+        if (line[0] == '\t' && (line[1] == '+' || line[1] == '-')) {
+            skill_rules_add(rs, line[1] == '+', line + 2);
+            if (!nl) break;
+            continue;
+        }
         char *c = strstr(line, ": ");
         if (c) { *c = '\0'; skill_list_add(l, line, c + 2, NULL); }
         else skill_list_add(l, line, "", NULL);
@@ -803,16 +845,18 @@ static int skill_list_cmd(int argc, char **argv) {
     }
     if (*home) skill_list_root(&l, home);
     size_t local = l.n;
+    skill_rules_t rs = { 0 };
     const char *blk = getenv("TODOFORAI_BLOCK_ID");
     char err[512] = "";
-    int remote = blk && *blk ? skill_list_remote(&l, err, sizeof err) : -1;
+    int remote = blk && *blk ? skill_list_remote(&l, &rs, err, sizeof err) : -1;
     qsort(l.v, local, sizeof *l.v, ent_cmp);
     qsort(l.v + local, l.n - local, sizeof *l.v, ent_cmp);
     size_t shown = 0;
     for (size_t i = 0; i < l.n; i++) {
         skill_ent_t *e = &l.v[i];
-        int hit = argc <= 2;
-        for (int a = 2; a < argc && !hit; a++) hit = ci_has(e->name, argv[a]) || ci_has(e->desc, argv[a]);
+        int on = skill_rule_allows(&rs, e->name);
+        int hit = on && argc <= 2;
+        for (int a = 2; a < argc && on && !hit; a++) hit = ci_has(e->name, argv[a]) || ci_has(e->desc, argv[a]);
         if (hit) {
             printf("- %s%s%s", e->name, e->desc[0] ? ": " : "", e->desc);
             if (e->path) printf(" (file: %s)", e->path);
@@ -821,6 +865,8 @@ static int skill_list_cmd(int argc, char **argv) {
         }
         free(e->name); free(e->desc); free(e->path);
     }
+    for (size_t i = 0; i < rs.n; i++) free(rs.v[i].pat);
+    free(rs.v);
     free(l.v);
     if (!shown) fprintf(stderr, "tfa-skill: no skills%s\n", argc > 2 ? " match" : "");
     if (remote < 0 && blk && *blk) fprintf(stderr, "tfa-skill: project and built-in skills not listed: %s\n", err[0] ? err : "unavailable");
