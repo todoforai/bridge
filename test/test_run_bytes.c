@@ -139,9 +139,18 @@ static void suite(edge_t *e) {
 
     // Line-width cap: the suffix lands right after the kept text, before the
     // PTY's \r\n (after the \r it overwrote the line's start once collapsed).
-    check("over-long line: suffix before CR LF",
-          run_cmd_mode(e, "printf 'S%.0s' $(seq 40); printf 'm%.0s' $(seq 400); echo", 57, "safe")
-          && g_code == 0 && has("mmm ...[+140 chars]\r\n"));
+    {
+        const char *lc = "printf 'S%.0s' $(seq 40); printf 'm%.0s' $(seq 2100); echo";
+        check("over-long line: suffix before CR LF",
+              run_cmd_mode(e, lc, strlen(lc), "safe")
+              && g_code == 0 && has("mmm ...[+140 chars]\r\n"));
+        check("wide mode: no per-line cap",
+              run_cmd_mode(e, lc, strlen(lc), "wide")
+              && g_code == 0 && !has("...[+") && has("mmmmmm\r\n"));
+        check("full mode: no per-line cap",
+              run_cmd_mode(e, lc, strlen(lc), "full")
+              && g_code == 0 && !has("...[+") && has("mmmmmm\r\n"));
+    }
 
     // Persistent shell is still healthy after all of the above.
     check("session still usable", RUN("echo alive") && g_code == 0 && has("alive"));

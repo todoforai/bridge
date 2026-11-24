@@ -197,7 +197,7 @@ static char *bridge_expand_tilde(const char *p) {
 #define OB_STREAM_FIRST 10000              // chars kept/streamed from the start
 #define OB_STREAM_LAST  10000              // chars kept from the end (tail)
 #define OB_RUN_CAP      (256 * 1024)       // absolute ceiling (full mode)
-#define OB_LINE_LEN     300                // per-line width cap
+#define OB_LINE_LEN     2000               // bash output per-line limit
 // Tail buffer: holds the rolling last OB_STREAM_LAST bytes plus one full PTY
 // read of slack so a single append never overflows before we trim.
 #define OB_TAIL_CAP     (OB_STREAM_LAST + BUF_SIZE)
@@ -1808,7 +1808,7 @@ static void ob_resolve(out_policy_t *ob, const char *mode, size_t mode_len) {
     if (OB_MODE_IS("wide")) {
         first = OB_STREAM_FIRST; last = OB_STREAM_LAST; cap = OB_STREAM_FIRST + OB_STREAM_LAST; line = OB_NOLIMIT;
     } else if (OB_MODE_IS("full")) {
-        first = OB_NOLIMIT; last = 0; cap = OB_RUN_CAP; line = OB_LINE_LEN;
+        first = OB_NOLIMIT; last = 0; cap = OB_RUN_CAP; line = OB_NOLIMIT;
     } else if (OB_MODE_IS("raw")) {
         first = OB_NOLIMIT; last = 0; cap = OB_NOLIMIT; line = OB_NOLIMIT;
     } else { // safe (default)
