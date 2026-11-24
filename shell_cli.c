@@ -587,6 +587,244 @@ int cmd_cat(int argc, char **argv) {
     return rc;
 }
 
+// ── `tfa-skill list [word...]`: every skill the agent could list, with its description ──
+// This machine's (the agent's walk order: the cwd and its parents, then $HOME; first
+// name wins), then the backend's (`skills:` ref: yours in the project, the project's,
+// the built-in). The system prompt may carry names only (AgentSettings.toolDetail).
+
+typedef struct { char *name, *desc, *path; } skill_ent_t;
+typedef struct { skill_ent_t *v; size_t n, cap; } skill_list_t;
+
+static int skill_list_has(const skill_list_t *l, const char *name) {
+    for (size_t i = 0; i < l->n; i++) if (!strcmp(l->v[i].name, name)) return 1;
+    return 0;
+}
+
+static void skill_list_add(skill_list_t *l, const char *name, const char *desc, const char *path) {
+    if (!*name || skill_list_has(l, name)) return;
+    if (l->n == l->cap) {
+        size_t c = l->cap ? l->cap * 2 : 32;
+        skill_ent_t *v = realloc(l->v, c * sizeof *v);
+        if (!v) return;
+        l->v = v; l->cap = c;
+    }
+    l->v[l->n++] = (skill_ent_t){ strdup(name), strdup(desc ? desc : ""), path ? strdup(path) : NULL };
+}
+
+// Append `src[0..n)` to `out` with whitespace runs collapsed to one space.
+static void ws_append(char *out, size_t cap, const char *src, size_t n) {
+    size_t o = strlen(out);
+    for (size_t i = 0; i < n && o + 1 < cap; i++) {
+        int sp = src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n';
+        if (sp) { if (o && out[o - 1] != ' ') out[o++] = ' '; }
+        else out[o++] = src[i];
+    }
+    while (o && out[o - 1] == ' ') o--;
+    out[o] = '\0';
+}
+
+// A skill file's name + description as the agent's _skill_meta reads them (top-level
+// `name:`/`description:`, block scalars folded; a loose .md: stem + first paragraph).
+// 0 = not listed (no closed frontmatter, disabled).
+static int skill_meta_of(const char *path, int loose, const char *dflt, char *name, size_t ncap, char *desc, size_t dcap) {
+    int fd = sh_open(path);
+    if (fd < 0) return 0;
+    char buf[8193];
+    sh_ssize n = sh_read(fd, buf, sizeof buf - 1);
+    sh_close(fd);
+    if (n < 0) return 0;
+    buf[n] = '\0';
+    snprintf(name, ncap, "%s", dflt);
+    desc[0] = '\0';
+    char *p = buf;
+    if (!strncmp(p, "\xef\xbb\xbf", 3)) p += 3;
+    char *body = p;
+    if (!strncmp(p, "---", 3) && (p[3] == '\n' || p[3] == '\r')) {
+        int closed = 0, in_desc = 0;
+        for (p = strchr(p, '\n'); p && *++p; p = strchr(p, '\n')) {
+            size_t l = strcspn(p, "\r\n");
+            while (l && (p[l - 1] == ' ' || p[l - 1] == '\t')) l--;
+            if (l == 3 && !strncmp(p, "---", 3)) { closed = 1; body = p + l; break; }
+            if (in_desc && (p[0] == ' ' || p[0] == '\t' || !l)) { ws_append(desc, dcap, " ", 1); ws_append(desc, dcap, p, l); continue; }
+            in_desc = 0;
+            size_t k = 0;
+            while (k < l && (p[k] == '_' || p[k] == '-' || (p[k] | 0x20) - 'a' < 26u || (unsigned)(p[k] - '0') < 10u)) k++;
+            size_t c = k;
+            while (c < l && (p[c] == ' ' || p[c] == '\t')) c++;
+            if (!k || c >= l || p[c] != ':') continue;
+            const char *v = p + c + 1;
+            size_t vl = l - (size_t)(v - p);
+            while (vl && (*v == ' ' || *v == '\t')) { v++; vl--; }
+            for (size_t i = 1; i < vl; i++) if (v[i] == '#' && (v[i - 1] == ' ' || v[i - 1] == '\t')) { vl = i; break; }
+            while (vl && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+            if (vl >= 2 && (*v == '"' || *v == '\'') && v[vl - 1] == *v) { v++; vl -= 2; }
+            if (k == 24 && !strncmp(p, "disable-model-invocation", 24) && vl == 4 && !strncmp(v, "true", 4)) return 0;
+            if (k == 4 && !strncmp(p, "name", 4) && vl && vl < ncap) { memcpy(name, v, vl); name[vl] = '\0'; }
+            if (k == 11 && !strncmp(p, "description", 11)) {
+                desc[0] = '\0';
+                if (vl && (*v == '>' || *v == '|')) in_desc = 1;   // block scalar: the indented lines below
+                else ws_append(desc, dcap, v, vl);
+            }
+        }
+        if (!closed) return 0;
+    } else if (!loose) return 0;
+    if (loose && !desc[0]) {   // first prose paragraph of the body
+        for (p = body; *p; ) {
+            size_t l = strcspn(p, "\r\n");
+            const char *t = p;
+            while (l && (*t == ' ' || *t == '\t')) { t++; l--; }
+            int skip = !l || *t == '#' || *t == '|' || !strncmp(t, "```", 3) || !strncmp(t, "---", 3);
+            if (skip && desc[0]) break;
+            if (!skip) { if (desc[0]) ws_append(desc, dcap, " ", 1); ws_append(desc, dcap, t, l); }
+            p += strcspn(p, "\r\n");
+            while (*p == '\r' || *p == '\n') p++;
+        }
+    }
+    return 1;
+}
+
+static void skill_list_walk(skill_list_t *l, const char *dir, int depth) {
+    if (depth <= 0) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    char sub[4096], f[4200], name[256], desc[4096];
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name) >= (int)sizeof sub || !is_dir(sub)) continue;
+        snprintf(f, sizeof f, "%s/SKILL.md", sub);
+        if (file_exists(f) && skill_meta_of(f, 0, e->d_name, name, sizeof name, desc, sizeof desc))
+            skill_list_add(l, name, desc, strcmp(name, e->d_name) ? f : NULL);   // renamed: only its path finds it
+        skill_list_walk(l, sub, depth - 1);
+    }
+    closedir(d);
+}
+
+static void skill_list_base(skill_list_t *l, const char *base) {
+    if (!is_dir(base)) return;
+    skill_list_walk(l, base, 5);
+    DIR *d = opendir(base);
+    if (!d) return;
+    struct dirent *e;
+    char f[4200], stem[256], name[256], desc[4096];
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (e->d_name[0] == '.' || n < 4 || n - 3 >= sizeof stem || strcmp(e->d_name + n - 3, ".md")) continue;
+        memcpy(stem, e->d_name, n - 3); stem[n - 3] = '\0';
+        if (!strcmp(stem, "SKILL") || !strcasecmp(stem, "README")) continue;
+        if (snprintf(f, sizeof f, "%s/%s", base, e->d_name) >= (int)sizeof f || !file_exists(f)) continue;
+        if (skill_meta_of(f, 1, stem, name, sizeof name, desc, sizeof desc))
+            skill_list_add(l, name, desc, strcmp(name, stem) ? f : NULL);
+    }
+    closedir(d);
+}
+
+static void skill_list_root(skill_list_t *l, const char *root) {
+    static const char *const dirs[] = { ".agents", ".claude" };
+    char base[4096];
+    for (int i = 0; i < 2; i++) {
+        if (snprintf(base, sizeof base, "%s/%s/skills", root, dirs[i]) < (int)sizeof base) skill_list_base(l, base);
+        if (snprintf(base, sizeof base, "%s/%s/plugins", root, dirs[i]) >= (int)sizeof base) continue;
+        DIR *d = opendir(base);
+        if (!d) continue;
+        struct dirent *e;
+        char *pl[64]; int np = 0;
+        while (np < 64 && (e = readdir(d))) if (e->d_name[0] != '.' && (pl[np] = strdup(e->d_name))) np++;
+        closedir(d);
+        qsort(pl, (size_t)np, sizeof *pl, skill_cmp);
+        char sk[4096];
+        for (int j = 0; j < np; j++) {
+            if (snprintf(sk, sizeof sk, "%s/%s/skills", base, pl[j]) < (int)sizeof sk) skill_list_base(l, sk);
+            free(pl[j]);
+        }
+    }
+}
+
+// The backend's skills (`skills:` ref → `name: description` lines) into `l`, after the local ones.
+static int skill_list_remote(skill_list_t *l, char *err, size_t ecap) {
+    char mime[128];
+    ws_fd_t s = shell_client_open("fetch", NULL, NULL, -1, "skills:", 0, err, ecap);
+    if (s == WS_INVALID_FD) return -1;
+    long size = 0;
+    int r = shell_client_fetch_head(s, &size, mime, sizeof mime, err, ecap);
+    if (r <= 0 || size < 0 || size > 4 * 1024 * 1024) { shell_client_close(s); if (r > 0) snprintf(err, ecap, "listing too big"); return -1; }
+    char *buf = malloc((size_t)size + 1);
+    long got = 0;
+    while (buf && got < size) {
+        long n = shell_client_recv(s, buf + got, (size_t)(size - got));
+        if (n <= 0) break;
+        got += n;
+    }
+    shell_client_close(s);
+    if (!buf || got != size) { free(buf); snprintf(err, ecap, "transfer broke"); return -1; }
+    buf[got] = '\0';
+    for (char *line = buf, *nl; *line; line = nl ? nl + 1 : line + strlen(line)) {
+        nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *c = strstr(line, ": ");
+        if (c) { *c = '\0'; skill_list_add(l, line, c + 2, NULL); }
+        else skill_list_add(l, line, "", NULL);
+        if (!nl) break;
+    }
+    free(buf);
+    return 0;
+}
+
+static int ent_cmp(const void *a, const void *b) { return strcmp(((const skill_ent_t *)a)->name, ((const skill_ent_t *)b)->name); }
+
+// Case-insensitive substring (ASCII).
+static int ci_has(const char *hay, const char *needle) {
+    size_t n = strlen(needle);
+    for (; *hay; hay++) if (!strncasecmp(hay, needle, n)) return 1;
+    return !n;
+}
+
+static int skill_list_cmd(int argc, char **argv) {
+    skill_list_t l = { 0 };
+    char dir[4096], home[4096] = "";
+    const char *h = getenv("HOME");
+#ifdef _WIN32
+    if (!h || !*h) h = getenv("USERPROFILE");
+    if (!_getcwd(dir, sizeof dir)) dir[0] = '\0';
+#else
+    if (!getcwd(dir, sizeof dir)) dir[0] = '\0';
+#endif
+    if (h) snprintf(home, sizeof home, "%s", h);
+    for (char *c = dir; *c; c++) if (*c == '\\') *c = '/';
+    for (char *c = home; *c; c++) if (*c == '\\') *c = '/';
+    while (dir[0]) {   // the cwd and its parents (home last, as the agent lists it)
+        if (strcmp(dir, home)) skill_list_root(&l, dir);
+        char *cut = strrchr(dir, '/');
+        if (!cut || cut[1] == '\0') break;
+        cut[cut == dir || (cut == dir + 2 && dir[1] == ':') ? 1 : 0] = '\0';
+    }
+    if (*home) skill_list_root(&l, home);
+    size_t local = l.n;
+    const char *blk = getenv("TODOFORAI_BLOCK_ID");
+    char err[512] = "";
+    int remote = blk && *blk ? skill_list_remote(&l, err, sizeof err) : -1;
+    qsort(l.v, local, sizeof *l.v, ent_cmp);
+    qsort(l.v + local, l.n - local, sizeof *l.v, ent_cmp);
+    size_t shown = 0;
+    for (size_t i = 0; i < l.n; i++) {
+        skill_ent_t *e = &l.v[i];
+        int hit = argc <= 2;
+        for (int a = 2; a < argc && !hit; a++) hit = ci_has(e->name, argv[a]) || ci_has(e->desc, argv[a]);
+        if (hit) {
+            printf("- %s%s%s", e->name, e->desc[0] ? ": " : "", e->desc);
+            if (e->path) printf(" (file: %s)", e->path);
+            putchar('\n');
+            shown++;
+        }
+        free(e->name); free(e->desc); free(e->path);
+    }
+    free(l.v);
+    if (!shown) fprintf(stderr, "tfa-skill: no skills%s\n", argc > 2 ? " match" : "");
+    if (remote < 0 && blk && *blk) fprintf(stderr, "tfa-skill: project and built-in skills not listed: %s\n", err[0] ? err : "unavailable");
+    if (fflush(stdout) == EOF) return 141;
+    return shown ? 0 : 1;
+}
+
 // `tfa-skill <name>[/<file>][:FROM[:TO]]`: a listed skill's SKILL.md (or another
 // file of it), wherever the agent found it: this machine's (skill_path, the agent's
 // walk), else — one fetch — yours in the project, the project's, the built-in
@@ -598,12 +836,15 @@ int cmd_skill(int argc, char **argv) {
     }
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
         printf("Usage: tfa-skill <name>[/<file>][:FROM[:TO]]...\n"
+               "       tfa-skill list [word...]\n"
                "Print a skill: its SKILL.md, or <file> inside its folder.\n"
+               "list: every skill with its description; words (any, case-insensitive) filter by name/description.\n"
                "This machine's first (.agents/ and .claude/ skills and plugins of home, then of\n"
                "the cwd and its parents), else yours in the project, the project's, a built-in.\n");
         return argc < 2 ? 2 : 0;
     }
     stdio_binary();
+    if (!strcmp(argv[1], "list")) return skill_list_cmd(argc, argv);
     cat_prog = "tfa-skill";
     const char *blk = getenv("TODOFORAI_BLOCK_ID");
     int attach = blk && *blk, tty = stdout_is_tty(), seq = 0, rc = 0;
