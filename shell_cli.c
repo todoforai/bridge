@@ -417,13 +417,14 @@ static int skill_path(const char *spec, char *out, size_t cap) {
     if (h) snprintf(home, sizeof home, "%s", h);
     for (char *c = dir; *c; c++) if (*c == '\\') *c = '/';
     for (char *c = home; *c; c++) if (*c == '\\') *c = '/';
-    int found = *home && skill_in_root(home, name, skill, sizeof skill);
-    while (dir[0] && !found) {   // the cwd, its parents, then the root itself ("" + "/…")
+    int found = 0;
+    while (dir[0] && !found) {   // the cwd, its parents, then the root itself ("" + "/…"); HOME last, as the agent lists
         found = strcmp(dir, home) && skill_in_root(dir, name, skill, sizeof skill);
         char *cut = strrchr(dir, '/');
         if (found || !cut || cut[1] == '\0') break;   // was "/" or "C:/" — done
         cut[cut == dir || (cut == dir + 2 && dir[1] == ':') ? 1 : 0] = '\0';   // keep the root's slash
     }
+    if (!found && *home) found = skill_in_root(home, name, skill, sizeof skill);
     if (!found) return -1;
     if (!file) return snprintf(out, cap, "%s", skill) < (int)cap ? 0 : -1;
     char *slash = strrchr(skill, '/');
@@ -619,7 +620,6 @@ static void ws_append(char *out, size_t cap, const char *src, size_t n) {
         if (sp) { if (o && out[o - 1] != ' ') out[o++] = ' '; }
         else out[o++] = src[i];
     }
-    while (o && out[o - 1] == ' ') o--;
     out[o] = '\0';
 }
 
@@ -648,7 +648,7 @@ static int skill_meta_of(const char *path, int loose, const char *dflt, char *na
             if (in_desc && (p[0] == ' ' || p[0] == '\t' || !l)) { ws_append(desc, dcap, " ", 1); ws_append(desc, dcap, p, l); continue; }
             in_desc = 0;
             size_t k = 0;
-            while (k < l && (p[k] == '_' || p[k] == '-' || (p[k] | 0x20) - 'a' < 26u || (unsigned)(p[k] - '0') < 10u)) k++;
+            while (k < l && (p[k] == '_' || p[k] == '-' || (unsigned)((p[k] | 0x20) - 'a') < 26u || (unsigned)(p[k] - '0') < 10u)) k++;
             size_t c = k;
             while (c < l && (p[c] == ' ' || p[c] == '\t')) c++;
             if (!k || c >= l || p[c] != ':') continue;
@@ -677,9 +677,12 @@ static int skill_meta_of(const char *path, int loose, const char *dflt, char *na
             if (skip && desc[0]) break;
             if (!skip) { if (desc[0]) ws_append(desc, dcap, " ", 1); ws_append(desc, dcap, t, l); }
             p += strcspn(p, "\r\n");
-            while (*p == '\r' || *p == '\n') p++;
+            if (*p == '\r') p++;
+            if (*p == '\n') p++;
         }
     }
+    size_t o = strlen(desc);
+    while (o && desc[o - 1] == ' ') desc[--o] = '\0';
     return 1;
 }
 
