@@ -27,6 +27,7 @@ typedef struct {
     int       open;          // files exist and h is valid
     intptr_t  h;             // .output: POSIX fd / Win32 HANDLE
     long long out_len;       // bytes written since the last cap reset
+    long long sent_off;      // bytes of .output already delivered (reset on cap restart)
     long long in_off;        // bytes of .input already fed to the PTY
     char out_path[BG_PATH_CAP];
     char in_path[BG_PATH_CAP];
@@ -37,6 +38,9 @@ int  bg_task_open(bg_task_t *t, long pid);
 // Append to .output (best effort; a failed write is dropped). The bridge is
 // the only writer; others only read.
 void bg_task_write(bg_task_t *t, const void *data, size_t len);
+// Read up to `cap` bytes of .output starting at `off` (bounded by out_len).
+// Reads through the task's own handle; 0 on EOF or error.
+size_t bg_task_read(const bg_task_t *t, long long off, void *buf, size_t cap);
 // Peek up to `cap` not-yet-delivered .input bytes (0 = none). The file is the
 // queue: the caller advances in_off by what the PTY actually took, so a full
 // PTY never loses input. A file shrunk below in_off (someone truncated it)

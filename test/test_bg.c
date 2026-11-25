@@ -25,7 +25,8 @@ static int g_done, g_bg, g_exit, g_state_on, g_state_off, g_list;
 static char g_err_code[64];
 static size_t g_exit_len;
 static long g_pid, g_exit_code; static int g_exit_null, g_killed, g_bg_awaiting;
-static char g_out_path[512], g_in_path[512], g_output[65536], g_reason[32], g_list_json[8192], g_exit_json[65536], g_bg_json[4096];
+static char g_out_path[512], g_in_path[512], g_output[65536], g_fg_out[8192], g_reason[32], g_list_json[8192], g_exit_json[65536], g_bg_json[4096];
+static size_t g_fg_len;
 
 int bridge_test_noise_send(noise_ws_t *n, ws_t *w, const uint8_t *pt, size_t pt_len) {
     (void)n; (void)w;
@@ -37,6 +38,13 @@ static int test_capture(const char *json, size_t len) {
     const char *t = NULL; size_t tl = 0;
     if (!json_get_str(json, len, "type", &t, &tl)) return 0;
     size_t n;
+    if (T("output")) {
+        const char *d = NULL; size_t dl = 0;
+        if (json_get_str(json, len, "data", &d, &dl) && g_fg_len + 1 < sizeof g_fg_out) {
+            ssize_t dec = b64_decode(d, dl, (uint8_t *)g_fg_out + g_fg_len, sizeof g_fg_out - 1 - g_fg_len);
+            if (dec > 0) { g_fg_len += (size_t)dec; g_fg_out[g_fg_len] = '\0'; }
+        }
+    }
     if (T("step_done")) g_done++;
     if (T("step_background")) {
         g_bg++;
@@ -68,7 +76,8 @@ static void reset(void) {
     g_exit_json[0] = g_bg_json[0] = '\0';
     g_done = g_bg = g_exit = g_state_on = g_state_off = g_list = 0;
     g_pid = g_exit_code = 0; g_exit_null = g_killed = g_bg_awaiting = 0;
-    g_out_path[0] = g_in_path[0] = g_output[0] = g_reason[0] = '\0';
+    g_out_path[0] = g_in_path[0] = g_output[0] = g_fg_out[0] = g_reason[0] = '\0';
+    g_fg_len = 0;
 }
 
 static void send_run(edge_t *e, const char *cmd, const char *extra) {
@@ -182,14 +191,26 @@ int main(void) {
     fprintf(stderr, "[input] done\n");
 
     // 3. backgroundOnPark: the deadline converts the step in place.
+    // Foreground output goes to STEP_OUTPUT only; TASK_EXIT sends only the
+    // continuation from the handoff offset on, while .output holds the whole log.
     reset();
-    send_run(e, "echo before; sleep 0.8; echo after", ",\"backgroundOnPark\":true,\"timeoutMs\":300");
+    send_run(e, "echo before; sleep 0.8; echo after", ",\"backgroundOnPark\":true,\"timeoutMs\":350");
     CHECK(pump_until(e, bg_seen, 2000), "[park] no step_background");
     CHECK(!strcmp(g_reason, "timeout") && g_done == 0, "[park] reason=%s done=%d", g_reason, g_done);
+    CHECK(strstr(g_fg_out, "before") != NULL, "[park] foreground missed pre-handoff output: %s", g_fg_out);
     CHECK(pump_until(e, exited, 3000), "[park] no task_exit");
-    CHECK(g_exit_code == 0 && strstr(g_output, "after"), "[park] exit=%ld output=%s", g_exit_code, g_output);
+    CHECK(g_exit_code == 0 && strstr(g_output, "after") && !strstr(g_output, "before"),
+          "[park] exit=%ld output should be continuation only: %s", g_exit_code, g_output);
     // The file is the whole log: what ran before the handoff too.
     CHECK(file_has(g_out_path, "before") && file_has(g_out_path, "after"), "[park] file lacks pre-handoff output");
+    pump_until(e, no_active, 3000);
+    // Nothing printed after handoff → empty TASK_EXIT.output (no replay of foreground).
+    reset();
+    send_run(e, "echo only_before; sleep 0.6", ",\"backgroundOnPark\":true,\"timeoutMs\":300");
+    CHECK(pump_until(e, bg_seen, 2000) && strstr(g_fg_out, "only_before"), "[park-quiet] fg=%s", g_fg_out);
+    CHECK(pump_until(e, exited, 3000) && g_exit_code == 0 && g_output[0] == '\0',
+          "[park-quiet] expected empty continuation, got: %s", g_output);
+    CHECK(file_has(g_out_path, "only_before"), "[park-quiet] file lacks pre-handoff output");
     pump_until(e, no_active, 3000);
     fprintf(stderr, "[park] done\n");
 

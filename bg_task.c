@@ -73,14 +73,14 @@ int bg_task_open(bg_task_t *t, long pid) {
     HANDLE in = win_open(t->in_path, GENERIC_WRITE, CREATE_ALWAYS);
     if (in == INVALID_HANDLE_VALUE) { errno = EACCES; return -1; }
     CloseHandle(in);
-    HANDLE h = win_open(t->out_path, GENERIC_WRITE, CREATE_ALWAYS);
+    HANDLE h = win_open(t->out_path, GENERIC_READ | GENERIC_WRITE, CREATE_ALWAYS);
     if (h == INVALID_HANDLE_VALUE) { DeleteFileA(t->in_path); errno = EACCES; return -1; }
     t->h = (intptr_t)h;
 #else
     int in = open(t->in_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (in < 0) return -1;
     close(in);
-    int fd = open(t->out_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int fd = open(t->out_path, O_RDWR | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) { int er = errno; unlink(t->in_path); errno = er; return -1; }
     t->h = fd;
 #endif
@@ -103,6 +103,7 @@ static void out_restart(bg_task_t *t) {
     ssize_t w = write((int)t->h, note, sizeof note - 1); (void)w;
 #endif
     t->out_len = sizeof note - 1;
+    t->sent_off = 0;
 }
 
 void bg_task_write(bg_task_t *t, const void *data, size_t len) {
@@ -117,6 +118,22 @@ void bg_task_write(bg_task_t *t, const void *data, size_t len) {
 #else
     ssize_t w = write((int)t->h, data, len);
     if (w > 0) t->out_len += w;
+#endif
+}
+
+size_t bg_task_read(const bg_task_t *t, long long off, void *buf, size_t cap) {
+    if (!t->open || off < 0 || off >= t->out_len || cap == 0) return 0;
+    long long avail = t->out_len - off;
+    if ((long long)cap > avail) cap = (size_t)avail;
+#ifdef _WIN32
+    HANDLE h = (HANDLE)t->h;
+    LARGE_INTEGER pos; pos.QuadPart = off;
+    DWORD got = 0;
+    if (!SetFilePointerEx(h, pos, NULL, FILE_BEGIN) || !ReadFile(h, buf, (DWORD)cap, &got, NULL)) return 0;
+    return (size_t)got;
+#else
+    ssize_t got = pread((int)t->h, buf, cap, (off_t)off);
+    return got > 0 ? (size_t)got : 0;
 #endif
 }
 

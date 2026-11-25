@@ -1589,6 +1589,9 @@ static int bg_handoff(edge_t *e, session_t *s, const char *reason, int password_
         bg_task_write(&s->bgt, cp, k);
         off += k;
     }
+    // Everything up to here already streamed as STEP_OUTPUT before handoff;
+    // TASK_EXIT sends only what arrives from this offset on.
+    s->bgt.sent_off = s->bgt.out_len;
     bg_pre_free(s);
     int awaiting = password_prompt || !strcmp(reason, "probe");
     char buf[4096]; size_t u = 0;
@@ -1631,25 +1634,36 @@ static void send_task_state(edge_t *e, session_t *s, int awaiting) {
     s->bg_awaiting = awaiting;
 }
 
-// The task's whole log through the RUN's own output policy (s->ob kept the
-// resolved mode since the handoff): a woken agent reads what a foreground run
-// of the command would have returned, not a fixed tail.
+// Trim an incomplete trailing UTF-8 sequence at b[0..n) (possible when a cut
+// landed mid-character — at h == BG_EXIT_KEEP, b[h] belongs to the tail, so we
+// cannot look forward past h).
+static size_t utf8_trim_end(const uint8_t *b, size_t n) {
+    if (n == 0 || (b[n - 1] & 0x80) == 0) return n;
+    size_t i = n;
+    while (i > 0 && n - i < 4 && (b[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0) return 0;
+    uint8_t lead = b[i - 1];
+    if (lead < 0x80) return i;
+    size_t need = (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
+    return (need && n - (i - 1) == need) ? n : i - 1;
+}
+
+// The task's unread log (sent_off..out_len) through the RUN's own output policy
+// (s->ob kept the resolved mode since the handoff): a woken agent gets only the
+// continuation after what already streamed, not a replay or a fixed tail.
 static void bg_policy_output(edge_t *e, session_t *s, struct bg_exit_sink *k) {
-    FILE *f = fopen(s->bgt.out_path, "rb");
-    if (!f) return;
+    if (!s->bgt.open || s->bgt.sent_off >= s->bgt.out_len) return;
     ob_reset(&s->ob);
     s->bg_sink = k;
-    // Only what the bridge wrote (≤ BG_OUT_CAP): bytes someone else appended
-    // to the file are not the task's, and must not stall the loop.
     uint8_t buf[BUF_SIZE]; size_t n;
-    long long left = s->bgt.out_len;
-    while (left > 0 && (n = fread(buf, 1, left < (long long)sizeof buf ? (size_t)left : sizeof buf, f)) > 0) {
+    long long off = s->bgt.sent_off;
+    while ((n = bg_task_read(&s->bgt, off, buf, sizeof buf)) > 0) {
         ob_feed(e, s, buf, n);
-        left -= (long long)n;
+        off += (long long)n;
     }
-    fclose(f);
     ob_close(e, s);
     s->bg_sink = NULL;
+    s->bgt.sent_off = off;
 }
 
 // TASK_EXIT; the caller then run_finish()es (closes files, frees one-shots).
@@ -1664,7 +1678,7 @@ static void send_task_exit(edge_t *e, session_t *s, int has_code, int code) {
     // Keep the first h and last t bytes; halve both until the frame fits.
     size_t L = k->len, gap = k->cut ? BG_EXIT_KEEP : L, h = gap, t = L - gap, u;
     for (;;) {
-        while (h > 0 && h < L && (k->b[h] & 0xC0) == 0x80) h--;     // whole UTF-8 chars only
+        if (k->cut || h < L) h = utf8_trim_end(k->b, h);            // whole UTF-8 chars only
         while (t > 0 && (k->b[L - t] & 0xC0) == 0x80) t--;
         size_t dropped = k->cut + (L - h - t), ol = h;
         memcpy(out, k->b, h);
