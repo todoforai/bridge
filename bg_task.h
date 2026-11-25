@@ -42,8 +42,6 @@ void bg_task_write(bg_task_t *t, const void *data, size_t len);
 // PTY never loses input. A file shrunk below in_off (someone truncated it)
 // restarts from 0.
 long bg_task_peek_input(bg_task_t *t, void *buf, size_t cap);
-// Last ≤cap bytes of .output, starting on a UTF-8 boundary.
-size_t bg_task_tail(const bg_task_t *t, char *buf, size_t cap);
 // Close .output (kept for reading) and unlink .input.
 void bg_task_close(bg_task_t *t);
 // Delete task files not modified for BG_REAP_AGE_MS. Startup only.

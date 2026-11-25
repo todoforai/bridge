@@ -23,8 +23,9 @@ static int test_capture(const char *json, size_t len);
 
 static int g_done, g_bg, g_exit, g_state_on, g_state_off, g_list;
 static char g_err_code[64];
+static size_t g_exit_len;
 static long g_pid, g_exit_code; static int g_exit_null, g_killed, g_bg_awaiting;
-static char g_out_path[512], g_in_path[512], g_tail[4096], g_reason[32], g_list_json[8192], g_exit_json[16384], g_bg_json[4096];
+static char g_out_path[512], g_in_path[512], g_output[65536], g_reason[32], g_list_json[8192], g_exit_json[65536], g_bg_json[4096];
 
 int bridge_test_noise_send(noise_ws_t *n, ws_t *w, const uint8_t *pt, size_t pt_len) {
     (void)n; (void)w;
@@ -55,7 +56,8 @@ static int test_capture(const char *json, size_t len) {
         snprintf(g_exit_json, sizeof g_exit_json, "%.*s", (int)len, json);
         g_exit_null = !json_get_long(json, len, "exitCode", &g_exit_code);
         json_get_bool(json, len, "killed", &g_killed);
-        json_get_str_decoded(json, len, "tail", g_tail, sizeof g_tail, &n);
+        json_get_str_decoded(json, len, "output", g_output, sizeof g_output, &n);
+        g_exit_len = len;
     }
     if (T("error")) json_get_str_decoded(json, len, "code", g_err_code, sizeof g_err_code, &n);
     if (T("task_list")) { g_list++; snprintf(g_list_json, sizeof g_list_json, "%.*s", (int)len, json); }
@@ -66,7 +68,7 @@ static void reset(void) {
     g_exit_json[0] = g_bg_json[0] = '\0';
     g_done = g_bg = g_exit = g_state_on = g_state_off = g_list = 0;
     g_pid = g_exit_code = 0; g_exit_null = g_killed = g_bg_awaiting = 0;
-    g_out_path[0] = g_in_path[0] = g_tail[0] = g_reason[0] = '\0';
+    g_out_path[0] = g_in_path[0] = g_output[0] = g_reason[0] = '\0';
 }
 
 static void send_run(edge_t *e, const char *cmd, const char *extra) {
@@ -157,7 +159,7 @@ int main(void) {
     CHECK(g_pid > 0 && strstr(g_out_path, "/.todoforai/tasks/") && exists(g_in_path), "[basic] pid=%ld out=%s", g_pid, g_out_path);
     CHECK(pump_until(e, exited, 5000), "[basic] no task_exit");
     CHECK(!g_exit_null && g_exit_code == 3 && !g_killed, "[basic] exit=%ld null=%d killed=%d", g_exit_code, g_exit_null, g_killed);
-    CHECK(strstr(g_tail, "start") && strstr(g_tail, "end") && !strstr(g_tail, "__BRIDGE"), "[basic] tail=%s", g_tail);
+    CHECK(strstr(g_output, "start") && strstr(g_output, "end") && !strstr(g_output, "__BRIDGE"), "[basic] output=%s", g_output);
     CHECK(file_has(g_out_path, "end") && !exists(g_in_path), "[basic] files: out has end=%d input exists=%d", file_has(g_out_path, "end"), exists(g_in_path));
     CHECK(pump_until(e, no_active, 3000), "[basic] one-shot session not freed");
     fprintf(stderr, "[basic] done\n");
@@ -172,7 +174,7 @@ int main(void) {
     char ap[700]; snprintf(ap, sizeof ap, "echo hello>> \"%s\"", g_in_path);
     CHECK(system(ap) == 0, "[input] external append failed");
     CHECK(pump_until(e, exited, 5000), "[input] no task_exit");
-    CHECK(strstr(g_tail, "got:hello") != NULL, "[input] tail=%s", g_tail);
+    CHECK(strstr(g_output, "got:hello") != NULL, "[input] output=%s", g_output);
 #ifndef _WIN32
     CHECK(g_state_off >= 1, "[input] no task_state awaitingInput:false after input (off=%d)", g_state_off);
 #endif
@@ -185,7 +187,7 @@ int main(void) {
     CHECK(pump_until(e, bg_seen, 2000), "[park] no step_background");
     CHECK(!strcmp(g_reason, "timeout") && g_done == 0, "[park] reason=%s done=%d", g_reason, g_done);
     CHECK(pump_until(e, exited, 3000), "[park] no task_exit");
-    CHECK(g_exit_code == 0 && strstr(g_tail, "after"), "[park] exit=%ld tail=%s", g_exit_code, g_tail);
+    CHECK(g_exit_code == 0 && strstr(g_output, "after"), "[park] exit=%ld output=%s", g_exit_code, g_output);
     // The file is the whole log: what ran before the handoff too.
     CHECK(file_has(g_out_path, "before") && file_has(g_out_path, "after"), "[park] file lacks pre-handoff output");
     pump_until(e, no_active, 3000);
@@ -195,7 +197,7 @@ int main(void) {
     reset();
     send_run(e, "sleep 0.6; echo late", ",\"backgroundOnPark\":true,\"noInput\":true,\"timeoutMs\":200");
     CHECK(pump_until(e, bg_seen, 2000) && g_done == 0, "[noinput] bg=%d done=%d", g_bg, g_done);
-    CHECK(pump_until(e, exited, 3000) && strstr(g_tail, "late"), "[noinput] tail=%s", g_tail);
+    CHECK(pump_until(e, exited, 3000) && strstr(g_output, "late"), "[noinput] output=%s", g_output);
     pump_until(e, no_active, 3000);
 
     // 5. TASK_LIST + TASK_KILL (^C ends sleep).
@@ -258,14 +260,40 @@ int main(void) {
     reset();
     send_run(e, "sleep 0.5; read -r a; read -r b; echo got:$a:$b", ",\"background\":true");
     append(g_in_path, "one\ntwo\n");
-    CHECK(pump_until(e, exited, 4000) && strstr(g_tail, "got:one:two"), "[early-input] tail=%s", g_tail);
+    CHECK(pump_until(e, exited, 4000) && strstr(g_output, "got:one:two"), "[early-input] output=%s", g_output);
     pump_until(e, no_active, 3000);
 
     // 6d. `| tail -N` is not cut for a background run: the file is the whole log.
     reset();
     send_run(e, "seq 1 50 | tail -2", ",\"background\":true");
-    CHECK(pump_until(e, exited, 3000) && file_has(g_out_path, "49") && !strstr(g_tail, "\n1\n") && !file_has(g_out_path, "\n10\n"),
-          "[tail] pipeline not literal: %s", g_tail);
+    CHECK(pump_until(e, exited, 3000) && file_has(g_out_path, "49") && !strstr(g_output, "\n1\n") && !file_has(g_out_path, "\n10\n"),
+          "[tail] pipeline not literal: %s", g_output);
+    pump_until(e, no_active, 3000);
+
+    // 6h. The exit's output is the log through the RUN's output policy.
+    reset();
+    send_run(e, "seq 1 50; head -c 2500 /dev/zero | tr '\\0' x; echo", ",\"background\":true");
+    CHECK(pump_until(e, exited, 3000) && strstr(g_output, "1\r\n2\r\n") && strstr(g_output, "\n50\r\n") && strstr(g_output, " ...[+500 chars]"),
+          "[policy] safe: len=%zu", strlen(g_output));
+    pump_until(e, no_active, 3000);
+    reset();
+    send_run(e, "head -c 2500 /dev/zero | tr '\\0' x; echo", ",\"background\":true,\"output\":\"full\"");
+    CHECK(pump_until(e, exited, 3000) && !strstr(g_output, "...[+") && strlen(g_output) >= 2500, "[policy] full: len=%zu", strlen(g_output));
+    pump_until(e, no_active, 3000);
+    reset();
+    send_run(e, "seq 1 100000", ",\"background\":true");
+    CHECK(pump_until(e, exited, 5000) && strstr(g_output, "1\r\n2\r\n") && strstr(g_output, "[truncated ") && strstr(g_output, "100000"),
+          "[policy] safe head+tail: len=%zu", strlen(g_output));
+    pump_until(e, no_active, 3000);
+    // Bigger than one frame (and 6×-escaped control bytes): cut in the middle, still sent.
+    reset();
+    send_run(e, "seq 1 40000", ",\"background\":true,\"output\":\"full\"");
+    CHECK(pump_until(e, exited, 5000) && strstr(g_output, "cut to fit the exit frame") && strstr(g_output, "\n40000") && g_exit_len < BG_EXIT_FRAME,
+          "[policy] frame fit: frame=%zu", g_exit_len);
+    pump_until(e, no_active, 3000);
+    reset();
+    send_run(e, "head -c 100000 /dev/zero | tr '\\0' '\\001'; echo END", ",\"background\":true,\"output\":\"full\"");
+    CHECK(pump_until(e, exited, 5000) && strstr(g_output, "END") && g_exit_len < BG_EXIT_FRAME, "[policy] escaped fit: frame=%zu", g_exit_len);
     pump_until(e, no_active, 3000);
 
     // 6e. Native python: TASK_KILL's ^C ends it without escalation.
@@ -279,7 +307,7 @@ int main(void) {
         // 130 = ^C, not the escalation's 9. The traceback text itself may land
         // after the result line: SIGINT also kills the wrapper subshell, which
         // can report before python finishes printing (wrapper-wide race).
-        CHECK(g_exit_code == 130 && strstr(g_tail, "up"), "[python] exit=%ld tail=%s", g_exit_code, g_tail);
+        CHECK(g_exit_code == 130 && strstr(g_output, "up"), "[python] exit=%ld output=%s", g_exit_code, g_output);
     } else fprintf(stderr, "[python] skipped (exit %ld)\n", g_exit_code);
     pump_until(e, no_active, 3000);
 

@@ -155,24 +155,6 @@ long bg_task_peek_input(bg_task_t *t, void *buf, size_t cap) {
     return r;
 }
 
-size_t bg_task_tail(const bg_task_t *t, char *buf, size_t cap) {
-    if (!t->out_path[0] || cap == 0) return 0;
-    FILE *f = fopen(t->out_path, "rb");
-    if (!f) return 0;
-    size_t n = 0;
-    if (fseek(f, 0, SEEK_END) == 0) {
-        long sz = ftell(f);
-        long from = sz > (long)cap ? sz - (long)cap : 0;
-        if (sz > 0 && fseek(f, from, SEEK_SET) == 0) n = fread(buf, 1, cap, f);
-    }
-    fclose(f);
-    // Skip UTF-8 continuation bytes a byte cut may have left at the start.
-    size_t s = 0;
-    while (s < n && s < 4 && ((unsigned char)buf[s] & 0xC0) == 0x80) s++;
-    if (s) memmove(buf, buf + s, n - s);
-    return n - s;
-}
-
 void bg_task_close(bg_task_t *t) {
     if (!t->open) return;
 #ifdef _WIN32

@@ -420,6 +420,7 @@ typedef struct {
     // .input is polled into the PTY, and the sentinel yields TASK_EXIT.
     int       bg;
     int       bg_on_park;       // RUN asked: park ⇒ become a task, not STEP_AWAITING_INPUT
+    struct bg_exit_sink *bg_sink; // set only while send_task_exit replays the log: OUTPUT bytes land here
     int       bg_awaiting;      // last awaitingInput reported (TASK_STATE)
     int       bg_killed;        // TASK_KILL received
     int64_t   bg_kill_at_ms;    // SIGKILL deadline after the ^C of a TASK_KILL; 0 = none
@@ -1229,9 +1230,45 @@ static void otail_append(session_t *s, const uint8_t *data, size_t len) {
     s->otail_len += len;
 }
 
+// ── TASK_EXIT output ──
+// The exit frame carries the task's log through the RUN's output policy (see
+// bg_policy_output). One Noise frame holds < 64 KiB and JSON escaping grows
+// text (6× for control bytes), so the sink keeps the first and last
+// BG_EXIT_KEEP bytes; send_task_exit halves them until the frame fits.
+#define BG_EXIT_KEEP  (24 * 1024)
+#define BG_EXIT_FRAME (60 * 1024)
+struct bg_exit_sink {
+    uint8_t b[2 * BG_EXIT_KEEP];  // head [0, KEEP), then a rolling tail [KEEP, 2·KEEP)
+    size_t  len;                  // contiguous: the tail starts only once the head is full
+    size_t  cut;                  // bytes dropped between head and tail
+};
+static void bg_sink_put(struct bg_exit_sink *k, const uint8_t *d, size_t n) {
+    if (k->len < BG_EXIT_KEEP) {
+        size_t h = BG_EXIT_KEEP - k->len < n ? BG_EXIT_KEEP - k->len : n;
+        memcpy(k->b + k->len, d, h); k->len += h; d += h; n -= h;
+    }
+    if (n == 0) return;
+    uint8_t *tail = k->b + BG_EXIT_KEEP;
+    size_t tl = k->len - BG_EXIT_KEEP;
+    if (n >= BG_EXIT_KEEP) {
+        k->cut += tl + n - BG_EXIT_KEEP;
+        memcpy(tail, d + n - BG_EXIT_KEEP, BG_EXIT_KEEP);
+        k->len = 2 * BG_EXIT_KEEP;
+        return;
+    }
+    if (tl + n > BG_EXIT_KEEP) {
+        size_t drop = tl + n - BG_EXIT_KEEP;
+        memmove(tail, tail + drop, tl - drop);
+        tl -= drop; k->cut += drop;
+    }
+    memcpy(tail + tl, d, n);
+    k->len = BG_EXIT_KEEP + tl + n;
+}
+
 static void send_output_bytes(edge_t *e, session_t *s,
                               const uint8_t *data, size_t len) {
     if (len == 0) return;
+    if (s->bg_sink) { bg_sink_put(s->bg_sink, data, len); return; }
     // Single emission bigger than the whole buffer: keep ordering, send as-is.
     // Bypasses obuf, so it needs its own redaction pass (callers own the
     // buffer and expect it scrubbed either way — see redact_token).
@@ -1346,6 +1383,8 @@ static void bg_pre_free(session_t *s);
 static size_t sentinel_holdback(const session_t *s);
 static void ob_finish(edge_t *e, session_t *s);
 static void ob_reset(out_policy_t *ob);
+static void ob_feed(edge_t *e, session_t *s, const uint8_t *d, size_t n);
+static void ob_close(edge_t *e, session_t *s);
 
 // ── Wrapper staging (Windows) ───────────────────────────────────────────────
 // MSYS bash reads console input a character at a time and pays ~0.32 ms per
@@ -1495,12 +1534,11 @@ static void run_finish(session_t *s) {
 //                    startedAt, passwordPrompt, truncated}  — settles the RUN
 //   TASK_STATE      {pid, awaitingInput[, stdinWaiter]}
 //   TASK_EXIT       {pid, exitCode|null, killed, durationMs, startedAt,
-//                    outputPath, tail}
+//                    outputPath, output}
 // TASK_EXIT is lost if the backend is unreachable at that moment; it then
 // reconciles with TASK_LIST after reconnect (absent pid ⇒ exited).
 #define BG_MAX_TASKS 32
 #define BG_KILL_GRACE_MS 3000
-#define BG_TAIL_BYTES 2048
 
 static int bg_count(const edge_t *e) {
     int n = 0;
@@ -1593,24 +1631,69 @@ static void send_task_state(edge_t *e, session_t *s, int awaiting) {
     s->bg_awaiting = awaiting;
 }
 
+// The task's whole log through the RUN's own output policy (s->ob kept the
+// resolved mode since the handoff): a woken agent reads what a foreground run
+// of the command would have returned, not a fixed tail.
+static void bg_policy_output(edge_t *e, session_t *s, struct bg_exit_sink *k) {
+    FILE *f = fopen(s->bgt.out_path, "rb");
+    if (!f) return;
+    ob_reset(&s->ob);
+    s->bg_sink = k;
+    // Only what the bridge wrote (≤ BG_OUT_CAP): bytes someone else appended
+    // to the file are not the task's, and must not stall the loop.
+    uint8_t buf[BUF_SIZE]; size_t n;
+    long long left = s->bgt.out_len;
+    while (left > 0 && (n = fread(buf, 1, left < (long long)sizeof buf ? (size_t)left : sizeof buf, f)) > 0) {
+        ob_feed(e, s, buf, n);
+        left -= (long long)n;
+    }
+    fclose(f);
+    ob_close(e, s);
+    s->bg_sink = NULL;
+}
+
 // TASK_EXIT; the caller then run_finish()es (closes files, frees one-shots).
 static void send_task_exit(edge_t *e, session_t *s, int has_code, int code) {
-    char tail[BG_TAIL_BYTES];
-    size_t tl = bg_task_tail(&s->bgt, tail, sizeof tail);
-    redact_token(e, (uint8_t *)tail, tl);
-    char buf[BG_TAIL_BYTES * 6 + 2048]; size_t u = 0;
+    struct bg_exit_sink *k = calloc(1, sizeof *k);
+    char *buf = malloc(BG_EXIT_FRAME);
+    char *out = malloc(sizeof k->b + 1024);
+    if (!k || !buf || !out) goto done;
+    bg_policy_output(e, s, k);
     char rc[24]; snprintf(rc, sizeof rc, has_code ? "%d" : "null", code);
     char dur[24]; snprintf(dur, sizeof dur, "%lld", (long long)(monotonic_ms() - s->bg_started_mono));
-    if (emit_bg_common(buf, sizeof buf, &u, "task_exit", s) < 0 ||
-        jfield_raw(buf, sizeof buf, &u, "exitCode", rc, 1) < 0 ||
-        jfield_raw(buf, sizeof buf, &u, "killed", s->bg_killed ? "true" : "false", 1) < 0 ||
-        jfield_raw(buf, sizeof buf, &u, "durationMs", dur, 1) < 0 ||
-        jfield_str(buf, sizeof buf, &u, "outputPath", s->bgt.out_path, -1, 1) < 0 ||
-        jfield_str(buf, sizeof buf, &u, "tail", tail, (long)tl, 1) < 0 ||
-        json_emit_raw(buf, sizeof buf, &u, "}", 1) < 0) return;
+    // Keep the first h and last t bytes; halve both until the frame fits.
+    size_t L = k->len, gap = k->cut ? BG_EXIT_KEEP : L, h = gap, t = L - gap, u;
+    for (;;) {
+        while (h > 0 && h < L && (k->b[h] & 0xC0) == 0x80) h--;     // whole UTF-8 chars only
+        while (t > 0 && (k->b[L - t] & 0xC0) == 0x80) t--;
+        size_t dropped = k->cut + (L - h - t), ol = h;
+        memcpy(out, k->b, h);
+        if (dropped) {
+            int m = snprintf(out + ol, 1024, "\n\n... [%zu chars cut to fit the exit frame; whole log: %s] ...\n\n",
+                             dropped, s->bgt.out_path);
+            if (m > 0 && m < 1024) ol += (size_t)m;
+        }
+        memcpy(out + ol, k->b + L - t, t); ol += t;
+        // The log was scrubbed per write; a token split across two writes is whole again here.
+        redact_token(e, (uint8_t *)out, ol);
+        u = 0;
+        if (emit_bg_common(buf, BG_EXIT_FRAME, &u, "task_exit", s) == 0 &&
+            jfield_raw(buf, BG_EXIT_FRAME, &u, "exitCode", rc, 1) == 0 &&
+            jfield_raw(buf, BG_EXIT_FRAME, &u, "killed", s->bg_killed ? "true" : "false", 1) == 0 &&
+            jfield_raw(buf, BG_EXIT_FRAME, &u, "durationMs", dur, 1) == 0 &&
+            jfield_str(buf, BG_EXIT_FRAME, &u, "outputPath", s->bgt.out_path, -1, 1) == 0 &&
+            jfield_str(buf, BG_EXIT_FRAME, &u, "output", out, (long)ol, 1) == 0 &&
+            json_emit_raw(buf, BG_EXIT_FRAME, &u, "}", 1) == 0) break;
+        if (h + t == 0) goto done;
+        size_t total = (h + t) / 2;
+        h = total / 2; t = total - h;
+        if (k->cut && t > L - gap) t = L - gap;
+    }
     if (send_json(e, buf, u) != 0)
         fprintf(stderr, "TASK_EXIT pid %ld not delivered (offline) — TASK_LIST reconciles\n", SHELL_PID(s));
     fprintf(stderr, "background task pid %ld exited (%s)\n", SHELL_PID(s), rc);
+done:
+    free(out); free(buf); free(k);
 }
 
 static session_t *find_task(edge_t *e, long pid) {
@@ -2082,8 +2165,8 @@ static void bg_pre_free(session_t *s) {
     free(s->bg_pre); s->bg_pre = NULL; s->bg_pre_len = 0; s->bg_pre_dropped = 0;
 }
 
+static void ob_feed(edge_t *e, session_t *s, const uint8_t *d, size_t n);
 static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
-    out_policy_t *ob = &s->ob;
     if (n == 0) return;
     // Prompt tail sees every step byte, including those past head_limit that
     // are only kept for the truncation tail — otherwise a prompt printed after
@@ -2104,6 +2187,13 @@ static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
         }
         return;
     }
+    ob_feed(e, s, d, n);
+}
+
+// The output policy proper: stream the head (line-capped), roll the rest into
+// the tail. Also replays a finished task's log (bg_policy_output).
+static void ob_feed(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
+    out_policy_t *ob = &s->ob;
     const uint8_t *p = d; size_t rem = n;
     if (ob->head_limit == OB_NOLIMIT) {
         ob->total_len += ob_emit_capped(e, s, p, rem);
@@ -2130,9 +2220,12 @@ static void ob_append(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
 // Emit the truncation notice + tail once, at end-of-step (or before a pause).
 // No-op when nothing was dropped. send_step_done reads ob->truncated for the
 // frame flag, so call this just before it.
+static void ob_close(edge_t *e, session_t *s);
 static void ob_finish(edge_t *e, session_t *s) {
+    if (!s->bg) ob_close(e, s);   // a task's output is in its .output file
+}
+static void ob_close(edge_t *e, session_t *s) {
     out_policy_t *ob = &s->ob;
-    if (s->bg) return;   // everything already went to the .output file
     if (ob->tail_lines > 0) {
         // Stripped `| tail -N`: emit the last N lines of what rolled through
         // (≤ last_limit bytes — a huge-line tail yields fewer lines). The
