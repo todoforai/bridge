@@ -4636,6 +4636,48 @@ static long device_lock_owner_pid(const char *device_id) {
 static void device_lock_kill_owner(long pid) {
     kill((pid_t)pid, SIGTERM);
 }
+
+// A bridge stopped by `--kill` (the desktop app, another terminal) used to
+// vanish with just "Terminated": say which process sent it, then die exactly
+// as before. Only pid + process name — never argv, which can hold a token.
+// Async-signal-safe only: open/read/write/signal/raise.
+static void on_sigterm(int sig, siginfo_t *si, void *ctx) {
+    (void)ctx;
+    signal(SIGPIPE, SIG_IGN);   // a closed stderr pipe must not change how we die
+    char pid[24], *d = pid + sizeof pid;
+    *--d = '\0';
+    long v = si->si_pid > 0 ? si->si_pid : 0;
+    do *--d = (char)('0' + v % 10); while (v /= 10);
+    char msg[128] = "\nStopped: SIGTERM from pid ";
+    size_t n = strlen(msg), l = strlen(d);
+    memcpy(msg + n, d, l); n += l;
+#ifdef __linux__
+    char path[48] = "/proc/";
+    memcpy(path + 6, d, l);
+    memcpy(path + 6 + l, "/comm", 6);
+    int fd = si->si_pid > 0 ? open(path, O_RDONLY) : -1;
+    if (fd >= 0) {
+        msg[n++] = ' ';
+        ssize_t r = read(fd, msg + n, 17);   // comm: ≤15 chars + '\n'; msg has room
+        close(fd);
+        if (r > 0) n += (size_t)r - (msg[n + r - 1] == '\n');
+    }
+#endif
+    msg[n++] = '\n';
+    ssize_t w = write(STDERR_FILENO, msg, n); (void)w;
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// Before the lock publishes our pid, so a `--kill` can never beat it. Leaves a
+// SIGTERM disposition someone else chose (ignored, embedder's handler) alone.
+static void install_sigterm_note(void) {
+    struct sigaction old;
+    if (sigaction(SIGTERM, NULL, &old) != 0 || old.sa_handler != SIG_DFL) return;
+    struct sigaction sa = { .sa_sigaction = on_sigterm, .sa_flags = SA_SIGINFO | SA_RESETHAND };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+}
 #endif
 
 static void lock_sleep_100ms(void) {
@@ -4885,6 +4927,9 @@ int bridge_main(int argc, char **argv) {
     // With --kill the newcomer wins: stop the holder, take the lock.
     // Mayfly sessions skip the lock entirely: they register backend-side under
     // a fresh id, so they coexist with the normal bridge for this device.
+#ifndef _WIN32
+    if (!mayfly_todo_id) install_sigterm_note();
+#endif
     if (!mayfly_todo_id && acquire_device_lock(saved_creds.device_id) < 0
         && (!kill_existing || device_lock_kill_existing(saved_creds.device_id) < 0)) {
         // The pid file is best-effort: it's missing or unparsable when the
