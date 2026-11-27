@@ -197,6 +197,11 @@ static char *bridge_expand_tilde(const char *p) {
 #define OB_STREAM_FIRST 10000              // chars kept/streamed from the start
 #define OB_STREAM_LAST  10000              // chars kept from the end (tail)
 #define OB_RUN_CAP      (256 * 1024)       // absolute ceiling (full mode)
+// Bytes the head may stream for free (redraws, escapes, `\r`: sent, but not
+// counted as effective). Without a budget a command that only redraws
+// (`CSI 1A CSI 0K` in a loop: 14 MB in one step) never fills the head and
+// streams forever. Past it the head closes and the collapsed tail takes over.
+#define OB_HEAD_FREE_CAP OB_RUN_CAP
 #define OB_LINE_LEN     2000               // bash output per-line limit
 // Tail buffer: holds the rolling last OB_STREAM_LAST bytes plus one full PTY
 // read of slack so a single append never overflows before we trim.
@@ -233,6 +238,7 @@ typedef struct {
     size_t last_limit;   // min(lastLimit, hardCap - head_limit); rolling tail
     size_t line_limit;   // per-line width cap (OB_NOLIMIT = full-width)
     size_t head_len;     // bytes already streamed into the head
+    size_t head_raw;     // bytes sent by ob_emit_capped; head_raw - head_len = the free ones (≤ OB_HEAD_FREE_CAP)
     size_t total_len;    // total RUN output bytes seen
     int    truncated;    // head filled and more arrived
     int    notice_sent;  // truncation notice already emitted
@@ -2024,7 +2030,7 @@ static int ob_tail_strip_ok(const out_policy_t *ob) {
 // Clear counters/tail but keep the resolved limits (used at STEP_AWAITING_INPUT,
 // mirroring edge's resetForInteraction so post-prompt output is a fresh delta).
 static void ob_reset(out_policy_t *ob) {
-    ob->head_len = 0; ob->total_len = 0; ob->truncated = 0; ob->notice_sent = 0;
+    ob->head_len = 0; ob->head_raw = 0; ob->total_len = 0; ob->truncated = 0; ob->notice_sent = 0;
     ob->col = 0; ob->line_len = 0; ob->line_charged = 0; ob->line_dropped = 0;
     memset(&ob->head_tok, 0, sizeof ob->head_tok);
     ob->tail_len = 0; ob->tcur_len = 0; ob->tcur_col = 0; ob->tcur_charged = 0;
@@ -2151,6 +2157,7 @@ static size_t ob_emit_capped(edge_t *e, session_t *s, const uint8_t *d, size_t n
         }
     }
     if (u > 0) send_output_bytes(e, s, out, u);
+    ob->head_raw += u;  // what was sent, not what was read: a line-capped flood costs little
     free(out);
     return effective;
 }
@@ -2213,19 +2220,25 @@ static void ob_feed(edge_t *e, session_t *s, const uint8_t *d, size_t n) {
         ob->total_len += ob_emit_capped(e, s, p, rem);
         return;
     }
-    // Stream raw bytes while the EFFECTIVE head is under the limit. The limit
-    // is checked per PTY read (not per byte), so the head may overshoot by
-    // one read — same slack the tail buffer has.
-    while (rem > 0 && ob->head_len < ob->head_limit) {
+    // Stream raw bytes while the EFFECTIVE head is under the limit and the
+    // free bytes under OB_HEAD_FREE_CAP. The limit is checked per PTY read
+    // (not per byte), so the head may overshoot by one read — same slack the
+    // tail buffer has.
+    while (rem > 0 && ob->head_len < ob->head_limit && ob->head_raw - ob->head_len < OB_HEAD_FREE_CAP) {
         // Feed at most `room` raw bytes: effective ≤ raw, so this cannot
         // overshoot the limit by more than one chunk's worth of redraws.
         size_t room = ob->head_limit - ob->head_len;
+        size_t free_room = OB_HEAD_FREE_CAP - (ob->head_raw - ob->head_len);
         size_t take = rem < room ? rem : room;
+        if (take > free_room) take = free_room;
         size_t eff = ob_emit_capped(e, s, p, take);
         ob->head_len += eff; ob->total_len += eff;
         p += take; rem -= take;
     }
     if (rem > 0) {
+        // The cut may land inside an escape sequence: the tail continues it
+        // instead of storing its remainder as text.
+        if (!ob->truncated) ob->tail_tok = ob->head_tok;
         ob->truncated = 1;
         ob->total_len += ob_tail_push(ob, p, rem);
     }

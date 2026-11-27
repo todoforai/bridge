@@ -225,6 +225,29 @@ int main(void) {
     if (s->ob.total_len > 2000) { fprintf(stderr, "[spinner] effective accounting too high: %zu\n", s->ob.total_len); return 1; }
     printf("[spinner] OK (%zu raw bytes streamed, %zu effective)\n", g_out_len, s->ob.total_len);
 
+    // ── Redraw-only flood: nothing is "effective", so only the raw cap stops
+    // the stream (a 0x0-PTY ora loop streamed 14 MB into one chat block) ──
+    reset_capture();
+    run_cmd(e, s, "yes \"$(printf '\\033[1A\\033[0K')\" | head -c 450000 | tr -d '\\n'; echo; echo after-redraws", "safe");
+    if (g_out_len > OB_HEAD_FREE_CAP + 4096) { fprintf(stderr, "[redraw-cap] streamed %zu raw bytes (cap %d)\n", g_out_len, OB_HEAD_FREE_CAP); return 1; }
+    if (g_out_len < OB_HEAD_FREE_CAP) { fprintf(stderr, "[redraw-cap] flood too small to test the cap: %zu\n", g_out_len); return 1; }
+    if (!memmem(g_out, g_out_len, "[truncated", 10) || !memmem(g_out, g_out_len, "after-redraws", 13)) { fprintf(stderr, "[redraw-cap] no truncation notice or lost the real tail\n"); return 1; }
+    printf("[redraw-cap] OK (%zu raw bytes streamed)\n", g_out_len);
+
+    // ── ...but a line-capped flood is not: 300 KiB on one line sends ~2000
+    // bytes, so the head stays open and the next line still streams ──
+    reset_capture();
+    run_cmd(e, s, "head -c 300000 /dev/zero | tr '\\0' x; echo; echo after-long-line", "safe");
+    if (memmem(g_out, g_out_len, "[truncated", 10) || !memmem(g_out, g_out_len, "after-long-line", 15)) { fprintf(stderr, "[redraw-cap] a capped long line closed the head\n"); return 1; }
+    printf("[redraw-cap] OK (long line: %zu bytes sent)\n", g_out_len);
+
+    // ── The PTY has a real size: at 0x0 ora divides by zero columns and
+    // redraws forever (the flood above) ──
+    reset_capture();
+    run_cmd(e, s, "stty size", "safe");
+    if (!memmem(g_out, g_out_len, "50 200", 6)) { fprintf(stderr, "[winsize] got %.*s\n", (int)g_out_len, g_out); return 1; }
+    printf("[winsize] OK\n");
+
     // ── Spinner inside a flood: the tail is stored collapsed, so the real
     // trailing lines survive instead of being evicted by redraw frames ──
     reset_capture();
