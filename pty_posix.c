@@ -98,8 +98,13 @@ int bridge_pty_spawn(bridge_pty_t *p, const char *shell, const char *cwd, int no
     // to the pause detector, which only recognizes tasks blocked in n_tty_read.
     t.c_cc[VSUSP]  = _POSIX_VDISABLE;
 
+    // A real window size: forkpty's default is 0x0, and a tool that divides by
+    // the column count then breaks — ora (lingui, npm tooling) computes
+    // Infinity lines to clear and writes `CSI 1A CSI 0K` forever, 0.7 MB/s,
+    // never finishing. Wide, so `ps`/`docker ps` style tables are not cut at 80.
+    struct winsize ws = { .ws_row = 50, .ws_col = 200 };
     int master_fd = -1;
-    pid_t pid = forkpty(&master_fd, NULL, &t, NULL);
+    pid_t pid = forkpty(&master_fd, NULL, &t, &ws);
     if (pid < 0) return -1;
 
     // Non-blocking master: bridge_pty_read() returns 0 on EAGAIN so the
