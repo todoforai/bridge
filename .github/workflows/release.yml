@@ -263,8 +263,10 @@ jobs:
     needs: [build, sign-windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (for gh CLI context)
+      - name: Checkout (for gh CLI context & commit notes)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -289,11 +291,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ steps.tag.outputs.tag }}"
+          prev=$(git tag --list 'v*' --sort=-version:refname | awk -v t="$tag" 'found {print; exit} $0 == t {found=1}')
+          {
+            if [ -n "$prev" ]; then
+              git log --no-merges --pretty=format:"- %s" "$prev..$tag"
+              printf '\n\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "${{ github.repository }}" "$prev" "$tag"
+            else
+              git log --no-merges -n 20 --pretty=format:"- %s" "$tag"
+            fi
+          } > notes.md
           # Create the release if it doesn't exist; otherwise upload into it.
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
           else
             gh release create "$tag" dist/* \
               --title "todoforai-bridge $tag" \
-              --generate-notes
+              --notes-file notes.md
           fi
