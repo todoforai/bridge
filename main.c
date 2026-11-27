@@ -4206,6 +4206,15 @@ static void on_ws_msg(uint8_t op, const uint8_t *data, size_t len, void *ctx) {
         // the server validated our device credentials.
         e->auth_confirmed = 1;
         if (!e->mayfly) send_task_list(e, NULL, 0);   // reconcile tasks across reconnects
+        // Re-announce foreground runs: a RUN_STARTED written into the socket
+        // that just died is lost, and a run that then stays silent looks to the
+        // backend like a RUN that never arrived (it fails those after a short
+        // grace). Idempotent there; a no-op on the first connect.
+        for (int i = 0; i < g_max_sessions; i++) {
+            session_t *s = &e->sessions[i];
+            if (s->active && s->state == SESS_RUNNING && !s->bg && s->run_block_id_len > 0)
+                send_run_started(e, s, /*created=*/0);
+        }
         if (e->user_email && e->user_email[0])
             fprintf(stderr, "✓ Authenticated as %s\n", e->user_email);
         else
